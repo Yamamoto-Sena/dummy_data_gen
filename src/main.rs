@@ -117,6 +117,7 @@ enum ColumnType {
     Uuid,
     PrefectureJa,
     CityJa,
+    KatakanaName,
     Enum {
         choices: Vec<String>,
     },
@@ -162,6 +163,7 @@ enum PreparedColumnType {
     Uuid,
     PrefectureJa,
     CityJa,
+    KatakanaName,
     Enum { choices: Vec<String> },
 }
 
@@ -232,6 +234,7 @@ fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::
                 ColumnType::Uuid => PreparedColumnType::Uuid,
                 ColumnType::PrefectureJa => PreparedColumnType::PrefectureJa,
                 ColumnType::CityJa => PreparedColumnType::CityJa,
+                ColumnType::KatakanaName => PreparedColumnType::KatakanaName,
                 ColumnType::Enum { choices } => {
                     if choices.is_empty() {
                         return Err(format!("列 \"{}\": choices には1つ以上の選択肢が必要です", c.name).into());
@@ -292,6 +295,9 @@ fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::
             for warning in misplaced_city_ja_warnings(columns) {
                 eprintln!("{warning}");
             }
+            for warning in misplaced_katakana_name_warnings(columns) {
+                eprintln!("{warning}");
+            }
         })
 }
 
@@ -316,6 +322,30 @@ fn misplaced_city_ja_warnings(columns: &[PreparedColumn]) -> Vec<String> {
             format!(
                 "警告: 列 \"{}\"(city_ja)より後ろに prefecture_ja 列があります。city_jaは自分より前のprefecture_ja列しか参照しないため、都道府県と市区町村が対応しません。prefecture_ja列をcity_ja列より前に移動してください。",
                 city_col.name
+            )
+        })
+        .collect()
+}
+
+// katakana_name列も、city_ja列と同様に「自分より前にあるname_ja列」しか見ない設計。
+// name_ja列は定義してあるのにkatakana_nameより後ろにある場合、氏名とフリガナが
+// 対応しないまま黙って無関係な値が選ばれてしまうため、警告文を作る。
+fn misplaced_katakana_name_warnings(columns: &[PreparedColumn]) -> Vec<String> {
+    columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c.kind, PreparedColumnType::KatakanaName))
+        .filter(|(kana_idx, _)| {
+            let has_preceding_name =
+                columns[..*kana_idx].iter().any(|c| matches!(c.kind, PreparedColumnType::NameJa));
+            let has_following_name =
+                columns[*kana_idx + 1..].iter().any(|c| matches!(c.kind, PreparedColumnType::NameJa));
+            !has_preceding_name && has_following_name
+        })
+        .map(|(_, kana_col)| {
+            format!(
+                "警告: 列 \"{}\"(katakana_name)より後ろに name_ja 列があります。katakana_nameは自分より前のname_ja列しか参照しないため、氏名とフリガナが対応しません。name_ja列をkatakana_name列より前に移動してください。",
+                kana_col.name
             )
         })
         .collect()
@@ -396,6 +426,10 @@ impl std::fmt::Display for Encoding {
 
 const LAST_NAMES: &[&str] = &["佐藤", "鈴木", "高橋", "田中", "伊藤"];
 const FIRST_NAMES: &[&str] = &["翔太", "陽菜", "大輝", "美咲", "健太"];
+// LAST_NAMES/FIRST_NAMESと添字が1対1で対応するカタカナ読み(フリガナ)。
+// 同じ添字を使うことで、katakana_name列がname_ja列と同じ氏名の読みを返せるようにしている
+const LAST_NAMES_KANA: &[&str] = &["サトウ", "スズキ", "タカハシ", "タナカ", "イトウ"];
+const FIRST_NAMES_KANA: &[&str] = &["ショウタ", "ヒナ", "ダイキ", "ミサキ", "ケンタ"];
 const PHONE_PREFIXES: &[&str] = &["090", "080", "070"];
 const COMPANY_SUFFIXES: &[&str] = &["商事", "商会", "工業", "産業", "建設", "システム", "フーズ", "物流"];
 
@@ -417,10 +451,28 @@ static ALL_CITIES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock:
     CITIES_BY_PREFECTURE.iter().flat_map(|(_, cities)| cities.iter().copied()).collect()
 });
 
+// 姓・名それぞれの添字を先に決める(姓→名の順)。random_nameと同じ乱数消費順序を保つことで、
+// --seed指定時の出力(既存のテスト・利用者のデータ)が変わらないようにしている。
+// katakana_nameが「同じ行のname_ja列と同じ氏名の読み」を作るには、文字列ではなく
+// この添字そのものが必要になる(文字列から元の添字を逆引きするのは面倒なため)
+fn random_name_indices(rng: &mut impl Rng) -> (usize, usize) {
+    (rng.gen_range(0..LAST_NAMES.len()), rng.gen_range(0..FIRST_NAMES.len()))
+}
+
+fn format_name(last_idx: usize, first_idx: usize) -> String {
+    format!("{}{}", LAST_NAMES[last_idx], FIRST_NAMES[first_idx])
+}
+
 fn random_name(rng: &mut impl Rng) -> String {
-    let last = LAST_NAMES[rng.gen_range(0..LAST_NAMES.len())];
-    let first = FIRST_NAMES[rng.gen_range(0..FIRST_NAMES.len())];
-    format!("{}{}", last, first)
+    let (last_idx, first_idx) = random_name_indices(rng);
+    format_name(last_idx, first_idx)
+}
+
+// context(前の列のname_ja)がSomeなら、その氏名と同じ添字のカタカナ読みを返す。
+// Noneなら独自にランダムな氏名の読みを作る(katakana_name単独使用時のフォールバック)
+fn random_katakana_name(rng: &mut impl Rng, context: Option<(usize, usize)>) -> String {
+    let (last_idx, first_idx) = context.unwrap_or_else(|| random_name_indices(rng));
+    format!("{}{}", LAST_NAMES_KANA[last_idx], FIRST_NAMES_KANA[first_idx])
 }
 
 fn random_email(id: u32) -> String {
@@ -474,40 +526,62 @@ fn random_uuid(rng: &mut impl Rng) -> String {
     uuid::Builder::from_random_bytes(bytes).into_uuid().to_string()
 }
 
+// 同じ行の中で、前の列の生成結果を後ろの列に伝えるための文脈。
+// 列間で参照し合う列タイプ(prefecture_ja→city_ja、name_ja→katakana_name)が増えたため、
+// 個別の引数(context_prefectureなど)を都度増やす代わりに、まとめて1つのstructにしている。
+#[derive(Default)]
+struct RowContext {
+    last_prefecture: Option<String>,
+    last_name_indices: Option<(usize, usize)>,
+}
+
 // 1列分の値を作る。null_rateの確率でNone(NULL)を返す。
-// context_prefectureは「同じ行の、これより前にあるprefecture_ja列の値」(あれば)で、
-// city_ja列がこの都道府県に対応する市区町村を選ぶために使う
+// ctxには「同じ行の、これより前にある列の生成結果」が入っており、
+// city_ja列・katakana_name列がそれぞれprefecture_ja列・name_ja列の値を参照するのに使う。
+// 戻り値の2つ目は「name_ja列として新たに選んだ姓・名の添字」(それ以外の列やNULL・
+// unique_pool経由の場合はNone)で、generate_rowがRowContextに保存するために使う。
 fn generate_cell(
     column: &PreparedColumn,
     row_num: u32,
     rng: &mut impl Rng,
-    context_prefecture: Option<&str>,
-) -> Option<String> {
+    ctx: &RowContext,
+) -> (Option<String>, Option<(usize, usize)>) {
     // uniqueな列は、あらかじめ用意しておいたプールからこの行番号に対応する値を取り出すだけ
     // (unique同士でnull_rateとの併用はprepare_columnsで禁止しているので、Noneになることは無い)
     if let Some(pool) = &column.unique_pool {
-        return Some(pool[(row_num - 1) as usize].clone());
+        return (Some(pool[(row_num - 1) as usize].clone()), None);
     }
 
     if column.null_rate > 0.0 && rng.gen_bool(column.null_rate) {
-        None
-    } else if matches!(column.kind, PreparedColumnType::CityJa) {
-        Some(random_city(rng, context_prefecture))
-    } else {
-        Some(generate_value(&column.kind, row_num, rng))
+        return (None, None);
+    }
+
+    match column.kind {
+        PreparedColumnType::CityJa => (Some(random_city(rng, ctx.last_prefecture.as_deref())), None),
+        PreparedColumnType::KatakanaName => {
+            (Some(random_katakana_name(rng, ctx.last_name_indices)), None)
+        }
+        PreparedColumnType::NameJa => {
+            let (last_idx, first_idx) = random_name_indices(rng);
+            (Some(format_name(last_idx, first_idx)), Some((last_idx, first_idx)))
+        }
+        _ => (Some(generate_value(&column.kind, row_num, rng)), None),
     }
 }
 
-// 1行分(全列)の値を作る。列は前から順番に処理し、prefecture_ja列の値を覚えておいて
-// 後ろにあるcity_ja列に渡す(prefecture_jaはcity_jaより前に定義されている必要がある)
+// 1行分(全列)の値を作る。列は前から順番に処理し、prefecture_ja/name_ja列の値を
+// RowContextに覚えておいて後ろの列(city_ja/katakana_name)に渡す
+// (どちらも「参照される側」の列が「参照する側」の列より前に定義されている必要がある)
 fn generate_row(columns: &[PreparedColumn], row_num: u32, rng: &mut impl Rng) -> Vec<Option<String>> {
-    let mut last_prefecture: Option<String> = None;
+    let mut ctx = RowContext::default();
     let mut values = Vec::with_capacity(columns.len());
 
     for column in columns {
-        let cell = generate_cell(column, row_num, rng, last_prefecture.as_deref());
-        if matches!(column.kind, PreparedColumnType::PrefectureJa) {
-            last_prefecture = cell.clone();
+        let (cell, name_indices) = generate_cell(column, row_num, rng, &ctx);
+        match column.kind {
+            PreparedColumnType::PrefectureJa => ctx.last_prefecture = cell.clone(),
+            PreparedColumnType::NameJa => ctx.last_name_indices = name_indices,
+            _ => {}
         }
         values.push(cell);
     }
@@ -539,8 +613,10 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::CompanyNameJa => random_company_name(rng),
         PreparedColumnType::Uuid => random_uuid(rng),
         PreparedColumnType::PrefectureJa => random_prefecture(rng),
-        // context(前の列のprefecture_ja)が無い状態での単独生成。文脈付きの生成はgenerate_cellが行う
+        // context(前の列のprefecture_ja/name_ja)が無い状態での単独生成。
+        // 文脈付きの生成はgenerate_cellが行う
         PreparedColumnType::CityJa => random_city(rng, None),
+        PreparedColumnType::KatakanaName => random_katakana_name(rng, None),
         PreparedColumnType::Enum { choices } => choices[rng.gen_range(0..choices.len())].clone(),
     }
 }
@@ -559,6 +635,7 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
             | PreparedColumnType::Uuid
             | PreparedColumnType::PrefectureJa
             | PreparedColumnType::CityJa
+            | PreparedColumnType::KatakanaName
             | PreparedColumnType::Enum { .. }
     )
 }
@@ -1289,6 +1366,57 @@ mod tests {
         let schema = schema_from_yaml("row_count: 5\ncolumns:\n  - name: city\n    type: city_ja\n");
         let columns = prepare_columns(&schema).unwrap();
         assert!(misplaced_city_ja_warnings(&columns).is_empty());
+    }
+
+    // --- ここから F1-4(katakana_name) のテスト ---
+
+    #[test]
+    fn kana_name_arrays_have_same_length_as_name_arrays() {
+        assert_eq!(LAST_NAMES.len(), LAST_NAMES_KANA.len());
+        assert_eq!(FIRST_NAMES.len(), FIRST_NAMES_KANA.len());
+    }
+
+    #[test]
+    fn katakana_name_matches_preceding_name_ja() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: name\n    type: name_ja\n  - name: kana\n    type: katakana_name\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 7).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let mut parts = line.split(',');
+            let name = parts.next().unwrap();
+            let kana = parts.next().unwrap();
+            let last_idx = LAST_NAMES.iter().position(|&n| name.starts_with(n)).unwrap();
+            let first_idx = FIRST_NAMES.iter().position(|&n| name.ends_with(n)).unwrap();
+            assert_eq!(kana, format!("{}{}", LAST_NAMES_KANA[last_idx], FIRST_NAMES_KANA[first_idx]));
+        }
+    }
+
+    #[test]
+    fn katakana_name_without_name_ja_falls_back() {
+        let schema = schema_from_yaml("row_count: 10\ncolumns:\n  - name: kana\n    type: katakana_name\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        assert_eq!(csv_text.lines().skip(1).count(), 10);
+    }
+
+    #[test]
+    fn warns_when_name_ja_comes_after_katakana_name() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: kana\n    type: katakana_name\n  - name: name\n    type: name_ja\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert_eq!(misplaced_katakana_name_warnings(&columns).len(), 1);
+    }
+
+    #[test]
+    fn no_warning_when_name_ja_comes_before_katakana_name() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: name\n    type: name_ja\n  - name: kana\n    type: katakana_name\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert!(misplaced_katakana_name_warnings(&columns).is_empty());
     }
 
     #[test]

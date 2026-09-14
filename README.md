@@ -77,6 +77,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 |---|---|---|
 | `sequence` | 1から始まる連番 | なし |
 | `name_ja` | 日本語のランダムな氏名 | なし |
+| `katakana_name` | フリガナ。**直前に`name_ja`列があれば、その氏名と対応する読みを選ぶ**。無ければランダム | なし |
 | `email` | `user{連番}@example.com` | なし |
 | `integer` | `min`〜`max`のランダムな整数 | `min`, `max` |
 | `float` | `min`〜`max`のランダムな小数 | `min`, `max`, `decimals`(省略時2) |
@@ -135,6 +136,20 @@ columns:
 ```
 
 `city_ja`だけを単独で使った場合は、全都道府県の市区町村からランダムに選ぶ。`prefecture_ja`列は定義してあるのに`city_ja`より**後ろ**にある場合(順序を間違えた場合)は、対応関係が保てないため実行時に警告が表示される。
+
+### 氏名の整合性
+
+`name_ja`列の**後ろ**に`katakana_name`列を書くと、その行の氏名と対応するフリガナが選ばれる(都道府県⇔市区町村と同じ考え方)。
+
+```yaml
+columns:
+  - name: name
+    type: name_ja
+  - name: kana_name
+    type: katakana_name # nameより後ろに書く
+```
+
+`katakana_name`だけを単独で使った場合はランダムなフリガナを選ぶ。`name_ja`列は定義してあるのに`katakana_name`より後ろにある場合は、都道府県⇔市区町村のときと同様に警告が表示される。
 
 ### 進捗表示
 

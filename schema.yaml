@@ -6,6 +6,8 @@ columns:
     type: sequence   # 1から始まる連番
   - name: name
     type: name_ja     # 日本語のランダムな氏名
+  - name: kana_name
+    type: katakana_name # nameより後ろに書くと、その氏名と対応するフリガナになる
   - name: email
     type: email       # user{連番}@example.com 形式のメールアドレス
   - name: age
