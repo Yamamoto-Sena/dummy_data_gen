@@ -134,6 +134,22 @@ enum PreparedColumnType {
 }
 
 fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::error::Error>> {
+    if schema.columns.is_empty() {
+        return Err("columns には少なくとも1つ以上の列を定義してください".into());
+    }
+
+    for i in 0..schema.columns.len() {
+        for j in (i + 1)..schema.columns.len() {
+            if schema.columns[i].name == schema.columns[j].name {
+                return Err(format!(
+                    "列名 \"{}\" が重複しています。列名は一意にしてください",
+                    schema.columns[i].name
+                )
+                .into());
+            }
+        }
+    }
+
     schema
         .columns
         .iter()
@@ -304,6 +320,13 @@ fn sql_literal(kind: &PreparedColumnType, value: &str) -> String {
     }
 }
 
+// テーブル名・列名(識別子)を "..." で囲む。囲まないと、名前に , や " などSQLとして
+// 意味を持つ文字が含まれていた場合に文の構造そのものが壊れてしまう
+// (例: 列名 "id, name" をそのまま埋め込むと、列の数とVALUESの値の数が食い違ってしまう)
+fn sql_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 // 一度に書き出す行数(あまり大きいINSERT文1本にまとめると読みにくく、SQLエンジン側の
 // 上限に引っかかることもあるため、この件数ごとにINSERT文を分ける)
 const SQL_BATCH_SIZE: u32 = 1000;
@@ -317,9 +340,10 @@ fn build_sql(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let column_names = columns
         .iter()
-        .map(|c| c.name.as_str())
+        .map(|c| sql_ident(&c.name))
         .collect::<Vec<_>>()
         .join(", ");
+    let table_ident = sql_ident(table_name);
 
     // 各行の "(値1, 値2, ...)" 文字列を、行ごとに独立してrayonで並列に作る。
     // into_par_iter().map(...).collect() は行番号順を保ったまま結果を集めてくれる。
@@ -342,7 +366,7 @@ fn build_sql(
     // INSERT文の組み立て(バッチ分割)はファイル1本を順番に書くだけなので並列化せず、ここだけ直列に行う
     let mut sql = String::new();
     for batch in value_rows.chunks(SQL_BATCH_SIZE as usize) {
-        sql.push_str(&format!("INSERT INTO {} ({}) VALUES\n", table_name, column_names));
+        sql.push_str(&format!("INSERT INTO {} ({}) VALUES\n", table_ident, column_names));
         sql.push_str(&batch.join(",\n"));
         sql.push_str(";\n\n");
     }
@@ -383,15 +407,45 @@ fn build_csv(
 }
 
 // UTF-8のテキストを、指定された文字コードでファイルに書き出す(CSV/SQL共通の後処理)
+// UTF-8の文字列をShift-JISのバイト列に変換する。
+// encoding_rsの encode() / encode_from_utf8() は(HTMLの仕様に合わせて)変換できない文字を
+// "&#12345;" のようなHTML文字参照に置き換えるが、CSV/SQLのデータにHTML文字参照が紛れ込むと
+// (取り込み先ではHTMLとして解釈されないので)ただの意味不明な文字列になってしまう。
+// そのため、変換できない文字を自分で検出して "?" 1文字に置き換える
+// (encode_from_utf8_without_replacement を使う、encoding_rs公式ドキュメント記載の定石)。
+fn encode_to_sjis(text: &str) -> (Vec<u8>, bool) {
+    let mut encoder = encoding_rs::SHIFT_JIS.new_encoder();
+    let mut out = Vec::with_capacity(text.len());
+    let mut buf = [0u8; 4096];
+    let mut remaining = text;
+    let mut had_errors = false;
+
+    loop {
+        let (result, read, written) =
+            encoder.encode_from_utf8_without_replacement(remaining, &mut buf, true);
+        out.extend_from_slice(&buf[..written]);
+        remaining = &remaining[read..];
+
+        match result {
+            encoding_rs::EncoderResult::InputEmpty => break,
+            encoding_rs::EncoderResult::OutputFull => continue, // bufが埋まっただけ。続きを処理する
+            encoding_rs::EncoderResult::Unmappable(_) => {
+                out.push(b'?');
+                had_errors = true;
+            }
+        }
+    }
+
+    (out, had_errors)
+}
+
 fn write_text(text: &str, path: &str, encoding: Encoding) -> Result<(), Box<dyn std::error::Error>> {
     match encoding {
         Encoding::Utf8 => std::fs::write(path, text)?,
         Encoding::Sjis => {
-            // encode()はUTF-8の文字列をShift-JISのバイト列に変換する。
-            // Shift-JISで表現できない文字があった場合はhad_errorsがtrueになる。
-            let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(text);
+            let (bytes, had_errors) = encode_to_sjis(text);
             if had_errors {
-                eprintln!("警告: Shift-JISに変換できない文字が含まれていました");
+                eprintln!("警告: Shift-JISに変換できない文字が '?' に置き換えられました");
             }
             std::fs::write(path, bytes)?;
         }
@@ -482,6 +536,46 @@ mod tests {
     fn sql_literal_quotes_text_columns_and_escapes_quote() {
         let quoted = sql_literal(&PreparedColumnType::NameJa, "O'Brien");
         assert_eq!(quoted, "'O''Brien'");
+    }
+
+    // 回帰テスト: 列名にカンマが含まれると、以前はINSERT文の列数とVALUESの値の数が
+    // ずれて壊れたSQLになっていた(sql_ident で列名/テーブル名をクォートして修正)
+    #[test]
+    fn build_sql_quotes_column_names_containing_comma() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ntable_name: t\ncolumns:\n  - name: \"id, name\"\n    type: sequence\n  - name: email\n    type: email\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let sql = build_sql(schema.row_count, &columns, "t", 42).unwrap();
+        assert!(sql.contains("\"id, name\""));
+        assert!(sql.starts_with("INSERT INTO \"t\" (\"id, name\", \"email\") VALUES"));
+        // 値は2個(列も2個)であるべき
+        let values_line = sql.lines().nth(1).unwrap();
+        assert_eq!(values_line.matches(',').count(), 1);
+    }
+
+    #[test]
+    fn prepare_columns_rejects_empty_columns() {
+        let schema = schema_from_yaml("row_count: 1\ncolumns: []\n");
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn prepare_columns_rejects_duplicate_column_names() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: id\n    type: sequence\n  - name: id\n    type: email\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    // 回帰テスト: 以前はShift-JISで表現できない文字をHTML文字参照("&#12345;")に
+    // 置き換えていたため、CSV/SQLの中に意味不明な文字列が紛れ込んでいた
+    #[test]
+    fn encode_to_sjis_replaces_unmappable_chars_with_question_mark_not_html_entity() {
+        let (bytes, had_errors) = encode_to_sjis("絵文字🎉列");
+        assert!(had_errors);
+        let (decoded, _, _) = encoding_rs::SHIFT_JIS.decode(&bytes);
+        assert_eq!(decoded, "絵文字?列");
     }
 
     #[test]
