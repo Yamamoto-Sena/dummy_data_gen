@@ -47,6 +47,8 @@ enum Format {
     Sql,
     #[value(name = "json")]
     Json,
+    #[value(name = "xlsx")]
+    Xlsx,
 }
 
 impl std::fmt::Display for Format {
@@ -55,6 +57,7 @@ impl std::fmt::Display for Format {
             Format::Csv => write!(f, "csv"),
             Format::Sql => write!(f, "sql"),
             Format::Json => write!(f, "json"),
+            Format::Xlsx => write!(f, "xlsx"),
         }
     }
 }
@@ -111,6 +114,8 @@ enum ColumnType {
     AddressJa,
     CompanyNameJa,
     Uuid,
+    PrefectureJa,
+    CityJa,
     Enum {
         choices: Vec<String>,
     },
@@ -154,6 +159,8 @@ enum PreparedColumnType {
     AddressJa,
     CompanyNameJa,
     Uuid,
+    PrefectureJa,
+    CityJa,
     Enum { choices: Vec<String> },
 }
 
@@ -222,6 +229,8 @@ fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::
                 ColumnType::AddressJa => PreparedColumnType::AddressJa,
                 ColumnType::CompanyNameJa => PreparedColumnType::CompanyNameJa,
                 ColumnType::Uuid => PreparedColumnType::Uuid,
+                ColumnType::PrefectureJa => PreparedColumnType::PrefectureJa,
+                ColumnType::CityJa => PreparedColumnType::CityJa,
                 ColumnType::Enum { choices } => {
                     if choices.is_empty() {
                         return Err(format!("列 \"{}\": choices には1つ以上の選択肢が必要です", c.name).into());
@@ -355,10 +364,26 @@ impl std::fmt::Display for Encoding {
 
 const LAST_NAMES: &[&str] = &["佐藤", "鈴木", "高橋", "田中", "伊藤"];
 const FIRST_NAMES: &[&str] = &["翔太", "陽菜", "大輝", "美咲", "健太"];
-const PREFECTURES: &[&str] = &["東京都", "大阪府", "愛知県", "北海道", "福岡県"];
-const CITIES: &[&str] = &["中央区", "港区", "西区", "本町", "緑区"];
 const PHONE_PREFIXES: &[&str] = &["090", "080", "070"];
 const COMPANY_SUFFIXES: &[&str] = &["商事", "商会", "工業", "産業", "建設", "システム", "フーズ", "物流"];
+
+// 都道府県ごとに「その都道府県に実在する市区町村っぽい名前」を対応させたもの。
+// address_ja(1列で住所)と、prefecture_ja + city_ja(2列に分けたとき)の両方で
+// このテーブルを共有することで、「東京都なのに市区町村は北海道の地名」のような
+// 不自然な組み合わせが起きないようにしている(F4-2: 列間整合性)。
+const CITIES_BY_PREFECTURE: &[(&str, &[&str])] = &[
+    ("東京都", &["新宿区", "渋谷区", "港区", "台東区", "世田谷区"]),
+    ("大阪府", &["中央区", "北区", "天王寺区", "堺市", "豊中市"]),
+    ("愛知県", &["中区", "東区", "豊田市", "岡崎市", "一宮市"]),
+    ("北海道", &["札幌市中央区", "函館市", "旭川市", "小樽市", "帯広市"]),
+    ("福岡県", &["博多区", "北九州市", "久留米市", "大野城市", "春日市"]),
+];
+
+// city_ja列だけを単独で(prefecture_ja列との組み合わせなしで)使ったときのために、
+// 全都道府県の市区町村をまとめたリストを1回だけ計算しておく
+static ALL_CITIES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    CITIES_BY_PREFECTURE.iter().flat_map(|(_, cities)| cities.iter().copied()).collect()
+});
 
 fn random_name(rng: &mut impl Rng) -> String {
     let last = LAST_NAMES[rng.gen_range(0..LAST_NAMES.len())];
@@ -380,9 +405,25 @@ fn random_phone(rng: &mut impl Rng) -> String {
 }
 
 fn random_address(rng: &mut impl Rng) -> String {
-    let pref = PREFECTURES[rng.gen_range(0..PREFECTURES.len())];
-    let city = CITIES[rng.gen_range(0..CITIES.len())];
+    let (pref, cities) = CITIES_BY_PREFECTURE[rng.gen_range(0..CITIES_BY_PREFECTURE.len())];
+    let city = cities[rng.gen_range(0..cities.len())];
     format!("{}{}{}-{}", pref, city, rng.gen_range(1..20), rng.gen_range(1..20))
+}
+
+fn random_prefecture(rng: &mut impl Rng) -> String {
+    CITIES_BY_PREFECTURE[rng.gen_range(0..CITIES_BY_PREFECTURE.len())].0.to_string()
+}
+
+// context_prefectureがSome(その行のprefecture_ja列の値)なら、その都道府県に実在する
+// 市区町村の中からランダムに選ぶ。None(prefecture_ja列がスキーマに無い等)なら、
+// 全都道府県の市区町村からランダムに選ぶ(city_ja単独使用時のフォールバック)
+fn random_city(rng: &mut impl Rng, context_prefecture: Option<&str>) -> String {
+    if let Some(pref) = context_prefecture
+        && let Some((_, cities)) = CITIES_BY_PREFECTURE.iter().find(|(p, _)| *p == pref)
+    {
+        return cities[rng.gen_range(0..cities.len())].to_string();
+    }
+    ALL_CITIES[rng.gen_range(0..ALL_CITIES.len())].to_string()
 }
 
 // 氏名で使っている姓のリスト(LAST_NAMES)を「創業者の名字っぽい会社名」として再利用する
@@ -401,8 +442,15 @@ fn random_uuid(rng: &mut impl Rng) -> String {
     uuid::Builder::from_random_bytes(bytes).into_uuid().to_string()
 }
 
-// 1列分の値を作る。null_rateの確率でNone(NULL)を返す
-fn generate_cell(column: &PreparedColumn, row_num: u32, rng: &mut impl Rng) -> Option<String> {
+// 1列分の値を作る。null_rateの確率でNone(NULL)を返す。
+// context_prefectureは「同じ行の、これより前にあるprefecture_ja列の値」(あれば)で、
+// city_ja列がこの都道府県に対応する市区町村を選ぶために使う
+fn generate_cell(
+    column: &PreparedColumn,
+    row_num: u32,
+    rng: &mut impl Rng,
+    context_prefecture: Option<&str>,
+) -> Option<String> {
     // uniqueな列は、あらかじめ用意しておいたプールからこの行番号に対応する値を取り出すだけ
     // (unique同士でnull_rateとの併用はprepare_columnsで禁止しているので、Noneになることは無い)
     if let Some(pool) = &column.unique_pool {
@@ -411,14 +459,28 @@ fn generate_cell(column: &PreparedColumn, row_num: u32, rng: &mut impl Rng) -> O
 
     if column.null_rate > 0.0 && rng.gen_bool(column.null_rate) {
         None
+    } else if matches!(column.kind, PreparedColumnType::CityJa) {
+        Some(random_city(rng, context_prefecture))
     } else {
         Some(generate_value(&column.kind, row_num, rng))
     }
 }
 
-// 1行分(全列)の値を作る
+// 1行分(全列)の値を作る。列は前から順番に処理し、prefecture_ja列の値を覚えておいて
+// 後ろにあるcity_ja列に渡す(prefecture_jaはcity_jaより前に定義されている必要がある)
 fn generate_row(columns: &[PreparedColumn], row_num: u32, rng: &mut impl Rng) -> Vec<Option<String>> {
-    columns.iter().map(|c| generate_cell(c, row_num, rng)).collect()
+    let mut last_prefecture: Option<String> = None;
+    let mut values = Vec::with_capacity(columns.len());
+
+    for column in columns {
+        let cell = generate_cell(column, row_num, rng, last_prefecture.as_deref());
+        if matches!(column.kind, PreparedColumnType::PrefectureJa) {
+            last_prefecture = cell.clone();
+        }
+        values.push(cell);
+    }
+
+    values
 }
 
 // 列タイプに応じて、1つ分の値を作る。row_numは「今何行目か(1始まり)」
@@ -444,6 +506,9 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::AddressJa => random_address(rng),
         PreparedColumnType::CompanyNameJa => random_company_name(rng),
         PreparedColumnType::Uuid => random_uuid(rng),
+        PreparedColumnType::PrefectureJa => random_prefecture(rng),
+        // context(前の列のprefecture_ja)が無い状態での単独生成。文脈付きの生成はgenerate_cellが行う
+        PreparedColumnType::CityJa => random_city(rng, None),
         PreparedColumnType::Enum { choices } => choices[rng.gen_range(0..choices.len())].clone(),
     }
 }
@@ -460,8 +525,47 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
             | PreparedColumnType::AddressJa
             | PreparedColumnType::CompanyNameJa
             | PreparedColumnType::Uuid
+            | PreparedColumnType::PrefectureJa
+            | PreparedColumnType::CityJa
             | PreparedColumnType::Enum { .. }
     )
+}
+
+// 進捗バーを表示する行数のしきい値。これより少ない行数だと一瞬で終わってしまい、
+// バーを表示してもチラッと見えるだけで邪魔なうえ、cargo testの出力も汚れるので隠す
+const PROGRESS_BAR_THRESHOLD: u32 = 1000;
+
+fn new_progress_bar(row_count: u32) -> indicatif::ProgressBar {
+    if row_count < PROGRESS_BAR_THRESHOLD {
+        return indicatif::ProgressBar::hidden();
+    }
+    let bar = indicatif::ProgressBar::new(row_count as u64);
+    bar.set_style(
+        indicatif::ProgressStyle::with_template("生成中 [{bar:40.cyan/blue}] {pos}/{len}行 ({percent}%)")
+            .expect("テンプレート文字列は固定なので必ずパースできる")
+            .progress_chars("=>-"),
+    );
+    bar
+}
+
+// 全行・全列の値を、rayonで並列に生成する。CSV/SQL/JSON/Excelどの出力形式でも
+// 「値を作る」部分は共通なので、ここに一本化している(進捗バーの更新もここでまとめて行う)。
+// ファイルへの書き込み(直列処理が必要)は、それぞれのbuild_*関数が個別に行う。
+fn generate_all_rows(row_count: u32, columns: &[PreparedColumn], base_seed: u64) -> Vec<Vec<Option<String>>> {
+    let progress = new_progress_bar(row_count);
+
+    let rows: Vec<Vec<Option<String>>> = (1..=row_count)
+        .into_par_iter()
+        .map(|row_num| {
+            let mut rng = row_rng(base_seed, row_num);
+            let row = generate_row(columns, row_num, &mut rng);
+            progress.inc(1);
+            row
+        })
+        .collect();
+
+    progress.finish_and_clear();
+    rows
 }
 
 // SQL文字列リテラルの中に ' が含まれていると構文が壊れるので '' に二重化してエスケープする
@@ -498,17 +602,17 @@ fn build_sql(
         .join(", ");
     let table_ident = sql_ident(table_name);
 
-    // 各行の "(値1, 値2, ...)" 文字列を、行ごとに独立してrayonで並列に作る。
-    // into_par_iter().map(...).collect() は行番号順を保ったまま結果を集めてくれる。
-    let value_rows: Vec<String> = (1..=row_count)
-        .into_par_iter()
-        .map(|row_num| {
-            let mut rng = row_rng(base_seed, row_num);
-            let values: Vec<String> = generate_row(columns, row_num, &mut rng)
-                .into_iter()
+    // 値の生成(rayonで並列)はgenerate_all_rowsにまとめてある。
+    // "(値1, 値2, ...)" という文字列への組み立てはここで直列に行う。
+    let rows = generate_all_rows(row_count, columns, base_seed);
+    let value_rows: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let values: Vec<String> = row
+                .iter()
                 .zip(columns)
                 .map(|(cell, c)| match cell {
-                    Some(v) => sql_literal(&c.kind, &v),
+                    Some(v) => sql_literal(&c.kind, v),
                     None => "NULL".to_string(), // SQLのNULLはクォートしてはいけない
                 })
                 .collect();
@@ -533,26 +637,18 @@ fn build_csv(
     columns: &[PreparedColumn],
     base_seed: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // 行ごとの値生成はCPUを使う処理なので、rayonで複数スレッドに分散して並列に行う。
+    // 値の生成(rayonで並列)はgenerate_all_rowsにまとめてある。
     // csv::Writerへの書き込みは順番が大事なので、生成が終わった後にまとめて直列に書く。
     // NULL(None)はCSVでは空文字として書き出す
-    let rows: Vec<Vec<String>> = (1..=row_count)
-        .into_par_iter()
-        .map(|row_num| {
-            let mut rng = row_rng(base_seed, row_num);
-            generate_row(columns, row_num, &mut rng)
-                .into_iter()
-                .map(|cell| cell.unwrap_or_default())
-                .collect()
-        })
-        .collect();
+    let rows = generate_all_rows(row_count, columns, base_seed);
 
     let mut writer = csv::Writer::from_writer(Vec::new());
     let headers: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     writer.write_record(&headers)?; // ヘッダー行
 
     for row in &rows {
-        writer.write_record(row)?;
+        let record: Vec<&str> = row.iter().map(|cell| cell.as_deref().unwrap_or("")).collect();
+        writer.write_record(&record)?;
     }
 
     let bytes = writer.into_inner()?; // 内部バッファ(UTF-8のバイト列)を取り出す
@@ -659,13 +755,12 @@ fn build_json(
     columns: &[PreparedColumn],
     base_seed: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let lines: Vec<String> = (1..=row_count)
-        .into_par_iter()
-        .map(|row_num| {
-            let mut rng = row_rng(base_seed, row_num);
-            let cells = generate_row(columns, row_num, &mut rng);
+    let rows = generate_all_rows(row_count, columns, base_seed);
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|row| {
             let mut object = serde_json::Map::with_capacity(columns.len());
-            for (column, cell) in columns.iter().zip(cells) {
+            for (column, cell) in columns.iter().zip(row) {
                 object.insert(column.name.clone(), cell_to_json(&column.kind, cell.as_deref()));
             }
             serde_json::to_string(&object).expect("serde_jsonのオブジェクト直列化は失敗しない")
@@ -686,6 +781,68 @@ fn write_json(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let json_text = build_json(row_count, columns, base_seed)?;
     write_text(&json_text, path, encoding)
+}
+
+// 列タイプに応じて、Excelのセルに数値/真偽値/文字列として書き込む。NULL(None)は何も
+// 書かない(Excel上は空白セルになる。これが最も自然なNULLの表現)
+fn write_xlsx_cell(
+    worksheet: &mut rust_xlsxwriter::Worksheet,
+    row: u32,
+    col: u16,
+    kind: &PreparedColumnType,
+    cell: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(value) = cell else {
+        return Ok(());
+    };
+
+    match kind {
+        PreparedColumnType::Sequence | PreparedColumnType::Integer { .. } | PreparedColumnType::Float { .. } => {
+            if let Ok(number) = value.parse::<f64>() {
+                worksheet.write_number(row, col, number)?;
+            } else {
+                worksheet.write_string(row, col, value)?;
+            }
+        }
+        PreparedColumnType::Boolean => {
+            worksheet.write_boolean(row, col, value == "true")?;
+        }
+        _ => {
+            worksheet.write_string(row, col, value)?;
+        }
+    }
+
+    Ok(())
+}
+
+// Excel(.xlsx)ファイルを直接組み立てて保存する。xlsxはCSV/SQL/JSONと違ってテキストではなく
+// バイナリ(実体はZIP)形式なので、build_*関数で文字列を作ってからwrite_textに渡す、という
+// これまでの流れには乗せられず、ここだけ生成から保存まで独立して行っている。
+// また、xlsxは常にUTF-8相当の内部表現を持つファイル形式のため、--encodingは効かない。
+fn write_xlsx(
+    row_count: u32,
+    columns: &[PreparedColumn],
+    base_seed: u64,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rows = generate_all_rows(row_count, columns, base_seed);
+
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let worksheet = workbook.add_worksheet();
+
+    for (col_idx, column) in columns.iter().enumerate() {
+        worksheet.write_string(0, col_idx as u16, &column.name)?;
+    }
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        let excel_row = (row_idx + 1) as u32; // 0行目はヘッダーなので、データは1行目から
+        for (col_idx, (column, cell)) in columns.iter().zip(row).enumerate() {
+            write_xlsx_cell(worksheet, excel_row, col_idx as u16, &column.kind, cell.as_deref())?;
+        }
+    }
+
+    workbook.save(path)?;
+    Ok(())
 }
 
 fn main() {
@@ -717,8 +874,13 @@ fn main() {
         Format::Csv => "output.csv",
         Format::Sql => "output.sql",
         Format::Json => "output.json",
+        Format::Xlsx => "output.xlsx",
     };
     let path = args.output.as_deref().unwrap_or(default_path);
+
+    if matches!(args.format, Format::Xlsx) && matches!(args.encoding, Encoding::Sjis) {
+        eprintln!("警告: --format xlsxでは--encodingは無視されます(Excelファイルは常にUTF-8相当の内部形式です)");
+    }
 
     let result = match args.format {
         Format::Csv => write_csv(schema.row_count, &columns, base_seed, path, args.encoding),
@@ -729,6 +891,7 @@ fn main() {
             None => Err("SQL出力(--format sql)には、schema.yamlに table_name の指定が必要です".into()),
         },
         Format::Json => write_json(schema.row_count, &columns, base_seed, path, args.encoding),
+        Format::Xlsx => write_xlsx(schema.row_count, &columns, base_seed, path),
     };
 
     match result {
@@ -1031,5 +1194,71 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).unwrap();
             assert!(value["name"].is_null());
         }
+    }
+
+    // --- ここから F2-2(xlsx) / F3-2(進捗表示) / F4-2(列間整合性) のテスト ---
+
+    #[test]
+    fn progress_bar_is_hidden_below_threshold_and_visible_above_it() {
+        // is_hidden()は実行環境(ターミナルかどうか)にも左右されてしまうため、
+        // 代わりに「バーの長さが設定されているか」でしきい値のロジック自体を確認する
+        // (ProgressBar::hidden()は長さを持たない)
+        assert_eq!(new_progress_bar(PROGRESS_BAR_THRESHOLD - 1).length(), None);
+        assert_eq!(new_progress_bar(PROGRESS_BAR_THRESHOLD).length(), Some(PROGRESS_BAR_THRESHOLD as u64));
+    }
+
+    #[test]
+    fn city_ja_matches_the_preceding_prefecture_ja_column() {
+        let schema = schema_from_yaml(
+            "row_count: 50\ncolumns:\n  - name: pref\n    type: prefecture_ja\n  - name: city\n    type: city_ja\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 7).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let mut parts = line.split(',');
+            let pref = parts.next().unwrap();
+            let city = parts.next().unwrap();
+            let (_, cities) = CITIES_BY_PREFECTURE.iter().find(|(p, _)| *p == pref).unwrap();
+            assert!(cities.contains(&city), "{city} is not a city of {pref}");
+        }
+    }
+
+    #[test]
+    fn city_ja_without_prefecture_ja_falls_back_to_any_city() {
+        // prefecture_ja列が無い場合でもエラーにならず、どこかの市区町村が選ばれる
+        let schema = schema_from_yaml("row_count: 10\ncolumns:\n  - name: city\n    type: city_ja\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(ALL_CITIES.contains(&line));
+        }
+    }
+
+    #[test]
+    fn write_xlsx_produces_a_readable_workbook_with_correct_types_and_nulls() {
+        let schema = schema_from_yaml(
+            "row_count: 8\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n    null_rate: 1.0\n  - name: active\n    type: boolean\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let path = std::env::temp_dir().join("dummy_data_gen_test.xlsx");
+        let path_str = path.to_str().unwrap();
+
+        write_xlsx(schema.row_count, &columns, 42, path_str).unwrap();
+
+        use calamine::{DataType, Reader};
+        let mut workbook: calamine::Xlsx<_> = calamine::open_workbook(path_str).unwrap();
+        let range = workbook.worksheet_range_at(0).unwrap().unwrap();
+        let rows: Vec<_> = range.rows().collect();
+
+        assert_eq!(rows.len(), 9); // ヘッダー1行 + データ8行
+        assert_eq!(rows[0][0].to_string(), "id");
+
+        for row in &rows[1..] {
+            assert!(row[0].is_int() || row[0].is_float()); // idは数値
+            assert!(row[1].is_empty()); // nameはnull_rate:1.0なので常に空セル
+            assert!(row[2].get_bool().is_some()); // activeは真偽値
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

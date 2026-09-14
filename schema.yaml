@@ -32,5 +32,11 @@ columns:
   - name: phone
     type: phone_ja    # 携帯電話番号風(090/080/070-XXXX-XXXX)
     null_rate: 0.1    # 10%の確率で未入力(NULL)にする。任意の列タイプに付けられる
-  - name: address
-    type: address_ja  # 都道府県+市区町村風の簡易的な住所
+  - name: prefecture
+    type: prefecture_ja # 都道府県
+  - name: city
+    type: city_ja       # prefectureより後ろに書くと、その都道府県に実在する市区町村になる
+  - name: company
+    type: company_name_ja # 「株式会社〇〇商事」のような会社名
+  - name: uid
+    type: uuid             # UUID v4形式のランダムなID

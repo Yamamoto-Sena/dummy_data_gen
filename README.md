@@ -7,12 +7,14 @@
 - **高速**: 値の生成をRustのマルチスレッド処理(rayon)で並列化。10列×100万行でも数秒で生成できる。
 - **完全オフライン**: ネットワーク通信を一切行わない。テストデータ(氏名・メールアドレス等)を外部サービスに送信できない、社内のセキュリティ規定にも対応しやすい。
 - **YAMLで自由にスキーマ定義**: 列名・型・行数を`schema.yaml`に書くだけ。Gitで管理・レビューできる。
-- **CSV/SQL/JSONに対応**: `--format csv`(デフォルト)/ `--format sql`(`INSERT INTO`文をバッチ生成)/ `--format json`(NDJSON、1行1件)。
+- **CSV/SQL/JSON/Excelに対応**: `--format csv`(デフォルト)/ `--format sql`(`INSERT INTO`文をバッチ生成)/ `--format json`(NDJSON、1行1件)/ `--format xlsx`(Excelファイル)。
 - **Shift-JIS出力に対応**: `--encoding sjis`。Dr.Sum/MotionBoard/Datalizerなど、日本の業務システムはUTF-8だけでなくShift-JISを前提にしていることが多いため。
 - **再現性**: `--seed`で乱数シードを固定すると、同じ設定から毎回同じデータを再現できる。
 - **NULL値の混入**: 列ごとに`null_rate`(0.0〜1.0)を指定すると、指定した確率でNULL(空)を混ぜられる。
 - **enum型列**: `choices`のリストからランダムに1つ選ぶ列を定義できる(会員ステータスなど)。
 - **unique制約**: 列ごとに`unique: true`を指定すると、行間で値が重複しないようにできる。
+- **都道府県⇔市区町村の整合性**: `prefecture_ja`列の後に`city_ja`列を置くと、その都道府県に実在する市区町村が選ばれる。
+- **進捗表示**: 1000行以上のデータを生成するとき、ターミナルに進捗バーを表示する。
 
 ## インストール・ビルド
 
@@ -57,14 +59,14 @@ columns:
 cargo run -- --config schema.yaml --format csv --encoding utf8
 ```
 
-デフォルトでは形式に応じて `output.csv` / `output.sql` / `output.json` に上書き保存される。`--output <path>` で保存先を明示的に指定することもできる。
+デフォルトでは形式に応じて `output.csv` / `output.sql` / `output.json` / `output.xlsx` に上書き保存される。`--output <path>` で保存先を明示的に指定することもできる。
 
 ### CLIオプション
 
 | オプション | 説明 | デフォルト |
 |---|---|---|
 | `--config <path>` | スキーマファイルのパス | `schema.yaml` |
-| `--format <csv\|sql\|json>` | 出力形式。`sql`は`table_name`の指定が必須 | `csv` |
+| `--format <csv\|sql\|json\|xlsx>` | 出力形式。`sql`は`table_name`の指定が必須。`xlsx`では`--encoding`は無視される | `csv` |
 | `--encoding <utf8\|sjis>` | 出力の文字コード | `utf8` |
 | `--seed <数値>` | 乱数シード。指定すると毎回同じデータを再現する | 未指定(毎回ランダム) |
 | `--output <path>` | 出力先ファイルパス | 形式に応じた既定値 |
@@ -85,6 +87,8 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `address_ja` | 都道府県+市区町村の簡易住所 | なし |
 | `company_name_ja` | 「株式会社〇〇商事」のような会社名 | なし |
 | `uuid` | UUID v4形式のランダムなID(例: `550e8400-...`) | なし |
+| `prefecture_ja` | 都道府県 | なし |
+| `city_ja` | 市区町村。**直前に`prefecture_ja`列があれば、その都道府県に実在する地名を選ぶ**。無ければ全都道府県からランダム | なし |
 | `enum` | `choices`の中から均等ランダムに1つ選ぶ | `choices`(文字列のリスト) |
 
 どの列タイプにも `null_rate`(0.0〜1.0)を追加でき、その確率でNULL(CSVでは空文字、SQLではクォートなしの`NULL`、JSONでは`null`)を出力する。
@@ -109,6 +113,32 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 ```
 
 数値・真偽値の列はJSON上でも数値・真偽値として出力され(クォートされない)、NULLは`null`になる。
+
+### Excel(xlsx)出力
+
+`--format xlsx` を指定すると、Excelでそのまま開けるファイルを出力する。数値・真偽値の列はExcel上でも数値・真偽値のセルになり(文字列として入らない)、NULLは空セルになる。`--encoding`はxlsxには意味を持たない(Excelファイルは内部的に常にUTF-8相当のため)。
+
+```bash
+cargo run -- --config schema.yaml --format xlsx --output result.xlsx
+```
+
+### 都道府県⇔市区町村の整合性
+
+`prefecture_ja`列の**後ろ**に`city_ja`列を書くと、その行の都道府県に実在する市区町村が選ばれる(「東京都なのに市区町村は北海道の地名」のような不自然な組み合わせにならない)。
+
+```yaml
+columns:
+  - name: prefecture
+    type: prefecture_ja
+  - name: city
+    type: city_ja # prefectureより後ろに書く
+```
+
+`city_ja`だけを単独で使った場合は、全都道府県の市区町村からランダムに選ぶ。
+
+### 進捗表示
+
+`row_count`が1000以上のとき、生成中にターミナルへ進捗バー(件数・割合)を表示する。ファイルへのリダイレクトなど、ターミナル以外への出力時は自動的に表示されない。
 
 ## Dr.Sum / MotionBoard / Datalizer 等での利用について
 

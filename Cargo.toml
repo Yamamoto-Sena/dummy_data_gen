@@ -14,3 +14,8 @@ chrono = "0.4"
 rayon = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 uuid = "1"
+indicatif = "0.17"
+rust_xlsxwriter = "0.79"
+
+[dev-dependencies]
+calamine = "0.26"
