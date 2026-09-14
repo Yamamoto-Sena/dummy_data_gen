@@ -18,17 +18,20 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Encoding::Utf8)]
     encoding: Encoding,
 
-    /// 出力形式(csv / sql / json / xlsx)。sqlの場合はschema.yamlに table_name の指定が必要。
+    /// 出力形式(csv / sql / json / xlsx)。カンマ区切りで複数指定すると1回の実行で全部出力する
+    /// (例: --format csv,json)。sqlの場合はschema.yamlに table_name の指定が必要。
     /// xlsxの場合は--encodingが無視される(Excelは常にUTF-8相当の内部形式のため)
-    #[arg(long, value_enum, default_value_t = Format::Csv)]
-    format: Format,
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "csv")]
+    format: Vec<Format>,
 
     /// 乱数のシード値。指定すると、同じ設定なら毎回同じデータが再現される(テストや再実行に便利)。
     /// 省略した場合は毎回ランダムなシードを使う
     #[arg(long)]
     seed: Option<u64>,
 
-    /// 出力先ファイルパス。省略時は形式に応じて output.csv / output.sql / output.json / output.xlsx に保存する
+    /// 出力先ファイルパス。省略時は形式に応じて output.csv / output.sql / output.json / output.xlsx に保存する。
+    /// --formatを複数指定したときは拡張子なしのベース名として扱い、形式ごとに拡張子を付ける
+    /// (例: --output result --format csv,json → result.csv / result.json)
     #[arg(long)]
     output: Option<String>,
 }
@@ -40,7 +43,7 @@ fn row_rng(base_seed: u64, row_num: u32) -> SmallRng {
     SmallRng::seed_from_u64(base_seed.wrapping_add(row_num as u64))
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Hash)]
 enum Format {
     #[value(name = "csv")]
     Csv,
@@ -697,12 +700,13 @@ fn sql_ident(name: &str) -> String {
 // 上限に引っかかることもあるため、この件数ごとにINSERT文を分ける)
 const SQL_BATCH_SIZE: u32 = 1000;
 
-// SQLの中身をまずUTF-8の文字列としてメモリ上で組み立てる(ファイルにはまだ書かない)
-fn build_sql(
-    row_count: u32,
+// SQLの中身(行データはgenerate_all_rowsで生成済みのものを受け取る)をUTF-8の文字列として
+// メモリ上で組み立てる(ファイルにはまだ書かない)。複数形式を同時出力するとき、同じ行データを
+// 形式の数だけ重複生成しないよう、「生成」(generate_all_rows)と「清書」(この関数)を分けている。
+fn build_sql_from_rows(
     columns: &[PreparedColumn],
+    rows: &[Vec<Option<String>>],
     table_name: &str,
-    base_seed: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let column_names = columns
         .iter()
@@ -711,9 +715,6 @@ fn build_sql(
         .join(", ");
     let table_ident = sql_ident(table_name);
 
-    // 値の生成(rayonで並列)はgenerate_all_rowsにまとめてある。
-    // "(値1, 値2, ...)" という文字列への組み立てはここで直列に行う。
-    let rows = generate_all_rows(row_count, columns, base_seed);
     let value_rows: Vec<String> = rows
         .iter()
         .map(|row| {
@@ -729,7 +730,7 @@ fn build_sql(
         })
         .collect();
 
-    // INSERT文の組み立て(バッチ分割)はファイル1本を順番に書くだけなので並列化せず、ここだけ直列に行う
+    // INSERT文の組み立て(バッチ分割)はファイル1本を順番に書くだけなので並列化せず、直列に行う
     let mut sql = String::new();
     for batch in value_rows.chunks(SQL_BATCH_SIZE as usize) {
         sql.push_str(&format!("INSERT INTO {} ({}) VALUES\n", table_ident, column_names));
@@ -740,28 +741,46 @@ fn build_sql(
     Ok(sql)
 }
 
-// CSVの中身をまずUTF-8の文字列としてメモリ上で組み立てる(ファイルにはまだ書かない)
-fn build_csv(
+// build_sql_from_rowsの「行数とシードを渡すだけで一発で作れる」版。
+// mainではrowsを1回だけ生成して複数形式で使い回すためこの関数は呼ばないが、
+// 既存のテストが読みやすいようにこの形のまま残してある(テストからのみ使用)
+#[cfg(test)]
+fn build_sql(
     row_count: u32,
     columns: &[PreparedColumn],
+    table_name: &str,
     base_seed: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // 値の生成(rayonで並列)はgenerate_all_rowsにまとめてある。
-    // csv::Writerへの書き込みは順番が大事なので、生成が終わった後にまとめて直列に書く。
-    // NULL(None)はCSVでは空文字として書き出す
-    let rows = generate_all_rows(row_count, columns, base_seed);
+    build_sql_from_rows(columns, &generate_all_rows(row_count, columns, base_seed), table_name)
+}
 
+// CSVの中身(行データは生成済みのものを受け取る)をUTF-8の文字列として組み立てる。
+// NULL(None)はCSVでは空文字として書き出す
+fn build_csv_from_rows(
+    columns: &[PreparedColumn],
+    rows: &[Vec<Option<String>>],
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut writer = csv::Writer::from_writer(Vec::new());
     let headers: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     writer.write_record(&headers)?; // ヘッダー行
 
-    for row in &rows {
+    for row in rows {
         let record: Vec<&str> = row.iter().map(|cell| cell.as_deref().unwrap_or("")).collect();
         writer.write_record(&record)?;
     }
 
     let bytes = writer.into_inner()?; // 内部バッファ(UTF-8のバイト列)を取り出す
     Ok(String::from_utf8(bytes)?)
+}
+
+// build_csv_from_rowsの「行数とシードを渡すだけで一発で作れる」版(テストからのみ使用)
+#[cfg(test)]
+fn build_csv(
+    row_count: u32,
+    columns: &[PreparedColumn],
+    base_seed: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    build_csv_from_rows(columns, &generate_all_rows(row_count, columns, base_seed))
 }
 
 // UTF-8のテキストを、指定された文字コードでファイルに書き出す(CSV/SQL共通の後処理)
@@ -812,29 +831,6 @@ fn write_text(text: &str, path: &str, encoding: Encoding) -> Result<(), Box<dyn 
     Ok(())
 }
 
-fn write_csv(
-    row_count: u32,
-    columns: &[PreparedColumn],
-    base_seed: u64,
-    path: &str,
-    encoding: Encoding,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let csv_text = build_csv(row_count, columns, base_seed)?;
-    write_text(&csv_text, path, encoding)
-}
-
-fn write_sql(
-    row_count: u32,
-    columns: &[PreparedColumn],
-    table_name: &str,
-    base_seed: u64,
-    path: &str,
-    encoding: Encoding,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let sql_text = build_sql(row_count, columns, table_name, base_seed)?;
-    write_text(&sql_text, path, encoding)
-}
-
 // 列タイプに応じて、文字列の値を適切なJSONの型(数値・真偽値・文字列・null)に変換する
 fn cell_to_json(kind: &PreparedColumnType, cell: Option<&str>) -> serde_json::Value {
     let value = match cell {
@@ -858,13 +854,12 @@ fn cell_to_json(kind: &PreparedColumnType, cell: Option<&str>) -> serde_json::Va
     }
 }
 
-// JSON(NDJSON = 1行1件のJSONオブジェクト)の中身をUTF-8の文字列としてメモリ上で組み立てる
-fn build_json(
-    row_count: u32,
+// JSON(NDJSON = 1行1件のJSONオブジェクト)の中身(行データは生成済みのものを受け取る)を
+// UTF-8の文字列として組み立てる
+fn build_json_from_rows(
     columns: &[PreparedColumn],
-    base_seed: u64,
+    rows: &[Vec<Option<String>>],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let rows = generate_all_rows(row_count, columns, base_seed);
     let lines: Vec<String> = rows
         .iter()
         .map(|row| {
@@ -881,15 +876,14 @@ fn build_json(
     Ok(text)
 }
 
-fn write_json(
+// build_json_from_rowsの「行数とシードを渡すだけで一発で作れる」版(テストからのみ使用)
+#[cfg(test)]
+fn build_json(
     row_count: u32,
     columns: &[PreparedColumn],
     base_seed: u64,
-    path: &str,
-    encoding: Encoding,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let json_text = build_json(row_count, columns, base_seed)?;
-    write_text(&json_text, path, encoding)
+) -> Result<String, Box<dyn std::error::Error>> {
+    build_json_from_rows(columns, &generate_all_rows(row_count, columns, base_seed))
 }
 
 // 列タイプに応じて、Excelのセルに数値/真偽値/文字列として書き込む。NULL(None)は何も
@@ -924,18 +918,16 @@ fn write_xlsx_cell(
     Ok(())
 }
 
-// Excel(.xlsx)ファイルを直接組み立てて保存する。xlsxはCSV/SQL/JSONと違ってテキストではなく
-// バイナリ(実体はZIP)形式なので、build_*関数で文字列を作ってからwrite_textに渡す、という
-// これまでの流れには乗せられず、ここだけ生成から保存まで独立して行っている。
-// また、xlsxは常にUTF-8相当の内部表現を持つファイル形式のため、--encodingは効かない。
-fn write_xlsx(
-    row_count: u32,
+// Excel(.xlsx)ファイルを直接組み立てて保存する(行データは生成済みのものを受け取る)。
+// xlsxはCSV/SQL/JSONと違ってテキストではなくバイナリ(実体はZIP)形式なので、
+// build_*_from_rowsのように文字列を返してwrite_textに渡す、という流れには乗せられず、
+// ここだけ保存まで独立して行っている。また、xlsxは常にUTF-8相当の内部表現を持つ
+// ファイル形式のため、--encodingは効かない。
+fn write_xlsx_from_rows(
     columns: &[PreparedColumn],
-    base_seed: u64,
+    rows: &[Vec<Option<String>>],
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let rows = generate_all_rows(row_count, columns, base_seed);
-
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let worksheet = workbook.add_worksheet();
 
@@ -952,6 +944,79 @@ fn write_xlsx(
 
     workbook.save(path)?;
     Ok(())
+}
+
+// write_xlsx_from_rowsの「行数とシードを渡すだけで一発で作れる」版(テストからのみ使用)
+#[cfg(test)]
+fn write_xlsx(
+    row_count: u32,
+    columns: &[PreparedColumn],
+    base_seed: u64,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_xlsx_from_rows(columns, &generate_all_rows(row_count, columns, base_seed), path)
+}
+
+fn format_extension(format: Format) -> &'static str {
+    match format {
+        Format::Csv => "csv",
+        Format::Sql => "sql",
+        Format::Json => "json",
+        Format::Xlsx => "xlsx",
+    }
+}
+
+fn default_output_path(format: Format) -> String {
+    format!("output.{}", format_extension(format))
+}
+
+// --outputと形式から、実際に書き込むパスを決める。
+// 形式が1つだけのときは今まで通りの挙動(--outputを文字通り使う。省略時はoutput.{ext})。
+// 形式が複数のときは--outputを「拡張子なしのベース名」として扱い、
+// 形式ごとに拡張子を付ける(例: "result"+csv → "result.csv")。
+// 拡張子付きで指定された場合(例: "result.csv")は、末尾の拡張子を1つ取り除いてベース名にする。
+fn output_base_path(output: Option<&str>, format: Format, multiple_formats: bool) -> String {
+    if !multiple_formats {
+        return output.map(str::to_string).unwrap_or_else(|| default_output_path(format));
+    }
+
+    let stem = match output {
+        Some(o) => match o.rsplit_once('.') {
+            Some((stem, _ext)) if !stem.is_empty() => stem.to_string(),
+            _ => o.to_string(),
+        },
+        None => "output".to_string(),
+    };
+    format!("{}.{}", stem, format_extension(format))
+}
+
+// 指定された1つの形式について、既に生成済みの行データ(rows)を清書してファイルに保存する。
+// rowsを引数で受け取ることで、複数形式を同時出力しても値の生成(generate_all_rows)は
+// 1回で済む(形式ごとに毎回同じ乱数列から生成し直すのは無駄なため)。
+fn write_output(
+    format: Format,
+    columns: &[PreparedColumn],
+    rows: &[Vec<Option<String>>],
+    table_name: Option<&str>,
+    path: &str,
+    encoding: Encoding,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match format {
+        Format::Csv => write_text(&build_csv_from_rows(columns, rows)?, path, encoding),
+        Format::Sql => {
+            let table_name = match table_name {
+                Some(t) => t,
+                None => {
+                    return Err(
+                        "SQL出力(--format sql)には、schema.yamlに table_name の指定が必要です".into()
+                    );
+                }
+            };
+            write_text(&build_sql_from_rows(columns, rows, table_name)?, path, encoding)
+        }
+        Format::Json => write_text(&build_json_from_rows(columns, rows)?, path, encoding),
+        Format::Xlsx => write_xlsx_from_rows(columns, rows, path),
+    }
 }
 
 fn main() {
@@ -979,36 +1044,34 @@ fn main() {
     // unique指定のある列の値プールは、base_seedが決まった後でないと計算できない
     resolve_unique_pools(&mut columns, schema.row_count, base_seed);
 
-    let default_path = match args.format {
-        Format::Csv => "output.csv",
-        Format::Sql => "output.sql",
-        Format::Json => "output.json",
-        Format::Xlsx => "output.xlsx",
-    };
-    let path = args.output.as_deref().unwrap_or(default_path);
+    // --format に同じ形式を重複指定されても1回だけ処理する(指定順は保つ)
+    let mut formats: Vec<Format> = Vec::new();
+    for &f in &args.format {
+        if !formats.contains(&f) {
+            formats.push(f);
+        }
+    }
+    let multiple_formats = formats.len() > 1;
 
-    if matches!(args.format, Format::Xlsx) && matches!(args.encoding, Encoding::Sjis) {
+    if formats.contains(&Format::Xlsx) && matches!(args.encoding, Encoding::Sjis) {
         eprintln!("警告: --format xlsxでは--encodingは無視されます(Excelファイルは常にUTF-8相当の内部形式です)");
     }
 
-    let result = match args.format {
-        Format::Csv => write_csv(schema.row_count, &columns, base_seed, path, args.encoding),
-        Format::Sql => match &schema.table_name {
-            Some(table_name) => {
-                write_sql(schema.row_count, &columns, table_name, base_seed, path, args.encoding)
-            }
-            None => Err("SQL出力(--format sql)には、schema.yamlに table_name の指定が必要です".into()),
-        },
-        Format::Json => write_json(schema.row_count, &columns, base_seed, path, args.encoding),
-        Format::Xlsx => write_xlsx(schema.row_count, &columns, base_seed, path),
-    };
+    // 値の生成(rayonで並列)は、指定された形式の数に関係なく1回だけ行う
+    let rows = generate_all_rows(schema.row_count, &columns, base_seed);
 
-    match result {
-        Ok(()) => println!(
-            "{}行のデータを {} ({}) に書き出しました",
-            schema.row_count, path, args.encoding
-        ),
-        Err(e) => eprintln!("エラーが発生しました: {}", e),
+    for format in formats {
+        let path = output_base_path(args.output.as_deref(), format, multiple_formats);
+        let result =
+            write_output(format, &columns, &rows, schema.table_name.as_deref(), &path, args.encoding);
+
+        match result {
+            Ok(()) => println!(
+                "{}行のデータを {} ({}) に書き出しました",
+                schema.row_count, path, args.encoding
+            ),
+            Err(e) => eprintln!("エラーが発生しました: {}", e),
+        }
     }
 }
 
@@ -1417,6 +1480,63 @@ mod tests {
         );
         let columns = prepare_columns(&schema).unwrap();
         assert!(misplaced_katakana_name_warnings(&columns).is_empty());
+    }
+
+    // --- ここから F3-3(複数形式同時出力) のテスト ---
+
+    #[test]
+    fn output_base_path_single_format_matches_previous_behavior() {
+        assert_eq!(output_base_path(None, Format::Csv, false), "output.csv");
+        assert_eq!(output_base_path(Some("my.csv"), Format::Csv, false), "my.csv");
+        assert_eq!(output_base_path(Some("no_ext"), Format::Json, false), "no_ext");
+    }
+
+    #[test]
+    fn output_base_path_multiple_formats_derives_extension() {
+        assert_eq!(output_base_path(None, Format::Csv, true), "output.csv");
+        assert_eq!(output_base_path(None, Format::Json, true), "output.json");
+        assert_eq!(output_base_path(Some("result"), Format::Xlsx, true), "result.xlsx");
+        assert_eq!(output_base_path(Some("result.csv"), Format::Json, true), "result.json");
+    }
+
+    #[test]
+    fn build_csv_from_rows_matches_build_csv() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let rows = generate_all_rows(schema.row_count, &columns, 42);
+        assert_eq!(build_csv_from_rows(&columns, &rows).unwrap(), build_csv(schema.row_count, &columns, 42).unwrap());
+    }
+
+    #[test]
+    fn build_json_from_rows_matches_build_json() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let rows = generate_all_rows(schema.row_count, &columns, 42);
+        assert_eq!(build_json_from_rows(&columns, &rows).unwrap(), build_json(schema.row_count, &columns, 42).unwrap());
+    }
+
+    #[test]
+    fn write_output_csv_and_json_produce_identical_underlying_data() {
+        // --format csv,json のように複数形式を指定したとき、同じ乱数から生成した
+        // 1つのrowsを両方の形式に使い回せていることを確認する
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let rows = generate_all_rows(schema.row_count, &columns, 99);
+        let csv_text = build_csv_from_rows(&columns, &rows).unwrap();
+        let json_text = build_json_from_rows(&columns, &rows).unwrap();
+
+        let csv_names: Vec<&str> = csv_text.lines().skip(1).map(|l| l.split(',').nth(1).unwrap()).collect();
+        let json_names: Vec<String> = json_text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(csv_names, json_names);
     }
 
     #[test]

@@ -66,7 +66,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | オプション | 説明 | デフォルト |
 |---|---|---|
 | `--config <path>` | スキーマファイルのパス | `schema.yaml` |
-| `--format <csv\|sql\|json\|xlsx>` | 出力形式。`sql`は`table_name`の指定が必須。`xlsx`では`--encoding`は無視される | `csv` |
+| `--format <csv\|sql\|json\|xlsx>` | 出力形式。カンマ区切りで複数指定可(例: `csv,json`)。`sql`は`table_name`の指定が必須。`xlsx`では`--encoding`は無視される | `csv` |
 | `--encoding <utf8\|sjis>` | 出力の文字コード | `utf8` |
 | `--seed <数値>` | 乱数シード。指定すると毎回同じデータを再現する | 未指定(毎回ランダム) |
 | `--output <path>` | 出力先ファイルパス | 形式に応じた既定値 |
@@ -123,6 +123,24 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 cargo run -- --config schema.yaml --format xlsx --output result.xlsx
 ```
 
+### 複数形式の同時出力
+
+`--format`にカンマ区切りで複数指定すると、1回の実行で全部の形式を出力する(値の生成は1回だけ行い、使い回すので効率的)。
+
+```bash
+cargo run -- --config schema.yaml --format csv,json,xlsx
+```
+
+- 形式を1つだけ指定したときは、これまで通り`--output`をそのまま出力先パスとして使う。
+- 形式を複数指定したときは、`--output`を「拡張子なしのベース名」として扱い、形式ごとに拡張子を付ける。
+
+```bash
+cargo run -- --config schema.yaml --format csv,json --output result
+# → result.csv と result.json が生成される
+```
+
+`--format sql`を他の形式と同時指定して`table_name`が未設定の場合、sqlだけがエラーになり、他の形式の出力は続行される。
+
 ### 都道府県⇔市区町村の整合性
 
 `prefecture_ja`列の**後ろ**に`city_ja`列を書くと、その行の都道府県に実在する市区町村が選ばれる(「東京都なのに市区町村は北海道の地名」のような不自然な組み合わせにならない)。
@@ -173,3 +191,10 @@ cargo test
 
 - 値生成(rayonで並列化): 約0.55秒(逐次実行では約1.55秒)
 - ディスクへの書き込み: 約1〜1.4秒(こちらがボトルネック。OS/ディスク側の制約でありCPUの並列化では改善できない)
+
+`--format`に複数形式を指定した場合、値生成(上記)は1回だけ行い、形式ごとに清書処理を
+繰り返すだけなので、形式を増やしても生成コストは重複しない。ただし清書・書き込み自体の
+コストは形式ごとに異なる。同じ10列×100万行で比較すると、CSV+JSON同時出力は約8秒
+(CSVだけなら約3秒)。**xlsx出力はセル単位で書き込む形式の特性上、大量データでは
+特に重く、10列×100万行のxlsx単体で約35秒かかる**(CSV/SQL/JSONとは1桁違う)。
+xlsxで大量データを扱う予定がある場合は注意すること。
