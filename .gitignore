@@ -1,0 +1,8 @@
+/target
+
+# 生成される出力ファイル(実行のたびに作られるので追跡しない)
+/output.csv
+/output.sql
+
+# 動作確認のために作った一時ファイル
+/scratch_test_schema.yaml

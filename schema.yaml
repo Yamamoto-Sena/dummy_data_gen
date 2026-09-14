@@ -1,0 +1,32 @@
+# どんな列を、何行作るかを定義するファイル
+row_count: 20
+table_name: users # --format sql のときにINSERT文のテーブル名として使う
+columns:
+  - name: id
+    type: sequence   # 1から始まる連番
+  - name: name
+    type: name_ja     # 日本語のランダムな氏名
+  - name: email
+    type: email       # user{連番}@example.com 形式のメールアドレス
+  - name: age
+    type: integer     # min〜maxの範囲でランダムな整数
+    min: 18
+    max: 65
+  - name: height
+    type: float       # min〜maxの範囲でランダムな小数(decimalsは小数点以下の桁数、省略時は2)
+    min: 150.0
+    max: 190.0
+    decimals: 1
+  - name: is_active
+    type: boolean     # true/false
+  - name: birthday
+    type: date        # start〜endの範囲でランダムな日付(YYYY-MM-DD)
+    start: "1960-01-01"
+    end: "2008-12-31"
+  - name: postal_code
+    type: postal_code # 日本の郵便番号風(NNN-NNNN)。実在する番号とは限らない
+  - name: phone
+    type: phone_ja    # 携帯電話番号風(090/080/070-XXXX-XXXX)
+    null_rate: 0.1    # 10%の確率で未入力(NULL)にする。任意の列タイプに付けられる
+  - name: address
+    type: address_ja  # 都道府県+市区町村風の簡易的な住所
