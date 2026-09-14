@@ -1,6 +1,7 @@
 use chrono::Datelike;
 use clap::{Parser, ValueEnum};
 use rand::rngs::SmallRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -17,7 +18,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Encoding::Utf8)]
     encoding: Encoding,
 
-    /// 出力形式(csv または sql)。sqlの場合はschema.yamlに table_name の指定が必要
+    /// 出力形式(csv / sql / json)。sqlの場合はschema.yamlに table_name の指定が必要
     #[arg(long, value_enum, default_value_t = Format::Csv)]
     format: Format,
 
@@ -25,6 +26,10 @@ struct Args {
     /// 省略した場合は毎回ランダムなシードを使う
     #[arg(long)]
     seed: Option<u64>,
+
+    /// 出力先ファイルパス。省略時は形式に応じて output.csv / output.sql / output.json に保存する
+    #[arg(long)]
+    output: Option<String>,
 }
 
 // 行番号ごとに独立したRNGを作る。base_seedが同じなら常に同じ値になるため、
@@ -40,6 +45,8 @@ enum Format {
     Csv,
     #[value(name = "sql")]
     Sql,
+    #[value(name = "json")]
+    Json,
 }
 
 impl std::fmt::Display for Format {
@@ -47,6 +54,7 @@ impl std::fmt::Display for Format {
         match self {
             Format::Csv => write!(f, "csv"),
             Format::Sql => write!(f, "sql"),
+            Format::Json => write!(f, "json"),
         }
     }
 }
@@ -67,6 +75,9 @@ struct ColumnDef {
     // 0.0〜1.0の確率でNULL(空)を混ぜる。省略時はNULLを混ぜない(0.0)
     #[serde(default)]
     null_rate: Option<f64>,
+    // trueにすると、この列の値が行間で重複しないようにする。省略時はfalse
+    #[serde(default)]
+    unique: Option<bool>,
     // flattenにより、typeやmin/maxなどの追加情報を「nameと同じ階層」から直接読み取れる
     #[serde(flatten)]
     column_type: ColumnType,
@@ -98,6 +109,9 @@ enum ColumnType {
     PostalCode,
     PhoneJa,
     AddressJa,
+    Enum {
+        choices: Vec<String>,
+    },
 }
 
 fn default_decimals() -> u32 {
@@ -118,6 +132,11 @@ struct PreparedColumn {
     name: String,
     kind: PreparedColumnType,
     null_rate: f64,
+    unique: bool,
+    // uniqueなら、あらかじめ計算しておいた「行数分の重複しない値」がここに入る
+    // (resolve_unique_pools が base_seed が決まった後に埋める)。
+    // Some(pool)のとき、generate_cellはこの中から順番に値を取り出すだけになる
+    unique_pool: Option<Vec<String>>,
 }
 
 enum PreparedColumnType {
@@ -131,6 +150,7 @@ enum PreparedColumnType {
     PostalCode,
     PhoneJa,
     AddressJa,
+    Enum { choices: Vec<String> },
 }
 
 fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::error::Error>> {
@@ -196,6 +216,12 @@ fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::
                 ColumnType::PostalCode => PreparedColumnType::PostalCode,
                 ColumnType::PhoneJa => PreparedColumnType::PhoneJa,
                 ColumnType::AddressJa => PreparedColumnType::AddressJa,
+                ColumnType::Enum { choices } => {
+                    if choices.is_empty() {
+                        return Err(format!("列 \"{}\": choices には1つ以上の選択肢が必要です", c.name).into());
+                    }
+                    PreparedColumnType::Enum { choices: choices.clone() }
+                }
             };
 
             let null_rate = c.null_rate.unwrap_or(0.0);
@@ -207,9 +233,101 @@ fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::
                 .into());
             }
 
-            Ok(PreparedColumn { name: c.name.clone(), kind, null_rate })
+            let unique = c.unique.unwrap_or(false);
+            if unique {
+                if null_rate > 0.0 {
+                    return Err(format!(
+                        "列 \"{}\": unique と null_rate は同時に指定できません",
+                        c.name
+                    )
+                    .into());
+                }
+                match unique_capacity(&kind) {
+                    None => {
+                        return Err(format!(
+                            "列 \"{}\": このtypeはuniqueに対応していません(enum/boolean/integer/dateのみ対応)",
+                            c.name
+                        )
+                        .into());
+                    }
+                    Some(capacity) if capacity > UNIQUE_CAPACITY_CAP => {
+                        return Err(format!(
+                            "列 \"{}\": unique: 値の組み合わせが{}通りあり、上限({}通り)を超えています。範囲や選択肢を絞ってください",
+                            c.name, capacity, UNIQUE_CAPACITY_CAP
+                        )
+                        .into());
+                    }
+                    Some(capacity) if capacity < schema.row_count as u128 => {
+                        return Err(format!(
+                            "列 \"{}\": unique: 値の組み合わせが{}通りしかなく、row_count({})分のユニークな値を用意できません",
+                            c.name, capacity, schema.row_count
+                        )
+                        .into());
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            // 実際の値(unique_pool)はこの後base_seedが決まってから resolve_unique_pools で埋める
+            Ok(PreparedColumn { name: c.name.clone(), kind, null_rate, unique, unique_pool: None })
         })
         .collect()
+}
+
+// unique制約を付けられる列タイプが取りうる値の組み合わせ数。
+// 全部の組み合わせをメモリ上に列挙してシャッフルする方式を取るため、これが分かる型だけに対応する。
+// postal_code/phone_ja/address_ja/floatは組み合わせが多すぎる、または不連続で数えにくいため非対応
+// (これらの値の重複を避けたい場合は、より小さい組み合わせ数のenum/integerで代用することを想定している)。
+fn unique_capacity(kind: &PreparedColumnType) -> Option<u128> {
+    match kind {
+        PreparedColumnType::Boolean => Some(2),
+        PreparedColumnType::Integer { min, max } => Some((*max as i128 - *min as i128 + 1) as u128),
+        PreparedColumnType::Date { span_days, .. } => Some(*span_days as u128 + 1),
+        PreparedColumnType::Enum { choices } => Some(choices.len() as u128),
+        _ => None,
+    }
+}
+
+// unique_capacityがこれを超える場合はエラーにする。組み合わせ全部をVecに列挙するので、
+// メモリを使いすぎない(や、あまりに時間がかかりすぎない)ようにするための安全弁
+const UNIQUE_CAPACITY_CAP: u128 = 2_000_000;
+
+// unique_capacityで数えた組み合わせを、実際の文字列としてすべて列挙する
+fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
+    match kind {
+        PreparedColumnType::Boolean => vec!["true".to_string(), "false".to_string()],
+        PreparedColumnType::Integer { min, max } => (*min..=*max).map(|v| v.to_string()).collect(),
+        PreparedColumnType::Date { start_days, span_days } => (0..=*span_days)
+            .map(|offset| {
+                chrono::NaiveDate::from_num_days_from_ce_opt(start_days + offset as i32)
+                    .expect("span_daysの範囲内なので必ず有効な日付になる")
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect(),
+        PreparedColumnType::Enum { choices } => choices.clone(),
+        _ => unreachable!("unique_capacityがNoneを返す型はここに来ない(prepare_columnsで弾いている)"),
+    }
+}
+
+// 列の全候補値をシャッフルして先頭row_count個を取る=「行数分の重複しない値」の完成。
+// column_saltは、同じschema内に複数のunique列があるときに、それぞれ違う乱数列になるようにするための値
+fn build_unique_pool(kind: &PreparedColumnType, row_count: u32, base_seed: u64, column_salt: u64) -> Vec<String> {
+    let mut values = enumerate_values(kind);
+    let mut rng = SmallRng::seed_from_u64(base_seed.wrapping_add(column_salt));
+    values.shuffle(&mut rng);
+    values.truncate(row_count as usize);
+    values
+}
+
+// unique指定のある列すべてに対して、実際の値のプールを計算してPreparedColumnに詰める。
+// base_seedが決まった後(=prepare_columnsの後)でないと呼べない
+fn resolve_unique_pools(columns: &mut [PreparedColumn], row_count: u32, base_seed: u64) {
+    for (i, column) in columns.iter_mut().enumerate() {
+        if column.unique {
+            column.unique_pool = Some(build_unique_pool(&column.kind, row_count, base_seed, i as u64));
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -262,6 +380,12 @@ fn random_address(rng: &mut impl Rng) -> String {
 
 // 1列分の値を作る。null_rateの確率でNone(NULL)を返す
 fn generate_cell(column: &PreparedColumn, row_num: u32, rng: &mut impl Rng) -> Option<String> {
+    // uniqueな列は、あらかじめ用意しておいたプールからこの行番号に対応する値を取り出すだけ
+    // (unique同士でnull_rateとの併用はprepare_columnsで禁止しているので、Noneになることは無い)
+    if let Some(pool) = &column.unique_pool {
+        return Some(pool[(row_num - 1) as usize].clone());
+    }
+
     if column.null_rate > 0.0 && rng.gen_bool(column.null_rate) {
         None
     } else {
@@ -295,6 +419,7 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::PostalCode => random_postal_code(rng),
         PreparedColumnType::PhoneJa => random_phone(rng),
         PreparedColumnType::AddressJa => random_address(rng),
+        PreparedColumnType::Enum { choices } => choices[rng.gen_range(0..choices.len())].clone(),
     }
 }
 
@@ -308,6 +433,7 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
             | PreparedColumnType::PostalCode
             | PreparedColumnType::PhoneJa
             | PreparedColumnType::AddressJa
+            | PreparedColumnType::Enum { .. }
     )
 }
 
@@ -477,6 +603,64 @@ fn write_sql(
     write_text(&sql_text, path, encoding)
 }
 
+// 列タイプに応じて、文字列の値を適切なJSONの型(数値・真偽値・文字列・null)に変換する
+fn cell_to_json(kind: &PreparedColumnType, cell: Option<&str>) -> serde_json::Value {
+    let value = match cell {
+        Some(v) => v,
+        None => return serde_json::Value::Null,
+    };
+
+    match kind {
+        PreparedColumnType::Sequence => value.parse::<u64>().map(Into::into).unwrap_or(serde_json::Value::Null),
+        PreparedColumnType::Integer { .. } => {
+            value.parse::<i64>().map(Into::into).unwrap_or(serde_json::Value::Null)
+        }
+        PreparedColumnType::Float { .. } => value
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        PreparedColumnType::Boolean => serde_json::Value::Bool(value == "true"),
+        _ => serde_json::Value::String(value.to_string()),
+    }
+}
+
+// JSON(NDJSON = 1行1件のJSONオブジェクト)の中身をUTF-8の文字列としてメモリ上で組み立てる
+fn build_json(
+    row_count: u32,
+    columns: &[PreparedColumn],
+    base_seed: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let lines: Vec<String> = (1..=row_count)
+        .into_par_iter()
+        .map(|row_num| {
+            let mut rng = row_rng(base_seed, row_num);
+            let cells = generate_row(columns, row_num, &mut rng);
+            let mut object = serde_json::Map::with_capacity(columns.len());
+            for (column, cell) in columns.iter().zip(cells) {
+                object.insert(column.name.clone(), cell_to_json(&column.kind, cell.as_deref()));
+            }
+            serde_json::to_string(&object).expect("serde_jsonのオブジェクト直列化は失敗しない")
+        })
+        .collect();
+
+    let mut text = lines.join("\n");
+    text.push('\n'); // CSV/SQL出力と同様、ファイル末尾に改行を入れておく
+    Ok(text)
+}
+
+fn write_json(
+    row_count: u32,
+    columns: &[PreparedColumn],
+    base_seed: u64,
+    path: &str,
+    encoding: Encoding,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let json_text = build_json(row_count, columns, base_seed)?;
+    write_text(&json_text, path, encoding)
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -488,7 +672,7 @@ fn main() {
         }
     };
 
-    let columns = match prepare_columns(&schema) {
+    let mut columns = match prepare_columns(&schema) {
         Ok(columns) => columns,
         Err(e) => {
             eprintln!("エラーが発生しました: {}", e);
@@ -496,13 +680,18 @@ fn main() {
         }
     };
 
-    let path = match args.format {
-        Format::Csv => "output.csv",
-        Format::Sql => "output.sql",
-    };
-
     // --seedが指定されていればそれを使い、無ければ実行のたびに変わるランダムな値を使う
     let base_seed = args.seed.unwrap_or_else(rand::random);
+
+    // unique指定のある列の値プールは、base_seedが決まった後でないと計算できない
+    resolve_unique_pools(&mut columns, schema.row_count, base_seed);
+
+    let default_path = match args.format {
+        Format::Csv => "output.csv",
+        Format::Sql => "output.sql",
+        Format::Json => "output.json",
+    };
+    let path = args.output.as_deref().unwrap_or(default_path);
 
     let result = match args.format {
         Format::Csv => write_csv(schema.row_count, &columns, base_seed, path, args.encoding),
@@ -512,6 +701,7 @@ fn main() {
             }
             None => Err("SQL出力(--format sql)には、schema.yamlに table_name の指定が必要です".into()),
         },
+        Format::Json => write_json(schema.row_count, &columns, base_seed, path, args.encoding),
     };
 
     match result {
@@ -684,6 +874,102 @@ mod tests {
         for line in csv_text.lines().skip(1) {
             let name_field = line.split(',').nth(1).unwrap();
             assert_eq!(name_field, "");
+        }
+    }
+
+    // --- ここから F1-1(enum) / F2-1(json) / F4-1(unique) のテスト ---
+
+    #[test]
+    fn enum_column_only_produces_declared_choices() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: status\n    type: enum\n    choices: [利用中, 休止中, 退会済み]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(["利用中", "休止中", "退会済み"].contains(&line));
+        }
+    }
+
+    #[test]
+    fn prepare_columns_rejects_empty_enum_choices() {
+        let schema =
+            schema_from_yaml("row_count: 1\ncolumns:\n  - name: s\n    type: enum\n    choices: []\n");
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn unique_integer_produces_no_duplicates_and_stays_in_range() {
+        let schema = schema_from_yaml(
+            "row_count: 20\ncolumns:\n  - name: n\n    type: integer\n    min: 1\n    max: 20\n    unique: true\n",
+        );
+        let mut columns = prepare_columns(&schema).unwrap();
+        resolve_unique_pools(&mut columns, schema.row_count, 42);
+        let csv_text = build_csv(schema.row_count, &columns, 42).unwrap();
+        let mut values: Vec<i64> = csv_text.lines().skip(1).map(|l| l.parse().unwrap()).collect();
+        values.sort_unstable();
+        assert_eq!(values, (1..=20).collect::<Vec<i64>>()); // 1〜20が重複なくちょうど1回ずつ出る
+    }
+
+    #[test]
+    fn prepare_columns_rejects_unique_when_capacity_is_insufficient() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: flag\n    type: boolean\n    unique: true\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn prepare_columns_rejects_unique_on_unsupported_type() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: a\n    type: address_ja\n    unique: true\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn prepare_columns_rejects_unique_combined_with_null_rate() {
+        let schema = schema_from_yaml(
+            "row_count: 3\ncolumns:\n  - name: n\n    type: integer\n    min: 1\n    max: 10\n    unique: true\n    null_rate: 0.1\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn prepare_columns_rejects_unique_capacity_over_cap() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: big\n    type: integer\n    min: 0\n    max: 5000000000\n    unique: true\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn build_json_produces_typed_ndjson_lines() {
+        let schema = schema_from_yaml(
+            "row_count: 3\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n  - name: active\n    type: boolean\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let json_text = build_json(schema.row_count, &columns, 42).unwrap();
+        let lines: Vec<&str> = json_text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(value["id"].is_number());
+            assert!(value["name"].is_string());
+            assert!(value["active"].is_boolean());
+        }
+    }
+
+    #[test]
+    fn build_json_null_cell_becomes_json_null() {
+        let schema = schema_from_yaml(
+            "row_count: 10\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n    null_rate: 1.0\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let json_text = build_json(schema.row_count, &columns, 42).unwrap();
+        for line in json_text.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(value["name"].is_null());
         }
     }
 }

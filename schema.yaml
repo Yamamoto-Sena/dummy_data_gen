@@ -12,6 +12,10 @@ columns:
     type: integer     # min〜maxの範囲でランダムな整数
     min: 18
     max: 65
+    unique: true      # 行間で値が重複しないようにする(値の組み合わせがrow_count以上必要)
+  - name: status
+    type: enum        # choicesの中からランダムに1つ選ぶ
+    choices: [利用中, 休止中, 退会済み]
   - name: height
     type: float       # min〜maxの範囲でランダムな小数(decimalsは小数点以下の桁数、省略時は2)
     min: 150.0
