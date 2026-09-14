@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 概要
 
-`dummy_data_gen` は、YAML設定ファイル（`schema.yaml`）で定義した列に沿ってダミーデータをCSVに書き出す Rust 製の小さな CLI ツール。ソースは [src/main.rs](src/main.rs) の 1 ファイルのみで構成されている。
+`dummy_data_gen` は、YAML設定ファイル（`schema.yaml`）で定義した列に沿ってダミーデータをCSV/SQL/JSON/Excel(xlsx)のいずれかに書き出す Rust 製の小さな CLI ツール。ソースは [src/main.rs](src/main.rs) の 1 ファイルのみで構成されている。
 
 ## 開発コマンド
 
@@ -22,7 +22,7 @@ cargo test
 
 `--config` は列定義を書いたYAMLファイルのパス（デフォルト `schema.yaml`）。行数(`row_count`)や列(`columns`)はこのYAML側で定義する（CLI引数の `--rows` は廃止済み）。`--encoding` は `utf8` か `sjis`（Shift-JIS。Dr.Sum/MotionBoard等の日本の業務システム向け。`--format xlsx`では無視される）。`--format` は `csv`（デフォルト）/ `sql`（`INSERT INTO`文。`schema.yaml`に `table_name` の指定が必須）/ `json`（NDJSON、1行1件）/ `xlsx`（Excelファイル）。`--seed` は乱数シード（省略時は毎回ランダム。指定すると同じ設定で毎回同じデータが再現される）。`--output` で保存先パスを指定できる（省略時は形式に応じて `output.csv` / `output.sql` / `output.json` / `output.xlsx`）。行数が`PROGRESS_BAR_THRESHOLD`（1000）以上のとき、生成中にターミナルへ進捗バーを表示する（リダイレクト/非ttyでは自動的に非表示になる。indicatifの標準挙動）。
 
-テストは `src/main.rs` 末尾の `#[cfg(test)] mod tests` にまとまっている（`cargo test` で実行）。バリデーション（min>max、不正な日付、null_rateの範囲外など）とSQLエスケープ、CSVの行数・NULL表現を中心にカバーしている。
+テストは `src/main.rs` 末尾の `#[cfg(test)] mod tests` にまとまっている（`cargo test` で実行）。バリデーション（min>max、不正な日付、null_rate/uniqueの範囲外など）、SQLエスケープ、CSV/JSON/ExcelのNULL表現、都道府県⇔市区町村の整合性、xlsxの読み返し検証（`calamine`使用）などをカバーしている。
 
 ## アーキテクチャ
 
@@ -34,7 +34,7 @@ cargo test
 - `prepare_columns` が `Schema`（YAMLそのまま、文字列ベース）を `PreparedColumn`（生成に使う実行時表現）に変換する。ここで min>max や日付の不正フォーマット・start>endなどのバリデーションを行い、日付は文字列を1行ごとに毎回パースし直さないよう、事前に「開始日からの通算日数(`start_days`)」と「日数の幅(`span_days`)」に変換しておく（大量行生成時の速度を落とさないため）。空の`columns`・列名の重複もここで弾く。
 - **unique制約**: `ColumnDef.unique: bool`。`unique_capacity` が列タイプごとの「取りうる値の組み合わせ数」を計算できる型（`enum`/`boolean`/`integer`/`date`のみ。`postal_code`/`phone_ja`/`address_ja`/`float`は組み合わせが多すぎる・不連続で数えにくいため非対応）に限って対応する。`prepare_columns`で「row_countより組み合わせが少ない」「組み合わせが`UNIQUE_CAPACITY_CAP`(200万)を超える」「null_rateと併用している」の3パターンをエラーにする。実際の値は`resolve_unique_pools`（`base_seed`確定後に呼ぶ必要があるため`main`で`prepare_columns`の後に実行）が、`enumerate_values`で全候補を列挙→シャッフル→先頭row_count件を取る、という方式で一括生成し`PreparedColumn.unique_pool`に格納する。`generate_cell`は`unique_pool`があればそこから`row_num`に対応する値を返すだけになる（並列生成と両立させるため、unique列だけ事前に逐次で確定させておく設計）。
 - `random_name` / `random_email` / `random_postal_code` / `random_phone` / `random_address` / `random_prefecture` / `random_city` が個別の値生成ロジック。`generate_value` が `PreparedColumnType` に応じてどれを呼ぶかを振り分ける。氏名・住所・電話番号などは `LAST_NAMES` / `FIRST_NAMES` / `CITIES_BY_PREFECTURE` / `PHONE_PREFIXES` の固定配列からのランダム組み合わせで、実在のデータとは無関係（あくまでダミー）。
-- **列間整合性（F4-2）**: `CITIES_BY_PREFECTURE`（都道府県ごとの市区町村リスト）が`address_ja`（1列）と`prefecture_ja`+`city_ja`（2列）の両方で共有される唯一のデータソース。`generate_row`は列を先頭から順に処理し、`prefecture_ja`列の生成結果を`last_prefecture`として覚えておき、後続の`city_ja`列の生成（`generate_cell`→`random_city`）にその都道府県名を渡す。このため**`prefecture_ja`は対応する`city_ja`より前に定義する必要がある**（後ろにあると単に無視され、`city_ja`は全都道府県からランダムに選ぶフォールバック動作になる）。`ALL_CITIES`は`city_ja`単独使用時に使う、全都道府県の市区町村を1回だけ計算する`LazyLock`。
+- **列間整合性（F4-2）**: `CITIES_BY_PREFECTURE`（都道府県ごとの市区町村リスト）が`address_ja`（1列）と`prefecture_ja`+`city_ja`（2列）の両方で共有される唯一のデータソース。`generate_row`は列を先頭から順に処理し、`prefecture_ja`列の生成結果を`last_prefecture`として覚えておき、後続の`city_ja`列の生成（`generate_cell`→`random_city`）にその都道府県名を渡す。このため**`prefecture_ja`は対応する`city_ja`より前に定義する必要がある**（後ろにあると単に無視され、`city_ja`は全都道府県からランダムに選ぶフォールバック動作になる）。`ALL_CITIES`は`city_ja`単独使用時に使う、全都道府県の市区町村を1回だけ計算する`LazyLock`。`prefecture_ja`が定義されているのに`city_ja`より後ろにある（＝ユーザーが順序を間違えた可能性が高い）ケースは`misplaced_city_ja_warnings`が検出し、`prepare_columns`の最後（`.inspect`）でその警告文を`eprintln!`する。エラーにはしない（`city_ja`単独使用は正当な用途のため）。同じschemaに複数の`prefecture_ja`/`city_ja`ペアがあっても、それぞれの`city_ja`は直前の`prefecture_ja`に対応する（`last_prefecture`は毎回上書きされる）。
 - `generate_cell` が1列分の値を作る（`null_rate` の確率で `None` を返す＝NULL。`context_prefecture`引数で直前の`prefecture_ja`の値を受け取る）。`generate_row` がそれを全列分まとめて `Vec<Option<String>>` にする。`build_csv` はNoneを空文字に、`build_sql` はNoneをクォートなしの `NULL` に、`cell_to_json`/`write_xlsx_cell` はNoneをそれぞれJSONの`null`/Excelの空セルに変換する。
 - `row_rng(base_seed, row_num)` が行番号ごとに独立した `SmallRng`（暗号強度は無いが高速なPRNG。ダミーデータ生成に暗号学的安全性は不要なため採用）を作る。`base_seed` が同じなら同じ行番号は常に同じ乱数列になるため、rayonでどのスレッドがどの行を処理しても結果が変わらない（再現性と並列化の両立）。`base_seed` は `--seed` 指定時はその値、未指定時は `rand::random()` で毎回変える。
 - **`generate_all_rows(row_count, columns, base_seed)`** が全出力形式（CSV/SQL/JSON/Excel）で共有する行生成の一本化された入り口。`(1..=row_count).into_par_iter()`（rayon）で行ごとの値生成をCPUコア数に分散して並列に行い、`.collect()` で行番号順を保ったまま `Vec<Vec<Option<String>>>` にまとめる。ここで`new_progress_bar`が作った進捗バー（**F3-2**）の`.inc(1)`も呼ぶ。各`build_*`/`write_xlsx`関数はこの結果を受け取り、形式ごとの文字列/バイナリへの変換（直列処理）だけを行う。

@@ -18,7 +18,8 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Encoding::Utf8)]
     encoding: Encoding,
 
-    /// 出力形式(csv / sql / json)。sqlの場合はschema.yamlに table_name の指定が必要
+    /// 出力形式(csv / sql / json / xlsx)。sqlの場合はschema.yamlに table_name の指定が必要。
+    /// xlsxの場合は--encodingが無視される(Excelは常にUTF-8相当の内部形式のため)
     #[arg(long, value_enum, default_value_t = Format::Csv)]
     format: Format,
 
@@ -27,7 +28,7 @@ struct Args {
     #[arg(long)]
     seed: Option<u64>,
 
-    /// 出力先ファイルパス。省略時は形式に応じて output.csv / output.sql / output.json に保存する
+    /// 出力先ファイルパス。省略時は形式に応じて output.csv / output.sql / output.json / output.xlsx に保存する
     #[arg(long)]
     output: Option<String>,
 }
@@ -285,6 +286,37 @@ fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::
 
             // 実際の値(unique_pool)はこの後base_seedが決まってから resolve_unique_pools で埋める
             Ok(PreparedColumn { name: c.name.clone(), kind, null_rate, unique, unique_pool: None })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .inspect(|columns| {
+            for warning in misplaced_city_ja_warnings(columns) {
+                eprintln!("{warning}");
+            }
+        })
+}
+
+// city_ja列は「自分より前にあるprefecture_ja列」しか見ない設計になっている。
+// なのでprefecture_ja列は定義してあるのにcity_jaより後ろにある場合、ユーザーの意図
+// (都道府県と市区町村を対応させたい)を満たせないまま黙って無関係な市区町村が
+// 選ばれてしまう。エラーにするほどではない(単独でcity_jaを使うのは正当な用途)ため、
+// 気づけるように警告文を作る(実際に表示するのは呼び出し元)。
+fn misplaced_city_ja_warnings(columns: &[PreparedColumn]) -> Vec<String> {
+    columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c.kind, PreparedColumnType::CityJa))
+        .filter(|(city_idx, _)| {
+            let has_preceding_prefecture =
+                columns[..*city_idx].iter().any(|c| matches!(c.kind, PreparedColumnType::PrefectureJa));
+            let has_following_prefecture =
+                columns[*city_idx + 1..].iter().any(|c| matches!(c.kind, PreparedColumnType::PrefectureJa));
+            !has_preceding_prefecture && has_following_prefecture
+        })
+        .map(|(_, city_col)| {
+            format!(
+                "警告: 列 \"{}\"(city_ja)より後ろに prefecture_ja 列があります。city_jaは自分より前のprefecture_ja列しか参照しないため、都道府県と市区町村が対応しません。prefecture_ja列をcity_ja列より前に移動してください。",
+                city_col.name
+            )
         })
         .collect()
 }
@@ -1232,6 +1264,31 @@ mod tests {
         for line in csv_text.lines().skip(1) {
             assert!(ALL_CITIES.contains(&line));
         }
+    }
+
+    #[test]
+    fn warns_when_prefecture_ja_comes_after_city_ja() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: city\n    type: city_ja\n  - name: pref\n    type: prefecture_ja\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert_eq!(misplaced_city_ja_warnings(&columns).len(), 1);
+    }
+
+    #[test]
+    fn no_warning_when_prefecture_ja_comes_before_city_ja() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: pref\n    type: prefecture_ja\n  - name: city\n    type: city_ja\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert!(misplaced_city_ja_warnings(&columns).is_empty());
+    }
+
+    #[test]
+    fn no_warning_when_city_ja_used_alone() {
+        let schema = schema_from_yaml("row_count: 5\ncolumns:\n  - name: city\n    type: city_ja\n");
+        let columns = prepare_columns(&schema).unwrap();
+        assert!(misplaced_city_ja_warnings(&columns).is_empty());
     }
 
     #[test]

@@ -4,6 +4,7 @@
 /output.csv
 /output.sql
 /output.json
+/output.xlsx
 
 # 動作確認のために作った一時ファイル
 /scratch_test_schema.yaml
