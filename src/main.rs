@@ -109,6 +109,7 @@ enum ColumnType {
     PostalCode,
     PhoneJa,
     AddressJa,
+    CompanyNameJa,
     Enum {
         choices: Vec<String>,
     },
@@ -150,6 +151,7 @@ enum PreparedColumnType {
     PostalCode,
     PhoneJa,
     AddressJa,
+    CompanyNameJa,
     Enum { choices: Vec<String> },
 }
 
@@ -216,6 +218,7 @@ fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::
                 ColumnType::PostalCode => PreparedColumnType::PostalCode,
                 ColumnType::PhoneJa => PreparedColumnType::PhoneJa,
                 ColumnType::AddressJa => PreparedColumnType::AddressJa,
+                ColumnType::CompanyNameJa => PreparedColumnType::CompanyNameJa,
                 ColumnType::Enum { choices } => {
                     if choices.is_empty() {
                         return Err(format!("列 \"{}\": choices には1つ以上の選択肢が必要です", c.name).into());
@@ -352,6 +355,7 @@ const FIRST_NAMES: &[&str] = &["翔太", "陽菜", "大輝", "美咲", "健太"]
 const PREFECTURES: &[&str] = &["東京都", "大阪府", "愛知県", "北海道", "福岡県"];
 const CITIES: &[&str] = &["中央区", "港区", "西区", "本町", "緑区"];
 const PHONE_PREFIXES: &[&str] = &["090", "080", "070"];
+const COMPANY_SUFFIXES: &[&str] = &["商事", "商会", "工業", "産業", "建設", "システム", "フーズ", "物流"];
 
 fn random_name(rng: &mut impl Rng) -> String {
     let last = LAST_NAMES[rng.gen_range(0..LAST_NAMES.len())];
@@ -376,6 +380,13 @@ fn random_address(rng: &mut impl Rng) -> String {
     let pref = PREFECTURES[rng.gen_range(0..PREFECTURES.len())];
     let city = CITIES[rng.gen_range(0..CITIES.len())];
     format!("{}{}{}-{}", pref, city, rng.gen_range(1..20), rng.gen_range(1..20))
+}
+
+// 氏名で使っている姓のリスト(LAST_NAMES)を「創業者の名字っぽい会社名」として再利用する
+fn random_company_name(rng: &mut impl Rng) -> String {
+    let stem = LAST_NAMES[rng.gen_range(0..LAST_NAMES.len())];
+    let suffix = COMPANY_SUFFIXES[rng.gen_range(0..COMPANY_SUFFIXES.len())];
+    format!("株式会社{}{}", stem, suffix)
 }
 
 // 1列分の値を作る。null_rateの確率でNone(NULL)を返す
@@ -419,6 +430,7 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::PostalCode => random_postal_code(rng),
         PreparedColumnType::PhoneJa => random_phone(rng),
         PreparedColumnType::AddressJa => random_address(rng),
+        PreparedColumnType::CompanyNameJa => random_company_name(rng),
         PreparedColumnType::Enum { choices } => choices[rng.gen_range(0..choices.len())].clone(),
     }
 }
@@ -433,6 +445,7 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
             | PreparedColumnType::PostalCode
             | PreparedColumnType::PhoneJa
             | PreparedColumnType::AddressJa
+            | PreparedColumnType::CompanyNameJa
             | PreparedColumnType::Enum { .. }
     )
 }
@@ -878,6 +891,18 @@ mod tests {
     }
 
     // --- ここから F1-1(enum) / F2-1(json) / F4-1(unique) のテスト ---
+
+    #[test]
+    fn company_name_ja_has_kabushiki_gaisha_prefix_and_known_suffix() {
+        let schema =
+            schema_from_yaml("row_count: 30\ncolumns:\n  - name: c\n    type: company_name_ja\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(line.starts_with("株式会社"));
+            assert!(COMPANY_SUFFIXES.iter().any(|s| line.ends_with(s)));
+        }
+    }
 
     #[test]
     fn enum_column_only_produces_declared_choices() {
