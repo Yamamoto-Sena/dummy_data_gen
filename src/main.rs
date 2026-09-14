@@ -110,6 +110,7 @@ enum ColumnType {
     PhoneJa,
     AddressJa,
     CompanyNameJa,
+    Uuid,
     Enum {
         choices: Vec<String>,
     },
@@ -152,6 +153,7 @@ enum PreparedColumnType {
     PhoneJa,
     AddressJa,
     CompanyNameJa,
+    Uuid,
     Enum { choices: Vec<String> },
 }
 
@@ -219,6 +221,7 @@ fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::
                 ColumnType::PhoneJa => PreparedColumnType::PhoneJa,
                 ColumnType::AddressJa => PreparedColumnType::AddressJa,
                 ColumnType::CompanyNameJa => PreparedColumnType::CompanyNameJa,
+                ColumnType::Uuid => PreparedColumnType::Uuid,
                 ColumnType::Enum { choices } => {
                     if choices.is_empty() {
                         return Err(format!("列 \"{}\": choices には1つ以上の選択肢が必要です", c.name).into());
@@ -389,6 +392,15 @@ fn random_company_name(rng: &mut impl Rng) -> String {
     format!("株式会社{}{}", stem, suffix)
 }
 
+// UUID(v4)は本来 uuid::Uuid::new_v4() で作れるが、それだとOS由来の乱数を直接使うため
+// --seed で再現できなくなってしまう。ここでは自前のrng(rowごとにシード付き)で
+// ランダムな16バイトを作り、それをUUID形式に組み立てることで再現性を保っている
+fn random_uuid(rng: &mut impl Rng) -> String {
+    let mut bytes = [0u8; 16];
+    rng.fill(&mut bytes);
+    uuid::Builder::from_random_bytes(bytes).into_uuid().to_string()
+}
+
 // 1列分の値を作る。null_rateの確率でNone(NULL)を返す
 fn generate_cell(column: &PreparedColumn, row_num: u32, rng: &mut impl Rng) -> Option<String> {
     // uniqueな列は、あらかじめ用意しておいたプールからこの行番号に対応する値を取り出すだけ
@@ -431,6 +443,7 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::PhoneJa => random_phone(rng),
         PreparedColumnType::AddressJa => random_address(rng),
         PreparedColumnType::CompanyNameJa => random_company_name(rng),
+        PreparedColumnType::Uuid => random_uuid(rng),
         PreparedColumnType::Enum { choices } => choices[rng.gen_range(0..choices.len())].clone(),
     }
 }
@@ -446,6 +459,7 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
             | PreparedColumnType::PhoneJa
             | PreparedColumnType::AddressJa
             | PreparedColumnType::CompanyNameJa
+            | PreparedColumnType::Uuid
             | PreparedColumnType::Enum { .. }
     )
 }
@@ -902,6 +916,27 @@ mod tests {
             assert!(line.starts_with("株式会社"));
             assert!(COMPANY_SUFFIXES.iter().any(|s| line.ends_with(s)));
         }
+    }
+
+    #[test]
+    fn uuid_column_produces_valid_v4_uuids_without_duplicates() {
+        let schema = schema_from_yaml("row_count: 50\ncolumns:\n  - name: id\n    type: uuid\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 42).unwrap();
+        let values: Vec<&str> = csv_text.lines().skip(1).collect();
+        assert_eq!(values.len(), 50);
+        for v in &values {
+            assert!(uuid::Uuid::parse_str(v).is_ok(), "invalid uuid: {v}");
+        }
+        let unique_count = values.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique_count, values.len()); // 50個も作れば衝突しないはず
+    }
+
+    #[test]
+    fn uuid_generation_is_reproducible_with_same_seed() {
+        let a = random_uuid(&mut row_rng(42, 1));
+        let b = random_uuid(&mut row_rng(42, 1));
+        assert_eq!(a, b);
     }
 
     #[test]

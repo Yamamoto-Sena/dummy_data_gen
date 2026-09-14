@@ -84,6 +84,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `phone_ja` | 携帯電話番号風(`090/080/070-XXXX-XXXX`) | なし |
 | `address_ja` | 都道府県+市区町村の簡易住所 | なし |
 | `company_name_ja` | 「株式会社〇〇商事」のような会社名 | なし |
+| `uuid` | UUID v4形式のランダムなID(例: `550e8400-...`) | なし |
 | `enum` | `choices`の中から均等ランダムに1つ選ぶ | `choices`(文字列のリスト) |
 
 どの列タイプにも `null_rate`(0.0〜1.0)を追加でき、その確率でNULL(CSVでは空文字、SQLではクォートなしの`NULL`、JSONでは`null`)を出力する。
