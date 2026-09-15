@@ -3,6 +3,10 @@ name = "dummy_data_gen"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "dummy_data_gen"
+path = "src/lib.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rand = { version = "0.8", features = ["small_rng"] }

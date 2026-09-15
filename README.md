@@ -76,21 +76,27 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | type | 説明 | 追加パラメータ |
 |---|---|---|
 | `sequence` | 1から始まる連番 | なし |
-| `name_ja` | 日本語のランダムな氏名 | なし |
-| `katakana_name` | フリガナ。**直前に`name_ja`列があれば、その氏名と対応する読みを選ぶ**。無ければランダム | なし |
-| `email` | `user{連番}@example.com` | なし |
+| `name_ja` | 日本語のランダムな氏名(フルネーム) | なし |
+| `last_name_ja` | 姓(苗字)のみ | なし |
+| `first_name_ja` | 名のみ | なし |
+| `katakana_name` | フリガナ(全角)。**直前に`name_ja`列があれば、その氏名と対応する読みを選ぶ**。無ければランダム | なし |
+| `katakana_name_hankaku` | フリガナ(半角)。参照ロジックは`katakana_name`と同じ | なし |
+| `email` | `user{連番}@{domain}` | `domain`(省略時`example.com`) |
 | `integer` | `min`〜`max`のランダムな整数 | `min`, `max` |
 | `float` | `min`〜`max`のランダムな小数 | `min`, `max`, `decimals`(省略時2) |
 | `boolean` | `true` / `false` | なし |
-| `date` | `start`〜`end`のランダムな日付(`YYYY-MM-DD`) | `start`, `end` |
+| `date` | `start`〜`end`のランダムな日付 | `start`, `end`, `format`(省略時`ymd`。`ymd`/`iso8601`/`slash`) |
+| `birth_date` | `min_age`〜`max_age`歳になる生年月日を、今日の日付から逆算 | `min_age`, `max_age`, `format`(dateと共通) |
 | `postal_code` | 日本の郵便番号風(`NNN-NNNN`) | なし |
 | `phone_ja` | 携帯電話番号風(`090/080/070-XXXX-XXXX`) | なし |
+| `phone_ja_landline` | 固定電話番号風(市外局番+`XXXX-XXXX`) | なし |
 | `address_ja` | 都道府県+市区町村の簡易住所 | なし |
 | `company_name_ja` | 「株式会社〇〇商事」のような会社名 | なし |
 | `uuid` | UUID v4形式のランダムなID(例: `550e8400-...`) | なし |
 | `prefecture_ja` | 都道府県 | なし |
 | `city_ja` | 市区町村。**直前に`prefecture_ja`列があれば、その都道府県に実在する地名を選ぶ**。無ければ全都道府県からランダム | なし |
 | `enum` | `choices`の中から均等ランダムに1つ選ぶ | `choices`(文字列のリスト) |
+| `fixed` | どの行でも常に同じ文字列を返す | `value` |
 | `foreign_key` | 親テーブルに実在する値からランダムに1つ選ぶ(複数テーブル形式`tables:`専用) | `references`(`"テーブル名.列名"`形式) |
 
 どの列タイプにも `null_rate`(0.0〜1.0)を追加でき、その確率でNULL(CSVでは空文字、SQLではクォートなしの`NULL`、JSONでは`null`)を出力する。
@@ -203,6 +209,10 @@ columns:
 ### 進捗表示
 
 `row_count`が1000以上のとき、生成中にターミナルへ進捗バー(件数・割合)を表示する。ファイルへのリダイレクトなど、ターミナル以外への出力時は自動的に表示されない。
+
+## GUI版(DummyGen JP)について
+
+`C:\dev_2\dummygen_jp_gui` に、このツールをライブラリ(`src/lib.rs`)として組み込んだTauri v2 + React 19のデスクトップGUIアプリ「DummyGen JP」がある。コマンド操作に不慣れな担当者向けに、カラム設定・生成件数・出力形式(CSV/SQL)・文字コード(UTF-8/Shift-JIS)を画面から設定できる。GUIはCSV/SQL出力のみ対応(複数テーブル・JSON/Excel出力は今のところCLI専用)。GUIから生成したUTF-8のCSVには、Excelで開いたときに文字化けしないようファイル先頭にBOMを付けている(CLIの`--encoding utf8`出力にはBOMは付かず、これまで通り)。
 
 ## Dr.Sum / MotionBoard / Datalizer 等での利用について
 

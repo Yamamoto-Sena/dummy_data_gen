@@ -8,3 +8,30 @@
 
 # 動作確認のために作った一時ファイル
 /scratch_test_schema.yaml
+before*.csv
+before*.sql
+before_multi_*
+after*.csv
+after*.sql
+after_multi_*
+big1.csv
+big2.csv
+big_schema.yaml
+check_*.csv
+check_*.sql
+check_*.xlsx
+my_output.csv
+my_test.json
+new_types.csv
+new_types.sql
+new_types_schema.yaml
+output_a.csv
+output_b.csv
+output_c.csv
+output_d.csv
+output_orders.csv
+output_users.csv
+progress_stderr*.log
+result*.csv
+result*.json
+test_error.yaml
