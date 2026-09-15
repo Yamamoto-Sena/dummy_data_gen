@@ -91,6 +91,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `prefecture_ja` | 都道府県 | なし |
 | `city_ja` | 市区町村。**直前に`prefecture_ja`列があれば、その都道府県に実在する地名を選ぶ**。無ければ全都道府県からランダム | なし |
 | `enum` | `choices`の中から均等ランダムに1つ選ぶ | `choices`(文字列のリスト) |
+| `foreign_key` | 親テーブルに実在する値からランダムに1つ選ぶ(複数テーブル形式`tables:`専用) | `references`(`"テーブル名.列名"`形式) |
 
 どの列タイプにも `null_rate`(0.0〜1.0)を追加でき、その確率でNULL(CSVでは空文字、SQLではクォートなしの`NULL`、JSONでは`null`)を出力する。
 
@@ -103,6 +104,36 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 - 値の組み合わせ数が `row_count` より少ない(例: `boolean`で行数5行にunique指定)
 - 値の組み合わせ数が200万通りを超える(範囲を絞って使う)
 - `null_rate` と同時に指定している
+
+### 複数テーブルの外部キー整合性
+
+トップレベルに `tables:` を書くと、複数のテーブルをまとめて定義できる。子テーブルの `foreign_key` 列は、必ず親テーブルに実在する値だけを参照する([schema_multi_table.yaml](schema_multi_table.yaml)参照)。
+
+```yaml
+tables:
+  - name: users
+    row_count: 50
+    columns:
+      - name: id
+        type: sequence
+  - name: orders
+    row_count: 200
+    columns:
+      - name: id
+        type: sequence
+      - name: user_id
+        type: foreign_key
+        references: users.id # "テーブル名.列名" の形式
+```
+
+```bash
+cargo run -- --config schema_multi_table.yaml --format csv,sql
+```
+
+- **既存の単一テーブル形式(`tables:`を使わない書き方)は今まで通りそのまま動く**。`tables:`と`row_count:`/`columns:`/`table_name:`を同時に指定するとエラーになる。
+- テーブルは依存関係を自動で解決し、親テーブルを先に生成してから子テーブルを生成する(`tables:`に書く順序は自由。多段参照・複数のテーブルから参照される親も対応)。循環参照・自己参照・存在しないテーブルや列への参照はエラーになる。
+- `foreign_key`列に `unique: true` は指定できない(1つの親の値を複数の子行が参照するのが外部キーの通常の挙動のため)。参照先の列に `null_rate` を指定することもできない(参照先にNULLが混ざるのを防ぐため)。参照する側の列自体への`null_rate`は指定できる(任意の関連を表せる)。
+- 出力先: `csv`/`json`はテーブルごとに別ファイル(`output_users.csv`など)、`sql`は依存順(親→子)で1つのファイルにまとめる、`xlsx`は1ブックにテーブルごとの1シートとしてまとめる。
 
 ### JSON出力(NDJSON)
 

@@ -1,0 +1,26 @@
+# 複数テーブル形式の例。トップレベルに tables: を置き、各要素が1テーブル分の定義になる
+# (単一テーブル形式のrow_count/table_name/columnsをそのまま1テーブル分だけ書いたもの)。
+# 既存の単一テーブル形式(schema.yaml)は、tables: を使わなければ今まで通り動く。
+tables:
+  - name: users
+    row_count: 50
+    columns:
+      - name: id
+        type: sequence
+      - name: name
+        type: name_ja
+      - name: prefecture
+        type: prefecture_ja
+
+  - name: orders
+    row_count: 200
+    columns:
+      - name: id
+        type: sequence
+      - name: user_id
+        type: foreign_key   # 必ずusersに実在するidの値だけが選ばれる
+        references: users.id
+      - name: amount
+        type: integer
+        min: 100
+        max: 50000

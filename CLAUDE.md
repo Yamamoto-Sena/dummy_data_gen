@@ -27,7 +27,7 @@ cargo test
 ## アーキテクチャ
 
 - `Args`（clap の `derive` マクロを使用）が CLI引数 `--config` / `--encoding` / `--format` / `--seed` / `--output` を定義している。
-- `Schema` / `ColumnDef` / `ColumnType`（serde の `Deserialize`）が `schema.yaml` の構造をそのまま表す。`load_schema` がファイル読み込み + YAMLパースを行う。
+- `Schema` / `ColumnDef` / `ColumnType`（serde の `Deserialize`）が「1テーブル分の定義」を表す（`Schema.table_name`は`#[serde(alias = "name")]`で`tables:`形式の`name:`キーも受ける）。`load_schema` は `RawSchemaFile`（トップレベルの`row_count`/`table_name`/`columns`/`tables`を全部Optionとして受ける箱）にパースしてから `normalize_schema_file` に渡し、単一テーブル形式・`tables:`形式のどちらも `SchemaFile { tables: Vec<Schema>, multi_table: bool }` に正規化する（**F4-3**。詳細は下の「複数テーブルの外部キー整合性」を参照）。単一/複数の判定に`serde(untagged)`を使わないのは、untaggedだと「どのバリアントにも一致しません」という分かりにくいエラーになり、既存の日本語エラーメッセージの質が落ちるため。
   `ColumnType` は `#[serde(tag = "type")]` の内部タグ付きenumで、`ColumnDef` 側は `#[serde(flatten)]` で受けている。
   そのため YAML上は `name` と `type` と、列タイプ固有の追加フィールド（`min`/`max`/`start`/`end`/`decimals`/`choices`）を同じ階層にフラットに書ける。
 - 対応する列タイプ: `sequence`（連番）/ `name_ja`（日本語氏名）/ `email` / `integer`（min/max指定の整数）/ `float`（min/max/decimals指定の小数）/ `boolean` / `date`（start/end指定、`YYYY-MM-DD`）/ `postal_code`（日本の郵便番号風）/ `phone_ja`（携帯電話番号風）/ `address_ja`（都道府県+市区町村風の住所。1列で完結）/ `company_name_ja`（`LAST_NAMES`を再利用し「株式会社+姓+`COMPANY_SUFFIXES`」の形で生成）/ `uuid`（v4形式。`uuid::Uuid::new_v4()`は使わず、自前のシード付きrngで作った16バイトを`uuid::Builder::from_random_bytes`に渡すことで`--seed`の再現性を維持している）/ `prefecture_ja`（都道府県）/ `city_ja`（市区町村。**同じ行の直前にある`prefecture_ja`列の値に対応する市区町村を選ぶ**。無ければ全都道府県からランダム）/ `katakana_name`（フリガナ。**同じ行の直前にある`name_ja`列と同じ氏名の読みを選ぶ**。無ければランダム）/ `enum`（`choices`リストからランダムに1つ選ぶ、均等ランダムのみ対応。重み付けは非対応）。
@@ -54,7 +54,20 @@ cargo test
 - **Excel出力（F2-2）**: `write_xlsx_from_rows`が`rust_xlsxwriter::Workbook`を直接組み立てて保存する。CSV/SQL/JSONは「文字列を組み立ててから`write_text`で書き出す」という流れだが、xlsxはテキストではなくバイナリ(ZIP)形式なのでこの流れには乗らず、単体で完結している。そのため**`--encoding`はxlsxには効かない**（`main`でSJIS指定時に警告を出す）。`write_xlsx_cell`が列タイプに応じて`write_number`/`write_boolean`/`write_string`を使い分け、NULL(None)は何も書かず空セルのままにする。
 - `write_text` が UTF-8文字列を受け取り、`encoding` に応じてそのまま保存するか `encoding_rs::SHIFT_JIS.encode()` でShift-JISに変換してから保存する共通処理（CSV/SQL/JSONで使う。xlsxは対象外）。
 - **複数形式同時出力（F3-3）**: `Args.format`は`Vec<Format>`で、`value_delimiter = ','`により`--format csv,json`のようなカンマ区切り指定を自動でパースする（`Format`に`PartialEq`/`Eq`/`Hash`を追加し、`main`側で重複指定を除去）。`format_extension`/`default_output_path`/`output_base_path`が出力パスを決める。**形式が1つだけのときは既存の挙動を一切変えない**（`--output`をそのまま使う）。**形式が複数のときは`--output`を拡張子なしのベース名として扱い**、形式ごとに拡張子を付ける（例: `--output result --format csv,json` → `result.csv`/`result.json`）。`write_output`が形式ごとの分岐（`sql`なら`table_name`必須チェックを含む）を一手に引き受ける。`sql` を選んだ場合、`schema.yaml` に `table_name` の指定がないとエラーになるが、**他に指定した形式の出力は続行する**（1つの形式の失敗が他をブロックしない）。
-- エラーハンドリングは `Box<dyn std::error::Error>` + `?` によるシンプルな伝播で、`main` 側で `load_schema` → `prepare_columns` → `resolve_unique_pools` → `generate_all_rows`(1回) → 指定された各形式について`write_output`、の順に処理し、形式ごとに成功/失敗を個別に表示する。
+- エラーハンドリングは `Box<dyn std::error::Error>` + `?` によるシンプルな伝播で、`main` 側で単一テーブルなら `load_schema` → `prepare_columns` → `resolve_unique_pools` → `generate_all_rows`(1回) → 指定された各形式について`write_output`、複数テーブルなら下記の手順の順に処理し、形式ごとに成功/失敗を個別に表示する。
+
+### 複数テーブルの外部キー整合性（F4-3）
+
+最も規模が大きい機能。トップレベルに`tables:`（`Vec<Schema>`）を書くと複数テーブルを1つのschema.yamlにまとめられ、子テーブルの`foreign_key`列は親テーブルに実在する値だけを参照する。**既存の単一テーブル形式（`tables:`を使わない書き方）は`load_schema`の正規化を経て`SchemaFile{multi_table: false}`になり、`main`はそれ専用の分岐（既存コードと全く同じ手順）を通るため、出力は1バイトも変わらない**（実測で確認済み: リファクタ前後で同一seed・同一schema.yamlのCSVがバイト単位で一致）。
+
+- `PreparedColumnType::ForeignKey { ref_table, ref_column, repr, pool }`: `pool`は親テーブル生成後に埋まる`Arc<Vec<String>>`（`unique_pool`と同じ「先に確定した値を使う」設計。`Arc`なのは同じ親列を複数の子列が参照しても実体を共有するため）。`repr: FkRepr`（`Integer`/`Float`/`Boolean`/`Text`）が参照先の列タイプから決まり、SQLのクォート要否（`is_text_column`）やJSON/Excelの型（`cell_to_json`/`write_xlsx_cell`）を左右する。`references: "テーブル名.列名"`は`parse_reference`が最初の`.`で分割する。
+- `PreparedTable { name, row_count, columns }`が「1テーブル分の生成準備が済んだ状態」。`prepare_tables`が`SchemaFile`の各テーブルに`prepare_columns`を適用する（単一テーブル形式で`foreign_key`列が使われていたらここでエラー）。
+- `resolve_foreign_keys`が全FK列の参照先（テーブル/列の存在、自己参照、参照先の`null_rate`）を検証し、依存辺（`deps[子index] = [親index...]`）と「後でプールを取り出す必要がある列」（`referenced: HashMap<ColumnKey, String>`、`ColumnKey = (String, String)`型エイリアス）を作る。
+- `topological_order`がKahnのアルゴリズムで親→子の順に並べる。循環していたら具体的な循環パスを1つ再構成してエラーメッセージに含める。
+- `resolve_fk_reprs`が**トポロジカル順**に走査して`repr`を確定させる（多段参照 `c.b_id → b.a_id → a.id` で、bのreprが確定してからcのreprを決めるため。順不同だと多段参照時にreprが未確定の`Text`のままになってしまう）。
+- `table_seed(base_seed, table_index)` = `base_seed.wrapping_add(table_index * 定数)`。`table_index`は**宣言順index**（トポロジカル順ではない）を使うため、`table_index == 0`のとき必ず`base_seed`そのものになり、単一テーブルの再現性に影響しない。同じ列構成の2テーブルが同一データにならないようにする目的。
+- `main`のテーブル生成ループ: `order`（親→子）に従い、各テーブルごとに `fill_foreign_key_pools`（既に確定した親のプールをFK列に差し込む）→ `resolve_unique_pools` → `generate_all_rows` → `collect_key_pools`（このテーブルの、他から参照される列の値をプール化する）を実行する。生成結果は`tables`とは別の`rows_by_table: Vec<Option<Vec<Vec<Option<String>>>>>`に持つ（`&mut tables[i]`と`&tables[j]`の同時借用を避けるため）。
+- `GeneratedTable<'a> { name, columns, rows }`（すべて借用）が出力用のビュー。`write_output_multi_table`が形式ごとに分岐する: csv/json は`table_file_path`（`"result.csv"+"users"`→`"result_users.csv"`、書き込み前にサニタイズ後の衝突を検査）でテーブルごとに別ファイル、sql は`build_sql_multi`で依存順（親→子）の`INSERT INTO`を1ファイルにまとめる（外部キー制約のあるDBにそのまま流し込める）、xlsx は`write_xlsx_tables`で1ブック・テーブルごとに1シート（`sanitize_sheet_name`が31文字制限・禁止文字・重複に対応）。`write_xlsx_from_rows`（単一テーブル）は`write_xlsx_tables`にシート名指定なしで委譲する薄いラッパー。
 
 ## 依存クレート
 

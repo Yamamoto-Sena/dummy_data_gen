@@ -5,6 +5,8 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 // 「このプログラムが受け取れる引数はこれです」という設計図(struct)
 #[derive(Parser)]
@@ -66,14 +68,85 @@ impl std::fmt::Display for Format {
     }
 }
 
-// schema.yaml の中身をそのまま受け止める箱(struct)。serdeが自動でYAML→structに変換する
+// schema.yaml の中身をそのまま受け止める箱(struct)。serdeが自動でYAML→structに変換する。
+// 「1テーブル分の定義」を表す型で、単一テーブル形式(schema.yamlのトップレベルに
+// row_count/columnsを直接書く形式)でも、複数テーブル形式(tables:の各要素)でも、
+// どちらも同じこの型として読み込む。tables:形式では要素のキーが"name"なので、
+// aliasでtable_nameとしても受け取れるようにしている。
 #[derive(Deserialize)]
 struct Schema {
     row_count: u32,
-    // SQL出力(--format sql)のときだけ使う。CSV出力では不要なのでOptionにしている
-    #[serde(default)]
+    // SQL出力(--format sql)のときや、tables:形式でのテーブル名として使う
+    #[serde(default, alias = "name")]
     table_name: Option<String>,
     columns: Vec<ColumnDef>,
+}
+
+// YAMLの最上位をいったん全部Optionとして受け止める箱。単一テーブル形式(row_count/columns
+// が直接トップレベルにある)と複数テーブル形式(tables:のリスト)のどちらで書かれているかを
+// ここではまだ判定しない(判定はnormalize_schema_fileで行う)。
+// serdeのuntagged enumを使わないのは、untaggedだと「どのバリアントにも一致しません」という
+// 分かりにくいエラーになり、既存の日本語エラーメッセージの分かりやすさが損なわれるため。
+#[derive(Deserialize)]
+struct RawSchemaFile {
+    #[serde(default)]
+    row_count: Option<u32>,
+    #[serde(default)]
+    table_name: Option<String>,
+    #[serde(default)]
+    columns: Option<Vec<ColumnDef>>,
+    #[serde(default)]
+    tables: Option<Vec<Schema>>,
+}
+
+// normalize_schema_fileの結果。multi_tableは出力パスの決め方の分岐に使う
+// (tables:形式で明示的に書かれていたかどうか。単一テーブル形式ならfalse)
+struct SchemaFile {
+    tables: Vec<Schema>,
+    multi_table: bool,
+}
+
+fn normalize_schema_file(raw: RawSchemaFile) -> Result<SchemaFile, Box<dyn std::error::Error>> {
+    let has_single_table_fields =
+        raw.row_count.is_some() || raw.columns.is_some() || raw.table_name.is_some();
+
+    if let Some(tables) = raw.tables {
+        if has_single_table_fields {
+            return Err(
+                "tables: と row_count:/columns:/table_name: は同時に指定できません。複数テーブルを作る場合は各テーブルの定義を tables: の中に書いてください".into(),
+            );
+        }
+        if tables.is_empty() {
+            return Err("tables には少なくとも1つ以上のテーブルを定義してください".into());
+        }
+        for (i, table) in tables.iter().enumerate() {
+            if table.table_name.as_deref().is_none_or(str::is_empty) {
+                return Err(format!("tables[{}]: テーブル名(name)を指定してください", i).into());
+            }
+        }
+        for i in 0..tables.len() {
+            for j in (i + 1)..tables.len() {
+                if tables[i].table_name == tables[j].table_name {
+                    return Err(format!(
+                        "テーブル名 \"{}\" が重複しています",
+                        tables[i].table_name.as_deref().unwrap_or("")
+                    )
+                    .into());
+                }
+            }
+        }
+        return Ok(SchemaFile { tables, multi_table: true });
+    }
+
+    let columns = raw
+        .columns
+        .ok_or("columns には少なくとも1つ以上の列を定義してください")?;
+    let row_count = raw.row_count.ok_or("row_count を指定してください")?;
+
+    Ok(SchemaFile {
+        tables: vec![Schema { row_count, table_name: raw.table_name, columns }],
+        multi_table: false,
+    })
 }
 
 #[derive(Deserialize)]
@@ -124,17 +197,21 @@ enum ColumnType {
     Enum {
         choices: Vec<String>,
     },
+    // "テーブル名.列名" 形式(最初の"."で分割)。複数テーブル形式(tables:)でのみ使える
+    ForeignKey {
+        references: String,
+    },
 }
 
 fn default_decimals() -> u32 {
     2
 }
 
-fn load_schema(path: &str) -> Result<Schema, Box<dyn std::error::Error>> {
+fn load_schema(path: &str) -> Result<SchemaFile, Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("スキーマファイル({})の読み込みに失敗しました: {}", path, e))?;
-    let schema: Schema = serde_yaml::from_str(&text)?;
-    Ok(schema)
+    let raw: RawSchemaFile = serde_yaml::from_str(&text)?;
+    normalize_schema_file(raw)
 }
 
 // YAMLから読んだそのままの定義(ColumnType)を、実際に値を作るときに必要な形に変換したもの。
@@ -168,6 +245,54 @@ enum PreparedColumnType {
     CityJa,
     KatakanaName,
     Enum { choices: Vec<String> },
+    ForeignKey {
+        ref_table: String,
+        ref_column: String,
+        // 参照先の列タイプから決まる「値の見え方」。SQLのクォート要否やJSON/Excelの型判定に使う。
+        // 既定はText。resolve_fk_reprsが親テーブルの列を見て確定させる
+        repr: FkRepr,
+        // 親テーブルを生成した後にfill_foreign_key_poolsが埋める。
+        // 生成時はこの中から一様ランダムに1つ選ぶだけになる(unique_poolと同じ二段構えの設計)。
+        // Arcなのは、同じ親列を複数の子列が参照しても実体を1つで共有するため
+        pool: Option<Arc<Vec<String>>>,
+    },
+}
+
+// 外部キーの値を、出力形式ごとにどう扱うか(参照先の列タイプから決まる)
+#[derive(Clone, Copy, PartialEq)]
+enum FkRepr {
+    Integer,
+    Float,
+    Boolean,
+    Text,
+}
+
+fn fk_repr_of(kind: &PreparedColumnType) -> FkRepr {
+    match kind {
+        PreparedColumnType::Sequence | PreparedColumnType::Integer { .. } => FkRepr::Integer,
+        PreparedColumnType::Float { .. } => FkRepr::Float,
+        PreparedColumnType::Boolean => FkRepr::Boolean,
+        // 多段参照(親自身もforeign_key列)の場合は、親のreprをそのまま引き継ぐ
+        PreparedColumnType::ForeignKey { repr, .. } => *repr,
+        _ => FkRepr::Text,
+    }
+}
+
+// "users.id" のような参照先指定を最初の"."で分割する(列名側には"."を含められる)
+fn parse_reference(
+    references: &str,
+    column_name: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    match references.split_once('.') {
+        Some((table, column)) if !table.is_empty() && !column.is_empty() => {
+            Ok((table.to_string(), column.to_string()))
+        }
+        _ => Err(format!(
+            "列 \"{}\": references は \"テーブル名.列名\" の形式で指定してください(例: users.id)",
+            column_name
+        )
+        .into()),
+    }
 }
 
 fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::error::Error>> {
@@ -244,6 +369,10 @@ fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::
                     }
                     PreparedColumnType::Enum { choices: choices.clone() }
                 }
+                ColumnType::ForeignKey { references } => {
+                    let (ref_table, ref_column) = parse_reference(references, &c.name)?;
+                    PreparedColumnType::ForeignKey { ref_table, ref_column, repr: FkRepr::Text, pool: None }
+                }
             };
 
             let null_rate = c.null_rate.unwrap_or(0.0);
@@ -257,6 +386,13 @@ fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::
 
             let unique = c.unique.unwrap_or(false);
             if unique {
+                if matches!(kind, PreparedColumnType::ForeignKey { .. }) {
+                    return Err(format!(
+                        "列 \"{}\": foreign_key列には unique を指定できません(1つの親の値を複数の子行が参照するのが外部キーの通常の挙動です)",
+                        c.name
+                    )
+                    .into());
+                }
                 if null_rate > 0.0 {
                     return Err(format!(
                         "列 \"{}\": unique と null_rate は同時に指定できません",
@@ -408,6 +544,248 @@ fn resolve_unique_pools(columns: &mut [PreparedColumn], row_count: u32, base_see
             column.unique_pool = Some(build_unique_pool(&column.kind, row_count, base_seed, i as u64));
         }
     }
+}
+
+// SchemaFile.tablesの1テーブル分を、prepare_columns済みの状態にしたもの
+struct PreparedTable {
+    // 単一テーブル形式(tables:を使っていない)でtable_name未指定ならNone
+    name: Option<String>,
+    row_count: u32,
+    columns: Vec<PreparedColumn>,
+}
+
+// SchemaFileの各テーブルにprepare_columnsを適用する
+fn prepare_tables(file: &SchemaFile) -> Result<Vec<PreparedTable>, Box<dyn std::error::Error>> {
+    file.tables
+        .iter()
+        .map(|schema| {
+            let columns = prepare_columns(schema)?;
+            // 単一テーブル形式でforeign_key列が使われていたら、参照先のテーブルが
+            // そもそも存在しえないのでここで弾く
+            if !file.multi_table
+                && let Some(c) = columns.iter().find(|c| matches!(c.kind, PreparedColumnType::ForeignKey { .. }))
+            {
+                return Err(format!(
+                    "列 \"{}\": foreign_key列は tables: 形式のスキーマでのみ使用できます(1テーブルだけのスキーマには参照先のテーブルがありません)",
+                    c.name
+                )
+                .into());
+            }
+            Ok(PreparedTable { name: schema.table_name.clone(), row_count: schema.row_count, columns })
+        })
+        .collect()
+}
+
+// (テーブル名, 列名) をキーにした対応表。referencedは「参照元の説明」、
+// key_poolsは「実際に生成された値のプール」を持つ
+type ColumnKey = (String, String);
+
+// 全FK列の参照先(テーブル/列の存在)を検証し、依存辺(deps[子テーブルindex] = 親テーブルindexのVec)と、
+// 「後でプールを取り出す必要がある親の列」(referenced: (テーブル名, 列名) → 参照元の説明)を作る。
+#[allow(clippy::type_complexity)] // (Vec<Vec<usize>>, HashMap<...>) は内部専用の戻り値で、これ以上分ける必要は薄い
+fn resolve_foreign_keys(
+    tables: &mut [PreparedTable],
+) -> Result<(Vec<Vec<usize>>, HashMap<ColumnKey, String>), Box<dyn std::error::Error>> {
+    let name_to_index: HashMap<&str, usize> = tables
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| t.name.as_deref().map(|n| (n, i)))
+        .collect();
+
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); tables.len()];
+    let mut referenced: HashMap<ColumnKey, String> = HashMap::new();
+
+    for (child_idx, table) in tables.iter().enumerate() {
+        let child_name = table.name.as_deref().unwrap_or("");
+        for column in &table.columns {
+            let PreparedColumnType::ForeignKey { ref_table, ref_column, .. } = &column.kind else {
+                continue;
+            };
+
+            if ref_table == child_name {
+                return Err(format!(
+                    "テーブル \"{}\" の列 \"{}\" が自分自身のテーブルを参照しています。自己参照は未対応です",
+                    child_name, column.name
+                )
+                .into());
+            }
+
+            let Some(&parent_idx) = name_to_index.get(ref_table.as_str()) else {
+                return Err(format!(
+                    "列 \"{}\": 参照先のテーブル \"{}\" が tables に定義されていません",
+                    column.name, ref_table
+                )
+                .into());
+            };
+
+            let parent = &tables[parent_idx];
+            let parent_column = parent.columns.iter().find(|c| &c.name == ref_column).ok_or_else(|| {
+                format!("列 \"{}\": テーブル \"{}\" に列 \"{}\" がありません", column.name, ref_table, ref_column)
+            })?;
+
+            if parent_column.null_rate > 0.0 {
+                return Err(format!(
+                    "列 \"{}\": 参照先の \"{}.{}\" には null_rate が指定されています。外部キーの参照先にNULLが混ざる列は指定できません",
+                    column.name, ref_table, ref_column
+                )
+                .into());
+            }
+
+            if !deps[child_idx].contains(&parent_idx) {
+                deps[child_idx].push(parent_idx);
+            }
+            referenced
+                .entry((ref_table.clone(), ref_column.clone()))
+                .or_insert_with(|| format!("{}.{}", child_name, column.name));
+        }
+    }
+
+    Ok((deps, referenced))
+}
+
+// Kahnのアルゴリズムで親→子の順に並べる。循環していたら具体的な循環パスを1つ再構成してエラーにする
+fn topological_order(
+    deps: &[Vec<usize>],
+    tables: &[PreparedTable],
+) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let n = tables.len();
+    let mut in_degree = vec![0usize; n];
+
+    // deps[child] = [親のindex...] なので、親→子の辺リスト(children[親] = [子...])を作る
+    // (in_degree[i] は「iに向かう辺の数」というKahnの通常の定義に合わせる)
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (child, parents) in deps.iter().enumerate() {
+        for &parent in parents {
+            children[parent].push(child);
+            in_degree[child] += 1;
+        }
+    }
+
+    let mut queue: std::collections::VecDeque<usize> =
+        (0..n).filter(|&i| in_degree[i] == 0).collect();
+    let mut order = Vec::with_capacity(n);
+
+    while let Some(i) = queue.pop_front() {
+        order.push(i);
+        for &child in &children[i] {
+            in_degree[child] -= 1;
+            if in_degree[child] == 0 {
+                queue.push_back(child);
+            }
+        }
+    }
+
+    if order.len() != n {
+        // 循環しているテーブル(in_degreeが0にならなかったもの)から、具体的な循環パスを1つたどる
+        let remaining: Vec<usize> = (0..n).filter(|&i| !order.contains(&i)).collect();
+        let mut path = vec![remaining[0]];
+        loop {
+            let current = *path.last().unwrap();
+            let next = deps[current].iter().find(|p| remaining.contains(p)).copied().unwrap();
+            if let Some(pos) = path.iter().position(|&x| x == next) {
+                path = path[pos..].to_vec();
+                break;
+            }
+            path.push(next);
+        }
+        let names: Vec<&str> =
+            path.iter().map(|&i| tables[i].name.as_deref().unwrap_or("")).collect();
+        return Err(format!(
+            "テーブル間の外部キーが循環しています: {} → {}。どこかの参照を外してください",
+            names.join(" → "),
+            names.first().unwrap_or(&"")
+        )
+        .into());
+    }
+
+    Ok(order)
+}
+
+// トポロジカル順に走査してreprを確定させる。多段参照(c.b_id → b.a_id → a.id)で、
+// bのreprが確定してからcのreprを決めるために、順不同ではなくトポロジカル順で処理する
+fn resolve_fk_reprs(
+    tables: &mut [PreparedTable],
+    order: &[usize],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for &i in order {
+        // (子テーブル内の列index, 新しいrepr) を先に集めてから書き込む
+        // (同じtables[i]の中で複数のFK列があっても、他のテーブルは参照しないのでここは1テーブル完結)
+        let mut updates = Vec::new();
+        for (col_idx, column) in tables[i].columns.iter().enumerate() {
+            if let PreparedColumnType::ForeignKey { ref_table, ref_column, .. } = &column.kind {
+                let parent_idx = tables
+                    .iter()
+                    .position(|t| t.name.as_deref() == Some(ref_table.as_str()))
+                    .expect("resolve_foreign_keysで存在確認済み");
+                let parent_column = tables[parent_idx]
+                    .columns
+                    .iter()
+                    .find(|c| &c.name == ref_column)
+                    .expect("resolve_foreign_keysで存在確認済み");
+                updates.push((col_idx, fk_repr_of(&parent_column.kind)));
+            }
+        }
+        for (col_idx, repr) in updates {
+            if let PreparedColumnType::ForeignKey { repr: r, .. } = &mut tables[i].columns[col_idx].kind {
+                *r = repr;
+            }
+        }
+    }
+    Ok(())
+}
+
+// テーブルごとに乱数シードをずらす。table_indexは宣言順index(トポロジカル順ではない)。
+// table_index==0のとき必ずbase_seedそのものになるため、単一テーブルの出力は
+// 今まで通り1バイトも変わらない。同じ列構成の2テーブルが同一データにならないようにする目的。
+fn table_seed(base_seed: u64, table_index: usize) -> u64 {
+    base_seed.wrapping_add((table_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+// 親テーブル生成後、参照されている列の値をプール化する
+fn collect_key_pools(
+    table: &PreparedTable,
+    rows: &[Vec<Option<String>>],
+    referenced: &HashMap<ColumnKey, String>,
+    pools: &mut HashMap<ColumnKey, Arc<Vec<String>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(table_name) = table.name.as_deref() else {
+        return Ok(());
+    };
+
+    for (col_idx, column) in table.columns.iter().enumerate() {
+        let key = (table_name.to_string(), column.name.clone());
+        let Some(referenced_by) = referenced.get(&key) else {
+            continue;
+        };
+
+        let values: Vec<String> = rows.iter().filter_map(|row| row[col_idx].clone()).collect();
+        if values.is_empty() {
+            return Err(format!(
+                "テーブル \"{}\" の列 \"{}\" に値が1つもないため、これを参照する {} の値を決められません(row_count が0になっていないか確認してください)",
+                table_name, column.name, referenced_by
+            )
+            .into());
+        }
+
+        pools.insert(key, Arc::new(values));
+    }
+
+    Ok(())
+}
+
+// 子テーブルの生成直前に、FK列にプールを差し込む
+fn fill_foreign_key_pools(
+    columns: &mut [PreparedColumn],
+    pools: &HashMap<ColumnKey, Arc<Vec<String>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for column in columns.iter_mut() {
+        if let PreparedColumnType::ForeignKey { ref_table, ref_column, pool, .. } = &mut column.kind {
+            let key = (ref_table.clone(), ref_column.clone());
+            let found = pools.get(&key).cloned().expect("トポロジカル順に生成しているので親のプールは必ず存在する");
+            *pool = Some(found);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -621,11 +999,20 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::CityJa => random_city(rng, None),
         PreparedColumnType::KatakanaName => random_katakana_name(rng, None),
         PreparedColumnType::Enum { choices } => choices[rng.gen_range(0..choices.len())].clone(),
+        PreparedColumnType::ForeignKey { pool, .. } => {
+            let pool = pool.as_ref().expect("FKプールはfill_foreign_key_poolsで親テーブル生成後に必ず埋まっている");
+            pool[rng.gen_range(0..pool.len())].clone()
+        }
     }
 }
 
 // SQLのVALUES句に書くとき、文字列として ' ' で囲む必要がある列タイプかどうか
 fn is_text_column(kind: &PreparedColumnType) -> bool {
+    // foreign_key列は参照先の型(repr)次第でクォート要否が変わるので個別に判定し、
+    // それ以外は列タイプで固定的に判定する
+    if let PreparedColumnType::ForeignKey { repr, .. } = kind {
+        return *repr == FkRepr::Text;
+    }
     matches!(
         kind,
         PreparedColumnType::NameJa
@@ -850,6 +1237,17 @@ fn cell_to_json(kind: &PreparedColumnType, cell: Option<&str>) -> serde_json::Va
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         PreparedColumnType::Boolean => serde_json::Value::Bool(value == "true"),
+        PreparedColumnType::ForeignKey { repr, .. } => match repr {
+            FkRepr::Integer => value.parse::<i64>().map(Into::into).unwrap_or(serde_json::Value::Null),
+            FkRepr::Float => value
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            FkRepr::Boolean => serde_json::Value::Bool(value == "true"),
+            FkRepr::Text => serde_json::Value::String(value.to_string()),
+        },
         _ => serde_json::Value::String(value.to_string()),
     }
 }
@@ -910,6 +1308,21 @@ fn write_xlsx_cell(
         PreparedColumnType::Boolean => {
             worksheet.write_boolean(row, col, value == "true")?;
         }
+        PreparedColumnType::ForeignKey { repr, .. } => match repr {
+            FkRepr::Integer | FkRepr::Float => {
+                if let Ok(number) = value.parse::<f64>() {
+                    worksheet.write_number(row, col, number)?;
+                } else {
+                    worksheet.write_string(row, col, value)?;
+                }
+            }
+            FkRepr::Boolean => {
+                worksheet.write_boolean(row, col, value == "true")?;
+            }
+            FkRepr::Text => {
+                worksheet.write_string(row, col, value)?;
+            }
+        },
         _ => {
             worksheet.write_string(row, col, value)?;
         }
@@ -928,22 +1341,10 @@ fn write_xlsx_from_rows(
     rows: &[Vec<Option<String>>],
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut workbook = rust_xlsxwriter::Workbook::new();
-    let worksheet = workbook.add_worksheet();
-
-    for (col_idx, column) in columns.iter().enumerate() {
-        worksheet.write_string(0, col_idx as u16, &column.name)?;
-    }
-
-    for (row_idx, row) in rows.iter().enumerate() {
-        let excel_row = (row_idx + 1) as u32; // 0行目はヘッダーなので、データは1行目から
-        for (col_idx, (column, cell)) in columns.iter().zip(row).enumerate() {
-            write_xlsx_cell(worksheet, excel_row, col_idx as u16, &column.kind, cell.as_deref())?;
-        }
-    }
-
-    workbook.save(path)?;
-    Ok(())
+    let table = GeneratedTable { name: None, columns, rows };
+    // use_sheet_names=falseにして、rust_xlsxwriterの既定のシート名(Sheet1)のままにする
+    // (複数テーブル出力とブックの中身を分けるため)
+    write_xlsx_tables(&[table], path, false)
 }
 
 // write_xlsx_from_rowsの「行数とシードを渡すだけで一発で作れる」版(テストからのみ使用)
@@ -992,7 +1393,7 @@ fn output_base_path(output: Option<&str>, format: Format, multiple_formats: bool
 
 // 指定された1つの形式について、既に生成済みの行データ(rows)を清書してファイルに保存する。
 // rowsを引数で受け取ることで、複数形式を同時出力しても値の生成(generate_all_rows)は
-// 1回で済む(形式ごとに毎回同じ乱数列から生成し直すのは無駄なため)。
+// 1回で済む(形式ごとに毎回同じ乱数列から生成し直すのは無駄なため)。単一テーブル専用。
 fn write_output(
     format: Format,
     columns: &[PreparedColumn],
@@ -1019,30 +1420,161 @@ fn write_output(
     }
 }
 
+// 生成済みの1テーブル分(複数テーブル出力で使う)。columns/rowsは借用のみで、
+// 実体はmain()側のtables/rows_by_tableが持ち続ける
+struct GeneratedTable<'a> {
+    name: Option<&'a str>,
+    columns: &'a [PreparedColumn],
+    rows: &'a [Vec<Option<String>>],
+}
+
+// ファイル名に使えない文字( \ / : * ? " < > | と制御文字)を "_" に置き換える
+fn sanitize_file_component(name: &str) -> String {
+    name.chars()
+        .map(|c| if r#"\/:*?"<>|"#.contains(c) || c.is_control() { '_' } else { c })
+        .collect()
+}
+
+// 複数テーブルでcsv/jsonを出すときの、テーブルごとのファイル名。
+// "result.csv" + "users" → "result_users.csv"(拡張子の直前にテーブル名を差し込む)
+fn table_file_path(base: &str, table_name: &str) -> String {
+    let sanitized = sanitize_file_component(table_name);
+    match base.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{}_{}.{}", stem, sanitized, ext),
+        _ => format!("{}_{}", base, sanitized),
+    }
+}
+
+// Excelのシート名の制約(31文字以内、[ ] : * ? / \ 不可、重複不可)に合わせて名前を整形する
+fn sanitize_sheet_name(name: &str, used: &mut std::collections::HashSet<String>) -> String {
+    let cleaned: String = name.chars().map(|c| if "[]:*?/\\".contains(c) { '_' } else { c }).collect();
+    let cleaned: String = cleaned.chars().take(31).collect();
+    let cleaned = if cleaned.is_empty() { "Sheet".to_string() } else { cleaned };
+
+    if !used.contains(&cleaned) {
+        used.insert(cleaned.clone());
+        return cleaned;
+    }
+
+    let mut suffix = 2;
+    loop {
+        let marker = format!("_{}", suffix);
+        let keep = 31usize.saturating_sub(marker.len());
+        let candidate = format!("{}{}", cleaned.chars().take(keep).collect::<String>(), marker);
+        if !used.contains(&candidate) {
+            used.insert(candidate.clone());
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+// 複数テーブルを依存順(親が先)に受け取り、1本のSQLにまとめる。
+// 外部キー制約のあるDBにそのまま流し込めるよう、親のテーブルのINSERT文を先に出力する
+fn build_sql_multi(tables: &[GeneratedTable]) -> Result<String, Box<dyn std::error::Error>> {
+    let mut sql = String::new();
+    for table in tables {
+        let table_name = table.name.expect("複数テーブル形式ではtable_nameが必須(normalize_schema_fileで保証済み)");
+        sql.push_str(&format!("-- テーブル: {}\n", table_name));
+        sql.push_str(&build_sql_from_rows(table.columns, table.rows, table_name)?);
+        sql.push('\n');
+    }
+    Ok(sql)
+}
+
+// 複数テーブルを1つのExcelブックにまとめる(テーブルごとに1シート)。
+// use_sheet_namesがfalseのときはシート名を設定せず、rust_xlsxwriterの既定(Sheet1等)のままにする
+// (単一テーブルのwrite_xlsx_from_rowsと完全に同じブックになるようにするため)
+fn write_xlsx_tables(
+    tables: &[GeneratedTable],
+    path: &str,
+    use_sheet_names: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let mut used_sheet_names = std::collections::HashSet::new();
+
+    for table in tables {
+        let worksheet = workbook.add_worksheet();
+        if use_sheet_names {
+            let name = table.name.unwrap_or("Sheet");
+            worksheet.set_name(sanitize_sheet_name(name, &mut used_sheet_names))?;
+        }
+
+        for (col_idx, column) in table.columns.iter().enumerate() {
+            worksheet.write_string(0, col_idx as u16, &column.name)?;
+        }
+
+        for (row_idx, row) in table.rows.iter().enumerate() {
+            let excel_row = (row_idx + 1) as u32;
+            for (col_idx, (column, cell)) in table.columns.iter().zip(row).enumerate() {
+                write_xlsx_cell(worksheet, excel_row, col_idx as u16, &column.kind, cell.as_deref())?;
+            }
+        }
+    }
+
+    workbook.save(path)?;
+    Ok(())
+}
+
+// 複数テーブルのとき、指定した形式について全テーブル分を書き出す。
+// 戻り値は書き込んだ(パス, 行数)の一覧(mainが成功メッセージを1行ずつ表示するために使う)
+fn write_output_multi_table(
+    format: Format,
+    tables: &[GeneratedTable],
+    base_path: &str,
+    encoding: Encoding,
+) -> Result<Vec<(String, u32)>, Box<dyn std::error::Error>> {
+    match format {
+        Format::Csv | Format::Json => {
+            // 書き込みを始める前に、サニタイズ後のファイル名が衝突しないか確認する
+            let mut paths = Vec::with_capacity(tables.len());
+            for table in tables {
+                let path = table_file_path(base_path, table.name.unwrap_or(""));
+                if paths.contains(&path) {
+                    return Err(format!(
+                        "出力ファイル名 \"{}\" が衝突します。テーブル名を変えてください",
+                        path
+                    )
+                    .into());
+                }
+                paths.push(path);
+            }
+
+            let mut written = Vec::with_capacity(tables.len());
+            for (table, path) in tables.iter().zip(paths) {
+                let text = match format {
+                    Format::Csv => build_csv_from_rows(table.columns, table.rows)?,
+                    Format::Json => build_json_from_rows(table.columns, table.rows)?,
+                    _ => unreachable!("csv/json以外はこの分岐に来ない"),
+                };
+                write_text(&text, &path, encoding)?;
+                written.push((path, table.rows.len() as u32));
+            }
+            Ok(written)
+        }
+        Format::Sql => {
+            write_text(&build_sql_multi(tables)?, base_path, encoding)?;
+            let total_rows: u32 = tables.iter().map(|t| t.rows.len() as u32).sum();
+            Ok(vec![(base_path.to_string(), total_rows)])
+        }
+        Format::Xlsx => {
+            write_xlsx_tables(tables, base_path, true)?;
+            let total_rows: u32 = tables.iter().map(|t| t.rows.len() as u32).sum();
+            Ok(vec![(base_path.to_string(), total_rows)])
+        }
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
-    let schema = match load_schema(&args.config) {
-        Ok(schema) => schema,
+    let schema_file = match load_schema(&args.config) {
+        Ok(schema_file) => schema_file,
         Err(e) => {
             eprintln!("エラーが発生しました: {}", e);
             return;
         }
     };
-
-    let mut columns = match prepare_columns(&schema) {
-        Ok(columns) => columns,
-        Err(e) => {
-            eprintln!("エラーが発生しました: {}", e);
-            return;
-        }
-    };
-
-    // --seedが指定されていればそれを使い、無ければ実行のたびに変わるランダムな値を使う
-    let base_seed = args.seed.unwrap_or_else(rand::random);
-
-    // unique指定のある列の値プールは、base_seedが決まった後でないと計算できない
-    resolve_unique_pools(&mut columns, schema.row_count, base_seed);
 
     // --format に同じ形式を重複指定されても1回だけ処理する(指定順は保つ)
     let mut formats: Vec<Format> = Vec::new();
@@ -1057,19 +1589,115 @@ fn main() {
         eprintln!("警告: --format xlsxでは--encodingは無視されます(Excelファイルは常にUTF-8相当の内部形式です)");
     }
 
-    // 値の生成(rayonで並列)は、指定された形式の数に関係なく1回だけ行う
-    let rows = generate_all_rows(schema.row_count, &columns, base_seed);
+    if !schema_file.multi_table {
+        // 単一テーブル(schema.yamlにtables:が無い、これまで通りの形式)。
+        // 既存の利用者への影響が絶対にないよう、以前と全く同じ手順・関数呼び出しのままにしてある。
+        let schema = &schema_file.tables[0];
+
+        let mut columns = match prepare_columns(schema) {
+            Ok(columns) => columns,
+            Err(e) => {
+                eprintln!("エラーが発生しました: {}", e);
+                return;
+            }
+        };
+
+        let base_seed = args.seed.unwrap_or_else(rand::random);
+        resolve_unique_pools(&mut columns, schema.row_count, base_seed);
+        let rows = generate_all_rows(schema.row_count, &columns, base_seed);
+
+        for format in formats {
+            let path = output_base_path(args.output.as_deref(), format, multiple_formats);
+            let result =
+                write_output(format, &columns, &rows, schema.table_name.as_deref(), &path, args.encoding);
+
+            match result {
+                Ok(()) => println!(
+                    "{}行のデータを {} ({}) に書き出しました",
+                    schema.row_count, path, args.encoding
+                ),
+                Err(e) => eprintln!("エラーが発生しました: {}", e),
+            }
+        }
+        return;
+    }
+
+    // 複数テーブル(tables:形式)。依存関係を解決してから、親→子の順に1テーブルずつ生成する
+    let mut tables = match prepare_tables(&schema_file) {
+        Ok(tables) => tables,
+        Err(e) => {
+            eprintln!("エラーが発生しました: {}", e);
+            return;
+        }
+    };
+
+    let (deps, referenced) = match resolve_foreign_keys(&mut tables) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("エラーが発生しました: {}", e);
+            return;
+        }
+    };
+
+    let order = match topological_order(&deps, &tables) {
+        Ok(order) => order,
+        Err(e) => {
+            eprintln!("エラーが発生しました: {}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = resolve_fk_reprs(&mut tables, &order) {
+        eprintln!("エラーが発生しました: {}", e);
+        return;
+    }
+
+    let base_seed = args.seed.unwrap_or_else(rand::random);
+    let mut key_pools: HashMap<ColumnKey, Arc<Vec<String>>> = HashMap::new();
+    let mut rows_by_table: Vec<Option<Vec<Vec<Option<String>>>>> =
+        (0..tables.len()).map(|_| None).collect();
+
+    for &i in &order {
+        eprintln!("テーブル \"{}\" を生成中...", tables[i].name.as_deref().unwrap_or(""));
+
+        if let Err(e) = fill_foreign_key_pools(&mut tables[i].columns, &key_pools) {
+            eprintln!("エラーが発生しました: {}", e);
+            return;
+        }
+
+        // table_seedは宣言順index(i)を使う。トポロジカル順ではないので、
+        // 単一テーブル(tables.len()==1)のときは常にbase_seedそのものになる
+        let seed = table_seed(base_seed, i);
+        let row_count = tables[i].row_count;
+        resolve_unique_pools(&mut tables[i].columns, row_count, seed);
+        let rows = generate_all_rows(row_count, &tables[i].columns, seed);
+
+        if let Err(e) = collect_key_pools(&tables[i], &rows, &referenced, &mut key_pools) {
+            eprintln!("エラーが発生しました: {}", e);
+            return;
+        }
+
+        rows_by_table[i] = Some(rows);
+    }
+
+    // 依存順(親が先)にGeneratedTableへまとめる(SQL1本出力のINSERT順のため)
+    let generated: Vec<GeneratedTable> = order
+        .iter()
+        .map(|&i| GeneratedTable {
+            name: tables[i].name.as_deref(),
+            columns: &tables[i].columns,
+            rows: rows_by_table[i].as_ref().unwrap(),
+        })
+        .collect();
 
     for format in formats {
-        let path = output_base_path(args.output.as_deref(), format, multiple_formats);
-        let result =
-            write_output(format, &columns, &rows, schema.table_name.as_deref(), &path, args.encoding);
-
-        match result {
-            Ok(()) => println!(
-                "{}行のデータを {} ({}) に書き出しました",
-                schema.row_count, path, args.encoding
-            ),
+        let base_path = output_base_path(args.output.as_deref(), format, multiple_formats);
+        match write_output_multi_table(format, &generated, &base_path, args.encoding) {
+            Ok(written) => {
+                for (path, row_count) in written {
+                    println!("{}行のデータを {} ({}) に書き出しました", row_count, path, args.encoding);
+                }
+            }
             Err(e) => eprintln!("エラーが発生しました: {}", e),
         }
     }
@@ -1082,6 +1710,22 @@ mod tests {
 
     fn schema_from_yaml(yaml: &str) -> Schema {
         serde_yaml::from_str(yaml).expect("テスト用YAMLのパースに失敗した")
+    }
+
+    fn schema_file_from_yaml(yaml: &str) -> Result<SchemaFile, Box<dyn std::error::Error>> {
+        let raw: RawSchemaFile = serde_yaml::from_str(yaml).expect("テスト用YAMLのパースに失敗した");
+        normalize_schema_file(raw)
+    }
+
+    // 複数テーブルschema.yamlから、依存関係解決・repr確定まで済んだPreparedTableを作る
+    // (F4-3のテストで繰り返し使う準備処理をまとめたもの)
+    fn prepared_tables_from_yaml(yaml: &str) -> Result<(Vec<PreparedTable>, Vec<usize>), Box<dyn std::error::Error>> {
+        let file = schema_file_from_yaml(yaml)?;
+        let mut tables = prepare_tables(&file)?;
+        let (deps, _referenced) = resolve_foreign_keys(&mut tables)?;
+        let order = topological_order(&deps, &tables)?;
+        resolve_fk_reprs(&mut tables, &order)?;
+        Ok((tables, order))
     }
 
     #[test]
@@ -1565,5 +2209,274 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- ここから F4-3(テーブル間の外部キー整合性) のテスト ---
+
+    // prepared_tables_from_yamlより先(依存関係解決の前段階)で必要になる、
+    // 実際の値生成まで行うテスト用ヘルパー。main()の複数テーブル生成ループと同じ手順を踏む
+    #[allow(clippy::type_complexity)] // テスト専用ヘルパーの戻り値。分割するほどの複雑さではない
+    fn run_multi_table(
+        yaml: &str,
+        base_seed: u64,
+    ) -> Result<(Vec<PreparedTable>, Vec<usize>, Vec<Vec<Vec<Option<String>>>>), Box<dyn std::error::Error>> {
+        let file = schema_file_from_yaml(yaml)?;
+        let mut tables = prepare_tables(&file)?;
+        let (deps, referenced) = resolve_foreign_keys(&mut tables)?;
+        let order = topological_order(&deps, &tables)?;
+        resolve_fk_reprs(&mut tables, &order)?;
+
+        let mut key_pools: HashMap<ColumnKey, Arc<Vec<String>>> = HashMap::new();
+        let mut rows_by_table: Vec<Vec<Vec<Option<String>>>> = (0..tables.len()).map(|_| Vec::new()).collect();
+
+        for &i in &order {
+            fill_foreign_key_pools(&mut tables[i].columns, &key_pools)?;
+            let seed = table_seed(base_seed, i);
+            let row_count = tables[i].row_count;
+            resolve_unique_pools(&mut tables[i].columns, row_count, seed);
+            let rows = generate_all_rows(row_count, &tables[i].columns, seed);
+            collect_key_pools(&tables[i], &rows, &referenced, &mut key_pools)?;
+            rows_by_table[i] = rows;
+        }
+
+        Ok((tables, order, rows_by_table))
+    }
+
+    #[test]
+    fn legacy_single_table_yaml_is_not_multi_table() {
+        let file = schema_file_from_yaml(
+            "row_count: 3\ncolumns:\n  - name: id\n    type: sequence\n",
+        )
+        .unwrap();
+        assert!(!file.multi_table);
+        assert_eq!(file.tables.len(), 1);
+    }
+
+    #[test]
+    fn tables_format_is_recognized_as_multi_table() {
+        let file = schema_file_from_yaml(
+            "tables:\n  - name: users\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n  - name: orders\n    row_count: 2\n    columns:\n      - name: id\n        type: sequence\n",
+        )
+        .unwrap();
+        assert!(file.multi_table);
+        assert_eq!(file.tables.len(), 2);
+        assert_eq!(file.tables[0].table_name.as_deref(), Some("users"));
+        assert_eq!(file.tables[1].row_count, 2);
+    }
+
+    #[test]
+    fn tables_and_top_level_columns_together_is_an_error() {
+        let result = schema_file_from_yaml(
+            "row_count: 3\ncolumns:\n  - name: id\n    type: sequence\ntables:\n  - name: users\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_tables_list_is_an_error() {
+        assert!(schema_file_from_yaml("tables: []\n").is_err());
+    }
+
+    #[test]
+    fn table_without_name_is_an_error() {
+        let result = schema_file_from_yaml(
+            "tables:\n  - row_count: 3\n    columns:\n      - name: id\n        type: sequence\n",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn duplicate_table_names_is_an_error() {
+        let result = schema_file_from_yaml(
+            "tables:\n  - name: users\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n  - name: users\n    row_count: 2\n    columns:\n      - name: id\n        type: sequence\n",
+        );
+        assert!(result.is_err());
+    }
+
+    const PARENT_CHILD_YAML: &str = "tables:\n  - name: users\n    row_count: 10\n    columns:\n      - name: id\n        type: sequence\n  - name: orders\n    row_count: 30\n    columns:\n      - name: id\n        type: sequence\n      - name: user_id\n        type: foreign_key\n        references: users.id\n";
+
+    #[test]
+    fn foreign_key_values_are_all_members_of_the_parent_generated_values() {
+        let (_tables, order, rows) = run_multi_table(PARENT_CHILD_YAML, 42).unwrap();
+        // ordersはusersより後に生成される(依存関係上)
+        let users_idx = order[0];
+        let orders_idx = order[1];
+        let user_ids: std::collections::HashSet<&str> =
+            rows[users_idx].iter().map(|r| r[0].as_deref().unwrap()).collect();
+        for row in &rows[orders_idx] {
+            let referenced = row[1].as_deref().unwrap();
+            assert!(user_ids.contains(referenced), "{referenced} not found in users.id");
+        }
+    }
+
+    #[test]
+    fn topological_order_puts_parent_before_child_even_when_declared_child_first() {
+        // orders(子)をusers(親)より先に書いても、生成順は親が先になるはず
+        let yaml = "tables:\n  - name: orders\n    row_count: 5\n    columns:\n      - name: id\n        type: sequence\n      - name: user_id\n        type: foreign_key\n        references: users.id\n  - name: users\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n";
+        let (tables, order, _rows) = run_multi_table(yaml, 1).unwrap();
+        let users_pos = order.iter().position(|&i| tables[i].name.as_deref() == Some("users")).unwrap();
+        let orders_pos = order.iter().position(|&i| tables[i].name.as_deref() == Some("orders")).unwrap();
+        assert!(users_pos < orders_pos);
+    }
+
+    #[test]
+    fn self_reference_is_an_error() {
+        let yaml = "tables:\n  - name: orders\n    row_count: 5\n    columns:\n      - name: id\n        type: sequence\n      - name: parent_id\n        type: foreign_key\n        references: orders.id\n";
+        assert!(prepared_tables_from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn cyclic_reference_is_an_error() {
+        let yaml = "tables:\n  - name: a\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n      - name: b_id\n        type: foreign_key\n        references: b.id\n  - name: b\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n      - name: a_id\n        type: foreign_key\n        references: a.id\n";
+        assert!(prepared_tables_from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn reference_to_unknown_table_is_an_error() {
+        let yaml = "tables:\n  - name: orders\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n      - name: user_id\n        type: foreign_key\n        references: users.id\n";
+        assert!(prepared_tables_from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn reference_to_unknown_column_is_an_error() {
+        let yaml = "tables:\n  - name: users\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n  - name: orders\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n      - name: user_id\n        type: foreign_key\n        references: users.nope\n";
+        assert!(prepared_tables_from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn foreign_key_column_rejects_unique() {
+        let yaml = "tables:\n  - name: users\n    row_count: 5\n    columns:\n      - name: id\n        type: sequence\n  - name: orders\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n      - name: user_id\n        type: foreign_key\n        references: users.id\n        unique: true\n";
+        assert!(prepared_tables_from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn referenced_parent_column_with_null_rate_is_an_error() {
+        let yaml = "tables:\n  - name: users\n    row_count: 5\n    columns:\n      - name: id\n        type: sequence\n        null_rate: 0.2\n  - name: orders\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n      - name: user_id\n        type: foreign_key\n        references: users.id\n";
+        assert!(prepared_tables_from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn empty_referenced_parent_table_is_an_error() {
+        let yaml = "tables:\n  - name: users\n    row_count: 0\n    columns:\n      - name: id\n        type: sequence\n  - name: orders\n    row_count: 3\n    columns:\n      - name: id\n        type: sequence\n      - name: user_id\n        type: foreign_key\n        references: users.id\n";
+        assert!(run_multi_table(yaml, 1).is_err());
+    }
+
+    #[test]
+    fn diamond_dependency_generates_successfully_with_valid_references() {
+        // d → b, d → c, b → a, c → a
+        let yaml = "tables:\n  - name: a\n    row_count: 4\n    columns:\n      - name: id\n        type: sequence\n  - name: b\n    row_count: 6\n    columns:\n      - name: id\n        type: sequence\n      - name: a_id\n        type: foreign_key\n        references: a.id\n  - name: c\n    row_count: 5\n    columns:\n      - name: id\n        type: sequence\n      - name: a_id\n        type: foreign_key\n        references: a.id\n  - name: d\n    row_count: 8\n    columns:\n      - name: id\n        type: sequence\n      - name: b_id\n        type: foreign_key\n        references: b.id\n      - name: c_id\n        type: foreign_key\n        references: c.id\n";
+        let (tables, order, rows) = run_multi_table(yaml, 3).unwrap();
+        assert_eq!(order.len(), 4);
+
+        let idx_of = |name: &str| tables.iter().position(|t| t.name.as_deref() == Some(name)).unwrap();
+        let a_ids: std::collections::HashSet<&str> =
+            rows[idx_of("a")].iter().map(|r| r[0].as_deref().unwrap()).collect();
+        for row in &rows[idx_of("b")] {
+            assert!(a_ids.contains(row[1].as_deref().unwrap()));
+        }
+        for row in &rows[idx_of("c")] {
+            assert!(a_ids.contains(row[1].as_deref().unwrap()));
+        }
+    }
+
+    #[test]
+    fn multi_hop_foreign_key_values_are_transitively_contained_and_repr_propagates() {
+        // c.b_id → b.a_id → a.id (aはsequenceなので、cのSQL上の値は無クォートになるはず)
+        let yaml = "tables:\n  - name: a\n    row_count: 5\n    columns:\n      - name: id\n        type: sequence\n  - name: b\n    row_count: 8\n    columns:\n      - name: id\n        type: sequence\n      - name: a_id\n        type: foreign_key\n        references: a.id\n  - name: c\n    row_count: 12\n    columns:\n      - name: id\n        type: sequence\n      - name: b_id\n        type: foreign_key\n        references: b.a_id\n";
+        let (tables, order, rows) = run_multi_table(yaml, 5).unwrap();
+        let idx_of = |name: &str| tables.iter().position(|t| t.name.as_deref() == Some(name)).unwrap();
+
+        let a_ids: std::collections::HashSet<&str> =
+            rows[idx_of("a")].iter().map(|r| r[0].as_deref().unwrap()).collect();
+        let b_a_ids: std::collections::HashSet<&str> =
+            rows[idx_of("b")].iter().map(|r| r[1].as_deref().unwrap()).collect();
+
+        for row in &rows[idx_of("c")] {
+            let v = row[1].as_deref().unwrap();
+            assert!(b_a_ids.contains(v));
+            assert!(a_ids.contains(v));
+        }
+
+        // reprがsequence(Integer)まで伝播していること = SQLでクォートされないこと
+        let c_col = tables[idx_of("c")].columns.iter().find(|col| col.name == "b_id").unwrap();
+        assert!(!is_text_column(&c_col.kind));
+
+        let _ = order;
+    }
+
+    #[test]
+    fn build_sql_multi_emits_parent_insert_before_child_insert() {
+        let (tables, order, rows) = run_multi_table(PARENT_CHILD_YAML, 9).unwrap();
+        let generated: Vec<GeneratedTable> = order
+            .iter()
+            .map(|&i| GeneratedTable { name: tables[i].name.as_deref(), columns: &tables[i].columns, rows: &rows[i] })
+            .collect();
+        let sql = build_sql_multi(&generated).unwrap();
+        let users_pos = sql.find("INSERT INTO \"users\"").unwrap();
+        let orders_pos = sql.find("INSERT INTO \"orders\"").unwrap();
+        assert!(users_pos < orders_pos);
+    }
+
+    #[test]
+    fn write_xlsx_tables_creates_one_sheet_per_table() {
+        let (tables, order, rows) = run_multi_table(PARENT_CHILD_YAML, 11).unwrap();
+        let generated: Vec<GeneratedTable> = order
+            .iter()
+            .map(|&i| GeneratedTable { name: tables[i].name.as_deref(), columns: &tables[i].columns, rows: &rows[i] })
+            .collect();
+
+        let path = std::env::temp_dir().join("dummy_data_gen_test_multi.xlsx");
+        let path_str = path.to_str().unwrap();
+        write_xlsx_tables(&generated, path_str, true).unwrap();
+
+        use calamine::Reader;
+        let workbook: calamine::Xlsx<_> = calamine::open_workbook(path_str).unwrap();
+        assert_eq!(workbook.sheet_names(), vec!["users".to_string(), "orders".to_string()]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn same_seed_produces_identical_multi_table_output() {
+        let (_t1, o1, r1) = run_multi_table(PARENT_CHILD_YAML, 123).unwrap();
+        let (_t2, o2, r2) = run_multi_table(PARENT_CHILD_YAML, 123).unwrap();
+        assert_eq!(o1, o2);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn tables_with_identical_columns_produce_different_data() {
+        let yaml = "tables:\n  - name: t1\n    row_count: 10\n    columns:\n      - name: v\n        type: integer\n        min: 0\n        max: 1000000\n  - name: t2\n    row_count: 10\n    columns:\n      - name: v\n        type: integer\n        min: 0\n        max: 1000000\n";
+        let (_tables, _order, rows) = run_multi_table(yaml, 77).unwrap();
+        assert_ne!(rows[0], rows[1]);
+    }
+
+    #[test]
+    fn table_seed_zero_index_matches_base_seed_exactly() {
+        assert_eq!(table_seed(12345, 0), 12345);
+    }
+
+    #[test]
+    fn table_file_path_inserts_table_name_before_extension() {
+        assert_eq!(table_file_path("output.csv", "users"), "output_users.csv");
+        assert_eq!(table_file_path("result.csv", "orders"), "result_orders.csv");
+    }
+
+    #[test]
+    fn sanitize_file_component_replaces_unsafe_characters() {
+        assert_eq!(sanitize_file_component("a/b:c"), "a_b_c");
+        assert_eq!(sanitize_file_component("normal_name"), "normal_name");
+    }
+
+    #[test]
+    fn write_output_multi_table_detects_filename_collision() {
+        let (tables, order, rows) = run_multi_table(PARENT_CHILD_YAML, 13).unwrap();
+        // 2つとも同じテーブル名(sanitize後に衝突)になるように、あえて同名のGeneratedTableを作る
+        let generated: Vec<GeneratedTable> = order
+            .iter()
+            .map(|&i| GeneratedTable { name: Some("dup"), columns: &tables[i].columns, rows: &rows[i] })
+            .collect();
+        let result = write_output_multi_table(Format::Csv, &generated, "output.csv", Encoding::Utf8);
+        assert!(result.is_err());
     }
 }
