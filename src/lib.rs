@@ -4,7 +4,7 @@ use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -44,11 +44,13 @@ impl std::fmt::Display for Format {
 // row_count/columnsを直接書く形式)でも、複数テーブル形式(tables:の各要素)でも、
 // どちらも同じこの型として読み込む。tables:形式では要素のキーが"name"なので、
 // aliasでtable_nameとしても受け取れるようにしている。
-#[derive(Deserialize)]
+// Serializeも付けているのは、GUI(dummygen_jp_gui)の「列設定をYAMLとして書き出す」機能
+// (schema_file_to_yaml)のため。読み込み(Deserialize)は元々のload_schema用
+#[derive(Deserialize, Serialize)]
 pub struct Schema {
     pub row_count: u32,
     // SQL出力(--format sql)のときや、tables:形式でのテーブル名として使う
-    #[serde(default, alias = "name")]
+    #[serde(default, alias = "name", skip_serializing_if = "Option::is_none")]
     pub table_name: Option<String>,
     pub columns: Vec<ColumnDef>,
 }
@@ -120,14 +122,14 @@ fn normalize_schema_file(raw: RawSchemaFile) -> Result<SchemaFile, Box<dyn std::
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct ColumnDef {
     pub name: String,
     // 0.0〜1.0の確率でNULL(空)を混ぜる。省略時はNULLを混ぜない(0.0)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub null_rate: Option<f64>,
     // trueにすると、この列の値が行間で重複しないようにする。省略時はfalse
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique: Option<bool>,
     // flattenにより、typeやmin/maxなどの追加情報を「nameと同じ階層」から直接読み取れる
     #[serde(flatten)]
@@ -136,15 +138,26 @@ pub struct ColumnDef {
 
 // tag = "type" にすると、YAML上の "type:" の値でどのバリアント(列タイプ)かを判定し、
 // min/maxなどの残りのフィールドをそのバリアントの中身として読み取ってくれる
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ColumnType {
     Sequence,
-    NameJa,
+    NameJa {
+        // trueのとき姓と名の間にスペースを入れる(例: "山田 太郎")。
+        // 省略時はfalse(既存のschema.yamlとの後方互換のため、今まで通り"山田太郎")
+        #[serde(default)]
+        with_space: bool,
+    },
     // 姓・名をそれぞれ単独で生成する列タイプ(name_jaはフルネーム一体型なので、
     // 姓だけ・名だけが欲しい場合に使う。katakana_nameのような列間の対応付けはしない)
     LastNameJa,
     FirstNameJa,
+    // name_jaのローマ字(ヘボン式)版。直前のname_ja列を参照する挙動はkatakana_nameと同じ
+    RomajiName,
+    // katakana_nameとは異なり、last_name_ja/first_name_jaと同様に列間の対応付けをしない
+    // 独立ランダムなフリガナ(姓・名それぞれ単独)
+    KatakanaLastName,
+    KatakanaFirstName,
     Email {
         // 省略時は"example.com"(既存のschema.yamlとの後方互換のため)
         #[serde(default = "default_email_domain")]
@@ -186,8 +199,30 @@ pub enum ColumnType {
     KatakanaName,
     // katakana_nameの半角カタカナ版。直前のname_ja列を参照する挙動は同じ
     KatakanaNameHankaku,
+    DepartmentJa,
+    JobTitleJa,
+    // IPv4のみ対応(IPv6は現状スコープ外)
+    IpAddress,
+    // 本物の署名検証はできない「それっぽい形」のダミー値(ヘッダー部分は固定文字列)
+    Jwt,
+    ApiKey,
+    // 16桁、Luhnアルゴリズムで検査数字(末尾1桁)を計算する
+    CreditCardNumber,
+    // "MM/YY"形式(今日から1〜5年後のランダムな年月)
+    CreditCardExpiry,
+    // 日本の普通預金口座番号を想定した7桁のゼロ埋め数字
+    BankAccountNumber,
+    // "SKU-"+英大文字/数字8文字
+    ProductSku,
+    // 12桁、個人番号法で定められた重み付け剰余演算で検査数字(末尾1桁)を計算する
+    MyNumber,
     Enum {
         choices: Vec<String>,
+        // choicesと同じ個数だけ指定すると、出現確率に偏りをつけられる(例: [7.0, 2.0, 1.0])。
+        // 値そのものの大小に意味はなく、他の要素との比率だけが結果を左右する。
+        // 省略時(None)は今まで通り均等な確率(既存のschema.yamlとの後方互換のため)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        weights: Option<Vec<f64>>,
     },
     // どの行でも常に同じ文字列を返す列
     Fixed {
@@ -209,12 +244,13 @@ fn default_email_domain() -> String {
 
 // date/birth_date列の日付表示形式。Iso8601とYmdは日付のみの表記では見た目が同じ(YYYY-MM-DD)
 // だが、利用者が明示的に選べるよう別の選択肢として用意してある
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Deserialize, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum DateFormat {
     Ymd,
     Iso8601,
     Slash,
+    Wareki,
 }
 
 fn default_date_format() -> DateFormat {
@@ -225,7 +261,33 @@ fn format_date(date: chrono::NaiveDate, format: DateFormat) -> String {
     match format {
         DateFormat::Ymd | DateFormat::Iso8601 => date.format("%Y-%m-%d").to_string(),
         DateFormat::Slash => date.format("%Y/%m/%d").to_string(),
+        DateFormat::Wareki => format_wareki(date),
     }
+}
+
+// 元号の開始日(グレゴリオ暦)。新しい元号から順に並べておき、date以上で最も新しい
+// 開始日を持つ元号を採用する。明治より前の日付は明治として扱う(ダミーデータの
+// 日付範囲は通常これで十分なため、birth_dateの365日/年近似と同様の意図的な単純化)
+const ERAS: &[(&str, i32, u32, u32)] = &[
+    ("令和", 2019, 5, 1),
+    ("平成", 1989, 1, 8),
+    ("昭和", 1926, 12, 25),
+    ("大正", 1912, 7, 30),
+    ("明治", 1868, 1, 25),
+];
+
+fn format_wareki(date: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let (era_name, era_start_year) = ERAS
+        .iter()
+        .find_map(|(name, y, m, d)| {
+            let start = chrono::NaiveDate::from_ymd_opt(*y, *m, *d).expect("ERAS内の日付は常に有効");
+            (date >= start).then_some((*name, *y))
+        })
+        .unwrap_or((ERAS.last().expect("ERASは空でない").0, ERAS.last().expect("ERASは空でない").1));
+    let year_in_era = date.year() - era_start_year + 1;
+    let year_label = if year_in_era == 1 { "元年".to_string() } else { format!("{year_in_era}年") };
+    format!("{}{}{}月{}日", era_name, year_label, date.month(), date.day())
 }
 
 pub fn load_schema(path: &str) -> Result<SchemaFile, Box<dyn std::error::Error>> {
@@ -233,6 +295,24 @@ pub fn load_schema(path: &str) -> Result<SchemaFile, Box<dyn std::error::Error>>
         .map_err(|e| format!("スキーマファイル({})の読み込みに失敗しました: {}", path, e))?;
     let raw: RawSchemaFile = serde_yaml::from_str(&text)?;
     normalize_schema_file(raw)
+}
+
+// tables:形式でYAMLに書き出すときだけ使う、tablesキー1つだけの小さな箱
+#[derive(Serialize)]
+struct TablesOnly<'a> {
+    tables: &'a [Schema],
+}
+
+// SchemaFileをschema.yamlと同じ見た目のYAML文字列にする(load_schemaの逆方向)。
+// GUI(dummygen_jp_gui)の「列設定をYAMLとして保存」機能で使う。
+// テーブルが1個だけなら、そのテーブルをトップレベルに直接書く単一テーブル形式
+// (手書きのschema.yamlと同じ見た目)にする。2個以上ならtables:形式にする
+pub fn schema_file_to_yaml(file: &SchemaFile) -> Result<String, Box<dyn std::error::Error>> {
+    if file.tables.len() == 1 {
+        Ok(serde_yaml::to_string(&file.tables[0])?)
+    } else {
+        Ok(serde_yaml::to_string(&TablesOnly { tables: &file.tables })?)
+    }
 }
 
 // YAMLから読んだそのままの定義(ColumnType)を、実際に値を作るときに必要な形に変換したもの。
@@ -251,9 +331,12 @@ pub struct PreparedColumn {
 
 pub enum PreparedColumnType {
     Sequence,
-    NameJa,
+    NameJa { with_space: bool },
     LastNameJa,
     FirstNameJa,
+    RomajiName,
+    KatakanaLastName,
+    KatakanaFirstName,
     Email { domain: String },
     Integer { min: i64, max: i64 },
     Float { min: f64, max: f64, decimals: u32 },
@@ -270,7 +353,17 @@ pub enum PreparedColumnType {
     CityJa,
     KatakanaName,
     KatakanaNameHankaku,
-    Enum { choices: Vec<String> },
+    DepartmentJa,
+    JobTitleJa,
+    IpAddress,
+    Jwt,
+    ApiKey,
+    CreditCardNumber,
+    CreditCardExpiry,
+    BankAccountNumber,
+    ProductSku,
+    MyNumber,
+    Enum { choices: Vec<String>, weights: Option<Vec<f64>> },
     Fixed { value: String },
     ForeignKey {
         ref_table: String,
@@ -345,9 +438,12 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
         .map(|c| {
             let kind = match &c.column_type {
                 ColumnType::Sequence => PreparedColumnType::Sequence,
-                ColumnType::NameJa => PreparedColumnType::NameJa,
+                ColumnType::NameJa { with_space } => PreparedColumnType::NameJa { with_space: *with_space },
                 ColumnType::LastNameJa => PreparedColumnType::LastNameJa,
                 ColumnType::FirstNameJa => PreparedColumnType::FirstNameJa,
+                ColumnType::RomajiName => PreparedColumnType::RomajiName,
+                ColumnType::KatakanaLastName => PreparedColumnType::KatakanaLastName,
+                ColumnType::KatakanaFirstName => PreparedColumnType::KatakanaFirstName,
                 ColumnType::Email { domain } => PreparedColumnType::Email { domain: domain.clone() },
                 ColumnType::Integer { min, max } => {
                     if min > max {
@@ -416,11 +512,38 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 ColumnType::CityJa => PreparedColumnType::CityJa,
                 ColumnType::KatakanaName => PreparedColumnType::KatakanaName,
                 ColumnType::KatakanaNameHankaku => PreparedColumnType::KatakanaNameHankaku,
-                ColumnType::Enum { choices } => {
+                ColumnType::DepartmentJa => PreparedColumnType::DepartmentJa,
+                ColumnType::JobTitleJa => PreparedColumnType::JobTitleJa,
+                ColumnType::IpAddress => PreparedColumnType::IpAddress,
+                ColumnType::Jwt => PreparedColumnType::Jwt,
+                ColumnType::ApiKey => PreparedColumnType::ApiKey,
+                ColumnType::CreditCardNumber => PreparedColumnType::CreditCardNumber,
+                ColumnType::CreditCardExpiry => PreparedColumnType::CreditCardExpiry,
+                ColumnType::BankAccountNumber => PreparedColumnType::BankAccountNumber,
+                ColumnType::ProductSku => PreparedColumnType::ProductSku,
+                ColumnType::MyNumber => PreparedColumnType::MyNumber,
+                ColumnType::Enum { choices, weights } => {
                     if choices.is_empty() {
                         return Err(format!("列 \"{}\": choices には1つ以上の選択肢が必要です", c.name).into());
                     }
-                    PreparedColumnType::Enum { choices: choices.clone() }
+                    if let Some(w) = weights {
+                        if w.len() != choices.len() {
+                            return Err(format!(
+                                "列 \"{}\": weights の個数({})は choices の個数({})と同じにしてください",
+                                c.name,
+                                w.len(),
+                                choices.len()
+                            )
+                            .into());
+                        }
+                        if w.iter().any(|&v| v < 0.0) {
+                            return Err(format!("列 \"{}\": weights に負の数は指定できません", c.name).into());
+                        }
+                        if w.iter().sum::<f64>() <= 0.0 {
+                            return Err(format!("列 \"{}\": weights の合計は0より大きくしてください", c.name).into());
+                        }
+                    }
+                    PreparedColumnType::Enum { choices: choices.clone(), weights: weights.clone() }
                 }
                 ColumnType::Fixed { value } => PreparedColumnType::Fixed { value: value.clone() },
                 ColumnType::ForeignKey { references } => {
@@ -455,28 +578,30 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                     .into());
                 }
                 match unique_capacity(&kind) {
-                    None => {
+                    UniqueCapacity::Unsupported => {
                         return Err(format!(
-                            "列 \"{}\": このtypeはuniqueに対応していません(enum/boolean/integer/dateのみ対応)",
+                            "列 \"{}\": このtypeはuniqueに対応していません(enum/boolean/integer/date/name_ja/last_name_ja/first_name_ja/phone_ja/phone_ja_landlineのみ対応)",
                             c.name
                         )
                         .into());
                     }
-                    Some(capacity) if capacity > UNIQUE_CAPACITY_CAP => {
+                    UniqueCapacity::Enumerable(capacity) if capacity > UNIQUE_CAPACITY_CAP => {
                         return Err(format!(
                             "列 \"{}\": unique: 値の組み合わせが{}通りあり、上限({}通り)を超えています。範囲や選択肢を絞ってください",
                             c.name, capacity, UNIQUE_CAPACITY_CAP
                         )
                         .into());
                     }
-                    Some(capacity) if capacity < schema.row_count as u128 => {
+                    UniqueCapacity::Enumerable(capacity) | UniqueCapacity::Retry(capacity)
+                        if capacity < schema.row_count as u128 =>
+                    {
                         return Err(format!(
                             "列 \"{}\": unique: 値の組み合わせが{}通りしかなく、row_count({})分のユニークな値を用意できません",
                             c.name, capacity, schema.row_count
                         )
                         .into());
                     }
-                    Some(_) => {}
+                    UniqueCapacity::Enumerable(_) | UniqueCapacity::Retry(_) => {}
                 }
             }
 
@@ -523,48 +648,95 @@ fn misplaced_city_ja_warnings(columns: &[PreparedColumn]) -> Vec<String> {
 // katakana_name列も、city_ja列と同様に「自分より前にあるname_ja列」しか見ない設計。
 // name_ja列は定義してあるのにkatakana_nameより後ろにある場合、氏名とフリガナが
 // 対応しないまま黙って無関係な値が選ばれてしまうため、警告文を作る。
+// katakana_name/katakana_name_hankaku/romaji_nameはいずれも「自分より前にあるname_ja列」
+// しか参照しない設計なので、3つまとめて同じ警告ロジックで扱う
 fn misplaced_katakana_name_warnings(columns: &[PreparedColumn]) -> Vec<String> {
+    fn type_label(kind: &PreparedColumnType) -> &'static str {
+        match kind {
+            PreparedColumnType::KatakanaName => "katakana_name",
+            PreparedColumnType::KatakanaNameHankaku => "katakana_name_hankaku",
+            PreparedColumnType::RomajiName => "romaji_name",
+            _ => unreachable!("直前のfilterでこの3型に絞り込み済み"),
+        }
+    }
+
     columns
         .iter()
         .enumerate()
         .filter(|(_, c)| {
-            matches!(c.kind, PreparedColumnType::KatakanaName | PreparedColumnType::KatakanaNameHankaku)
+            matches!(
+                c.kind,
+                PreparedColumnType::KatakanaName
+                    | PreparedColumnType::KatakanaNameHankaku
+                    | PreparedColumnType::RomajiName
+            )
         })
         .filter(|(kana_idx, _)| {
             let has_preceding_name =
-                columns[..*kana_idx].iter().any(|c| matches!(c.kind, PreparedColumnType::NameJa));
+                columns[..*kana_idx].iter().any(|c| matches!(c.kind, PreparedColumnType::NameJa { .. }));
             let has_following_name =
-                columns[*kana_idx + 1..].iter().any(|c| matches!(c.kind, PreparedColumnType::NameJa));
+                columns[*kana_idx + 1..].iter().any(|c| matches!(c.kind, PreparedColumnType::NameJa { .. }));
             !has_preceding_name && has_following_name
         })
         .map(|(_, kana_col)| {
+            let label = type_label(&kana_col.kind);
             format!(
-                "警告: 列 \"{}\"(katakana_name)より後ろに name_ja 列があります。katakana_nameは自分より前のname_ja列しか参照しないため、氏名とフリガナが対応しません。name_ja列をkatakana_name列より前に移動してください。",
+                "警告: 列 \"{}\"({label})より後ろに name_ja 列があります。{label}は自分より前のname_ja列しか参照しないため、氏名とフリガナ/ローマ字が対応しません。name_ja列を{label}列より前に移動してください。",
                 kana_col.name
             )
         })
         .collect()
 }
 
+// unique制約への対応方法。組み合わせ数が少ない型は全部列挙してシャッフルする方式(Enumerable)、
+// 組み合わせ数が膨大(だが行数よりは十分多い)型は、値を作っては重複チェックし被ったら
+// 作り直す方式(Retry)で対応する。どちらにも当てはまらない型はUnsupported
+enum UniqueCapacity {
+    Enumerable(u128),
+    Retry(u128),
+    Unsupported,
+}
+
 // unique制約を付けられる列タイプが取りうる値の組み合わせ数。
-// 全部の組み合わせをメモリ上に列挙してシャッフルする方式を取るため、これが分かる型だけに対応する。
-// postal_code/phone_ja/address_ja/floatは組み合わせが多すぎる、または不連続で数えにくいため非対応
+// postal_code/address_ja/floatは組み合わせが不連続・計算しづらいため非対応のまま
 // (これらの値の重複を避けたい場合は、より小さい組み合わせ数のenum/integerで代用することを想定している)。
-fn unique_capacity(kind: &PreparedColumnType) -> Option<u128> {
+fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
     match kind {
-        PreparedColumnType::Boolean => Some(2),
-        PreparedColumnType::Integer { min, max } => Some((*max as i128 - *min as i128 + 1) as u128),
-        PreparedColumnType::Date { span_days, .. } => Some(*span_days as u128 + 1),
-        PreparedColumnType::Enum { choices } => Some(choices.len() as u128),
-        _ => None,
+        PreparedColumnType::Boolean => UniqueCapacity::Enumerable(2),
+        PreparedColumnType::Integer { min, max } => {
+            UniqueCapacity::Enumerable((*max as i128 - *min as i128 + 1) as u128)
+        }
+        PreparedColumnType::Date { span_days, .. } => UniqueCapacity::Enumerable(*span_days as u128 + 1),
+        // unique:trueのときは(重み付けの有無にかかわらず)全選択肢を重複なく列挙するので、
+        // weightsは意味を持たない(README/CLAUDE.mdに明記。エラーにはせず単に無視する)
+        PreparedColumnType::Enum { choices, .. } => UniqueCapacity::Enumerable(choices.len() as u128),
+        PreparedColumnType::NameJa { .. } => {
+            UniqueCapacity::Enumerable((LAST_NAMES.len() * FIRST_NAMES.len()) as u128)
+        }
+        PreparedColumnType::LastNameJa => UniqueCapacity::Enumerable(LAST_NAMES.len() as u128),
+        PreparedColumnType::FirstNameJa => UniqueCapacity::Enumerable(FIRST_NAMES.len() as u128),
+        PreparedColumnType::RomajiName => {
+            UniqueCapacity::Enumerable((LAST_NAMES_ROMAJI.len() * FIRST_NAMES_ROMAJI.len()) as u128)
+        }
+        PreparedColumnType::KatakanaLastName => UniqueCapacity::Enumerable(LAST_NAMES_KANA.len() as u128),
+        PreparedColumnType::KatakanaFirstName => UniqueCapacity::Enumerable(FIRST_NAMES_KANA.len() as u128),
+        // 携帯電話・固定電話は組み合わせ数(市外局番の数 × 10^8)が膨大でEnumerable方式では
+        // 列挙しきれないが、実務で指定されるrow_count(最大100万)に対しては十分すぎるほど
+        // 大きいため、Retry方式(値を作って重複チェック)で対応する
+        PreparedColumnType::PhoneJa => UniqueCapacity::Retry(PHONE_PREFIXES.len() as u128 * 100_000_000),
+        PreparedColumnType::PhoneJaLandline => {
+            UniqueCapacity::Retry(PHONE_PREFIXES_LANDLINE.len() as u128 * 100_000_000)
+        }
+        _ => UniqueCapacity::Unsupported,
     }
 }
 
-// unique_capacityがこれを超える場合はエラーにする。組み合わせ全部をVecに列挙するので、
-// メモリを使いすぎない(や、あまりに時間がかかりすぎない)ようにするための安全弁
+// UniqueCapacity::Enumerableがこれを超える場合はエラーにする。組み合わせ全部をVecに
+// 列挙するので、メモリを使いすぎない(や、あまりに時間がかかりすぎない)ようにするための安全弁。
+// Retry方式は組み合わせを列挙しないため、この上限の対象外
 const UNIQUE_CAPACITY_CAP: u128 = 2_000_000;
 
-// unique_capacityで数えた組み合わせを、実際の文字列としてすべて列挙する
+// UniqueCapacity::Enumerableで数えた組み合わせを、実際の文字列としてすべて列挙する
 fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
     match kind {
         PreparedColumnType::Boolean => vec!["true".to_string(), "false".to_string()],
@@ -578,14 +750,63 @@ fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
                 )
             })
             .collect(),
-        PreparedColumnType::Enum { choices } => choices.clone(),
-        _ => unreachable!("unique_capacityがNoneを返す型はここに来ない(prepare_columnsで弾いている)"),
+        PreparedColumnType::Enum { choices, .. } => choices.clone(),
+        PreparedColumnType::NameJa { with_space } => (0..LAST_NAMES.len())
+            .flat_map(|last_idx| {
+                (0..FIRST_NAMES.len()).map(move |first_idx| format_name(last_idx, first_idx, *with_space))
+            })
+            .collect(),
+        PreparedColumnType::LastNameJa => LAST_NAMES.iter().map(|s| s.to_string()).collect(),
+        PreparedColumnType::FirstNameJa => FIRST_NAMES.iter().map(|s| s.to_string()).collect(),
+        PreparedColumnType::RomajiName => (0..LAST_NAMES_ROMAJI.len())
+            .flat_map(|last_idx| {
+                (0..FIRST_NAMES_ROMAJI.len())
+                    .map(move |first_idx| format!("{} {}", LAST_NAMES_ROMAJI[last_idx], FIRST_NAMES_ROMAJI[first_idx]))
+            })
+            .collect(),
+        PreparedColumnType::KatakanaLastName => LAST_NAMES_KANA.iter().map(|s| s.to_string()).collect(),
+        PreparedColumnType::KatakanaFirstName => FIRST_NAMES_KANA.iter().map(|s| s.to_string()).collect(),
+        _ => unreachable!("UniqueCapacity::Enumerable以外の型はここに来ない(prepare_columnsで弾いている)"),
     }
 }
 
-// 列の全候補値をシャッフルして先頭row_count個を取る=「行数分の重複しない値」の完成。
+// enumerate方式が使えない(組み合わせ数が膨大な)型向け。値を作っては既出かどうかを
+// HashSetでチェックし、被っていたら作り直す方式でrow_count件のユニークな値を集める。
+// prepare_columnsで「組み合わせ数 >= row_count」を事前に検証済みであり、かつ対象型は
+// 組み合わせ数がrow_count(最大100万)よりずっと多いため、衝突は実務上まれで高速に集まる。
+// 試行回数の上限は「実装のバグ等で無限ループにならない」ための安全弁であり、
+// 事前検証を正しく通過している限り実際に到達することはない
+fn build_unique_pool_by_retry(kind: &PreparedColumnType, row_count: u32, base_seed: u64, column_salt: u64) -> Vec<String> {
+    let mut rng = SmallRng::seed_from_u64(base_seed.wrapping_add(column_salt));
+    let mut seen = std::collections::HashSet::with_capacity(row_count as usize);
+    let mut values = Vec::with_capacity(row_count as usize);
+    let max_attempts = (row_count as u64).saturating_mul(1000).max(100_000);
+
+    for _ in 0..max_attempts {
+        if values.len() == row_count as usize {
+            break;
+        }
+        let candidate = generate_value(kind, 0, &mut rng);
+        if seen.insert(candidate.clone()) {
+            values.push(candidate);
+        }
+    }
+
+    assert_eq!(
+        values.len(),
+        row_count as usize,
+        "unique値の収集に失敗しました(組み合わせ数の事前検証をすり抜けた可能性があります)"
+    );
+    values
+}
+
+// 列の全候補値をシャッフルして先頭row_count個を取る=「行数分の重複しない値」の完成
+// (Enumerable方式)。Retry方式の型はbuild_unique_pool_by_retryに委譲する。
 // column_saltは、同じschema内に複数のunique列があるときに、それぞれ違う乱数列になるようにするための値
 fn build_unique_pool(kind: &PreparedColumnType, row_count: u32, base_seed: u64, column_salt: u64) -> Vec<String> {
+    if matches!(unique_capacity(kind), UniqueCapacity::Retry(_)) {
+        return build_unique_pool_by_retry(kind, row_count, base_seed, column_salt);
+    }
     let mut values = enumerate_values(kind);
     let mut rng = SmallRng::seed_from_u64(base_seed.wrapping_add(column_salt));
     values.shuffle(&mut rng);
@@ -845,6 +1066,41 @@ pub fn fill_foreign_key_pools(
     Ok(())
 }
 
+// 複数テーブルをトポロジカル順(親→子)に1テーブルずつ生成する。
+// main.rs(CLI)とdummygen_jp_guiのTauriコマンドの両方から呼べるよう、
+// 元々main.rs内にだけ書かれていたループをここに切り出したもの(ロジックは変更していない)。
+// on_table_startは「今どのテーブルを生成中か」を呼び出し側に知らせるコールバック
+// (CLIはeprintln!、GUIはTauriの進捗イベントを想定)。
+pub fn generate_multi_table_rows(
+    tables: &mut [PreparedTable],
+    order: &[usize],
+    referenced: &HashMap<ColumnKey, String>,
+    base_seed: u64,
+    mut on_table_start: impl FnMut(usize, &PreparedTable),
+) -> Result<Vec<Option<Vec<Vec<Option<String>>>>>, Box<dyn std::error::Error>> {
+    let mut key_pools: HashMap<ColumnKey, Arc<Vec<String>>> = HashMap::new();
+    let mut rows_by_table: Vec<Option<Vec<Vec<Option<String>>>>> = (0..tables.len()).map(|_| None).collect();
+
+    for &i in order {
+        on_table_start(i, &tables[i]);
+
+        fill_foreign_key_pools(&mut tables[i].columns, &key_pools)?;
+
+        // table_seedは宣言順index(i)を使う。トポロジカル順ではないので、
+        // 単一テーブル(tables.len()==1)のときは常にbase_seedそのものになる
+        let seed = table_seed(base_seed, i);
+        let row_count = tables[i].row_count;
+        resolve_unique_pools(&mut tables[i].columns, row_count, seed);
+        let rows = generate_all_rows(row_count, &tables[i].columns, seed);
+
+        collect_key_pools(&tables[i], &rows, referenced, &mut key_pools)?;
+
+        rows_by_table[i] = Some(rows);
+    }
+
+    Ok(rows_by_table)
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Encoding {
     #[value(name = "utf8")]
@@ -884,10 +1140,32 @@ const FIRST_NAMES_KANA: &[&str] = &[
     "ショウタ", "ヒナ", "ダイキ", "ミサキ", "ケンタ", "ハナコ", "タロウ", "ジロウ", "ナオキ", "ユミ", "ケイコ",
     "マコト", "アケミ", "タクヤ", "トモコ", "ダイスケ", "ユウコ", "オサム", "マイ", "ケンイチ",
 ];
+// LAST_NAMES/FIRST_NAMESと添字が1対1で対応するローマ字表記(ヘボン式)。
+// カタカナ→ローマ字の自動変換は促音・拗音・長音の扱いが複雑になるため、
+// LAST_NAMES_KANA/FIRST_NAMES_KANAと同様に手書きの対応表にしてある
+const LAST_NAMES_ROMAJI: &[&str] = &[
+    "Sato", "Suzuki", "Takahashi", "Tanaka", "Ito", "Watanabe", "Yamamoto", "Nakamura", "Kobayashi", "Kato",
+    "Yoshida", "Yamada", "Yamaguchi", "Matsumoto", "Inoue", "Kimura", "Hayashi", "Saito", "Shimizu", "Yamazaki",
+    "Mori", "Abe", "Ikeda", "Hashimoto", "Ishikawa", "Maeda", "Fujita", "Goto", "Okada", "Murakami",
+];
+const FIRST_NAMES_ROMAJI: &[&str] = &[
+    "Shota", "Hina", "Daiki", "Misaki", "Kenta", "Hanako", "Taro", "Jiro", "Naoki", "Yumi", "Keiko",
+    "Makoto", "Akemi", "Takuya", "Tomoko", "Daisuke", "Yuko", "Osamu", "Mai", "Kenichi",
+];
 const PHONE_PREFIXES: &[&str] = &["090", "080", "070"];
 // 固定電話番号(phone_ja_landline)用の市外局番。携帯電話番号(PHONE_PREFIXES)とは別に持つ
 const PHONE_PREFIXES_LANDLINE: &[&str] = &["03", "06", "052", "011", "092"];
 const COMPANY_SUFFIXES: &[&str] = &["商事", "商会", "工業", "産業", "建設", "システム", "フーズ", "物流"];
+
+// department_ja/job_title_ja用の辞書。日本企業で一般的な部署名・役職名から選んだもの
+const DEPARTMENTS: &[&str] = &[
+    "営業部", "総務部", "人事部", "経理部", "財務部", "企画部", "広報部", "法務部", "情報システム部", "開発部",
+    "製造部", "品質管理部", "購買部", "物流部", "マーケティング部", "カスタマーサポート部", "研究開発部", "監査部",
+];
+const JOB_TITLES: &[&str] = &[
+    "代表取締役", "取締役", "執行役員", "本部長", "部長", "次長", "課長", "課長代理", "係長", "主任", "主査",
+    "マネージャー", "リーダー", "一般社員", "契約社員", "派遣社員", "顧問",
+];
 
 // 全角カタカナ→半角カタカナの対応表。濁点・半濁点付きの文字は半角では
 // 基本字+濁点/半濁点の2文字になる。五十音+濁音+半濁音+拗音+長音など、
@@ -940,13 +1218,14 @@ fn random_name_indices(rng: &mut impl Rng) -> (usize, usize) {
     (rng.gen_range(0..LAST_NAMES.len()), rng.gen_range(0..FIRST_NAMES.len()))
 }
 
-fn format_name(last_idx: usize, first_idx: usize) -> String {
-    format!("{}{}", LAST_NAMES[last_idx], FIRST_NAMES[first_idx])
+fn format_name(last_idx: usize, first_idx: usize, with_space: bool) -> String {
+    let separator = if with_space { " " } else { "" };
+    format!("{}{}{}", LAST_NAMES[last_idx], separator, FIRST_NAMES[first_idx])
 }
 
-fn random_name(rng: &mut impl Rng) -> String {
+fn random_name(rng: &mut impl Rng, with_space: bool) -> String {
     let (last_idx, first_idx) = random_name_indices(rng);
-    format_name(last_idx, first_idx)
+    format_name(last_idx, first_idx, with_space)
 }
 
 // context(前の列のname_ja)がSomeなら、その氏名と同じ添字のカタカナ読みを返す。
@@ -954,6 +1233,13 @@ fn random_name(rng: &mut impl Rng) -> String {
 fn random_katakana_name(rng: &mut impl Rng, context: Option<(usize, usize)>) -> String {
     let (last_idx, first_idx) = context.unwrap_or_else(|| random_name_indices(rng));
     format!("{}{}", LAST_NAMES_KANA[last_idx], FIRST_NAMES_KANA[first_idx])
+}
+
+// random_katakana_nameと同じ考え方で、直前のname_ja列と同じ氏名のローマ字表記を返す。
+// 「姓 名」の順(ヘボン式、例: "Yamada Taro")で、姓と名の間は常にスペースで区切る
+fn random_romaji_name(rng: &mut impl Rng, context: Option<(usize, usize)>) -> String {
+    let (last_idx, first_idx) = context.unwrap_or_else(|| random_name_indices(rng));
+    format!("{} {}", LAST_NAMES_ROMAJI[last_idx], FIRST_NAMES_ROMAJI[first_idx])
 }
 
 // 全角カタカナの文字列を半角カタカナに変換する。KATAKANA_FULL_TO_HALFに無い文字は
@@ -977,6 +1263,15 @@ fn random_last_name(rng: &mut impl Rng) -> String {
 
 fn random_first_name(rng: &mut impl Rng) -> String {
     FIRST_NAMES[rng.gen_range(0..FIRST_NAMES.len())].to_string()
+}
+
+// last_name_ja/first_name_jaと同じく、他の列とは対応付けない独立ランダム
+fn random_katakana_last_name(rng: &mut impl Rng) -> String {
+    LAST_NAMES_KANA[rng.gen_range(0..LAST_NAMES_KANA.len())].to_string()
+}
+
+fn random_katakana_first_name(rng: &mut impl Rng) -> String {
+    FIRST_NAMES_KANA[rng.gen_range(0..FIRST_NAMES_KANA.len())].to_string()
 }
 
 fn random_email(id: u32, domain: &str) -> String {
@@ -1035,6 +1330,131 @@ fn random_uuid(rng: &mut impl Rng) -> String {
     uuid::Builder::from_random_bytes(bytes).into_uuid().to_string()
 }
 
+fn random_department(rng: &mut impl Rng) -> String {
+    DEPARTMENTS[rng.gen_range(0..DEPARTMENTS.len())].to_string()
+}
+
+fn random_job_title(rng: &mut impl Rng) -> String {
+    JOB_TITLES[rng.gen_range(0..JOB_TITLES.len())].to_string()
+}
+
+fn random_ip_address(rng: &mut impl Rng) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        rng.gen_range(0..=255),
+        rng.gen_range(0..=255),
+        rng.gen_range(0..=255),
+        rng.gen_range(0..=255)
+    )
+}
+
+// JWTのヘッダー部分({"alg":"HS256","typ":"JWT"})のbase64url表現は毎回同じ内容なので固定文字列にしてある。
+// ペイロード・署名は本物の検証はできないが、それっぽい見た目にするためbase64urlの文字集合から
+// ランダムに文字を選んで組み立てる(base64クレートは使わず文字集合から直接選ぶだけで十分なため追加しない)
+const JWT_HEADER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+const BASE64URL_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn random_base64url_string(rng: &mut impl Rng, len: usize) -> String {
+    (0..len).map(|_| BASE64URL_CHARS[rng.gen_range(0..BASE64URL_CHARS.len())] as char).collect()
+}
+
+fn random_jwt(rng: &mut impl Rng) -> String {
+    let payload_len = rng.gen_range(40..80);
+    let payload = random_base64url_string(rng, payload_len);
+    let signature = random_base64url_string(rng, 43);
+    format!("{JWT_HEADER}.{payload}.{signature}")
+}
+
+const API_KEY_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+fn random_api_key(rng: &mut impl Rng) -> String {
+    let body: String = (0..32).map(|_| API_KEY_CHARS[rng.gen_range(0..API_KEY_CHARS.len())] as char).collect();
+    format!("sk_{body}")
+}
+
+// Luhnアルゴリズムで検査数字(0-9)を計算する。digitsは検査数字を除いた本体(左から順)。
+// 右端(digitsの最後の要素)から数えて奇数番目(1番目, 3番目, ...)の桁を2倍し、
+// 2倍した結果が9を超えたら9を引いてから合計する(これが検査数字を末尾に付けたときに
+// 偶数番目になる位置)
+fn luhn_check_digit(digits: &[u8]) -> u8 {
+    let sum: u32 = digits
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, &d)| {
+            let d = d as u32;
+            if i % 2 == 0 {
+                let doubled = d * 2;
+                if doubled > 9 { doubled - 9 } else { doubled }
+            } else {
+                d
+            }
+        })
+        .sum();
+    ((10 - (sum % 10)) % 10) as u8
+}
+
+fn random_credit_card_number(rng: &mut impl Rng) -> String {
+    // 先頭1桁は"4"固定(Visa風)にし、残り14桁をランダムにして本体15桁とする
+    let mut digits = vec![4u8];
+    digits.extend((0..14).map(|_| rng.gen_range(0..10)));
+    let check_digit = luhn_check_digit(&digits);
+    digits.push(check_digit);
+    digits.iter().map(|d| d.to_string()).collect()
+}
+
+// クレジットカードの有効期限を"MM/YY"形式で返す。「今日」を基準に1〜5年後の
+// ランダムな年+ランダムな月(1〜12)にする(birth_dateと同じく「今日」基準の考え方)
+fn random_credit_card_expiry(rng: &mut impl Rng) -> String {
+    use chrono::Datelike;
+    let today = chrono::Local::now().date_naive();
+    let year = today.year() + rng.gen_range(1..=5);
+    let month = rng.gen_range(1..=12);
+    format!("{:02}/{:02}", month, year % 100)
+}
+
+// 日本の普通預金口座番号を想定した7桁のゼロ埋め数字
+fn random_bank_account_number(rng: &mut impl Rng) -> String {
+    format!("{:07}", rng.gen_range(0..10_000_000u32))
+}
+
+const SKU_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+// 商品SKUらしい"SKU-"+英大文字/数字8文字の文字列(random_api_keyと同じ乱数の使い方)
+fn random_product_sku(rng: &mut impl Rng) -> String {
+    let body: String = (0..8).map(|_| SKU_CHARS[rng.gen_range(0..SKU_CHARS.len())] as char).collect();
+    format!("SKU-{body}")
+}
+
+// 個人番号(マイナンバー)の検査数字。行政手続における特定の個人を識別するための
+// 番号の利用等に関する法律で定められた計算方法に従う。右から1始まりで数えた位置iの
+// 重みは、iが1〜6なら(i+1)、7〜11なら(i-5)。各桁×重みの合計を11で割った余りが
+// 0か1なら検査数字は0、それ以外は(11-余り)
+fn my_number_check_digit(digits: &[u8; 11]) -> u8 {
+    let sum: u32 = digits
+        .iter()
+        .enumerate()
+        .map(|(j, &d)| {
+            let i = 11 - j; // 右から1始まりの位置
+            let weight = if i <= 6 { i + 1 } else { i - 5 };
+            d as u32 * weight as u32
+        })
+        .sum();
+    let remainder = sum % 11;
+    if remainder <= 1 { 0 } else { (11 - remainder) as u8 }
+}
+
+fn random_my_number(rng: &mut impl Rng) -> String {
+    let mut digits = [0u8; 11];
+    for d in &mut digits {
+        *d = rng.gen_range(0..10);
+    }
+    let check_digit = my_number_check_digit(&digits);
+    let mut all: Vec<u8> = digits.to_vec();
+    all.push(check_digit);
+    all.iter().map(|d| d.to_string()).collect()
+}
+
 // 同じ行の中で、前の列の生成結果を後ろの列に伝えるための文脈。
 // 列間で参照し合う列タイプ(prefecture_ja→city_ja、name_ja→katakana_name)が増えたため、
 // 個別の引数(context_prefectureなど)を都度増やす代わりに、まとめて1つのstructにしている。
@@ -1073,9 +1493,10 @@ fn generate_cell(
         PreparedColumnType::KatakanaNameHankaku => {
             (Some(to_hankaku_katakana(&random_katakana_name(rng, ctx.last_name_indices))), None)
         }
-        PreparedColumnType::NameJa => {
+        PreparedColumnType::RomajiName => (Some(random_romaji_name(rng, ctx.last_name_indices)), None),
+        PreparedColumnType::NameJa { with_space } => {
             let (last_idx, first_idx) = random_name_indices(rng);
-            (Some(format_name(last_idx, first_idx)), Some((last_idx, first_idx)))
+            (Some(format_name(last_idx, first_idx, with_space)), Some((last_idx, first_idx)))
         }
         _ => (Some(generate_value(&column.kind, row_num, rng)), None),
     }
@@ -1092,7 +1513,7 @@ fn generate_row(columns: &[PreparedColumn], row_num: u32, rng: &mut impl Rng) ->
         let (cell, name_indices) = generate_cell(column, row_num, rng, &ctx);
         match column.kind {
             PreparedColumnType::PrefectureJa => ctx.last_prefecture = cell.clone(),
-            PreparedColumnType::NameJa => ctx.last_name_indices = name_indices,
+            PreparedColumnType::NameJa { .. } => ctx.last_name_indices = name_indices,
             _ => {}
         }
         values.push(cell);
@@ -1105,7 +1526,7 @@ fn generate_row(columns: &[PreparedColumn], row_num: u32, rng: &mut impl Rng) ->
 fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -> String {
     match kind {
         PreparedColumnType::Sequence => row_num.to_string(),
-        PreparedColumnType::NameJa => random_name(rng),
+        PreparedColumnType::NameJa { with_space } => random_name(rng, *with_space),
         PreparedColumnType::LastNameJa => random_last_name(rng),
         PreparedColumnType::FirstNameJa => random_first_name(rng),
         PreparedColumnType::Email { domain } => random_email(row_num, domain),
@@ -1139,7 +1560,30 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::CityJa => random_city(rng, None),
         PreparedColumnType::KatakanaName => random_katakana_name(rng, None),
         PreparedColumnType::KatakanaNameHankaku => to_hankaku_katakana(&random_katakana_name(rng, None)),
-        PreparedColumnType::Enum { choices } => choices[rng.gen_range(0..choices.len())].clone(),
+        // context(前の列のname_ja)が無い状態での単独生成。文脈付きの生成はgenerate_cellが行う
+        PreparedColumnType::RomajiName => random_romaji_name(rng, None),
+        PreparedColumnType::KatakanaLastName => random_katakana_last_name(rng),
+        PreparedColumnType::KatakanaFirstName => random_katakana_first_name(rng),
+        PreparedColumnType::DepartmentJa => random_department(rng),
+        PreparedColumnType::JobTitleJa => random_job_title(rng),
+        PreparedColumnType::IpAddress => random_ip_address(rng),
+        PreparedColumnType::Jwt => random_jwt(rng),
+        PreparedColumnType::ApiKey => random_api_key(rng),
+        PreparedColumnType::CreditCardNumber => random_credit_card_number(rng),
+        PreparedColumnType::CreditCardExpiry => random_credit_card_expiry(rng),
+        PreparedColumnType::BankAccountNumber => random_bank_account_number(rng),
+        PreparedColumnType::ProductSku => random_product_sku(rng),
+        PreparedColumnType::MyNumber => random_my_number(rng),
+        PreparedColumnType::Enum { choices, weights } => match weights {
+            // choose_weighted(rand::seq::SliceRandom、既にuseされている)で重み付き抽選する。
+            // prepare_columnsで「個数がchoicesと一致・負の数なし・合計>0」を検証済みなので、
+            // ここでのunwrapは失敗しない
+            Some(w) => {
+                let pairs: Vec<(&String, f64)> = choices.iter().zip(w.iter().copied()).collect();
+                pairs.choose_weighted(rng, |(_, weight)| *weight).unwrap().0.clone()
+            }
+            None => choices[rng.gen_range(0..choices.len())].clone(),
+        },
         PreparedColumnType::Fixed { value } => value.clone(),
         PreparedColumnType::ForeignKey { pool, .. } => {
             let pool = pool.as_ref().expect("FKプールはfill_foreign_key_poolsで親テーブル生成後に必ず埋まっている");
@@ -1157,9 +1601,12 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
     }
     matches!(
         kind,
-        PreparedColumnType::NameJa
+        PreparedColumnType::NameJa { .. }
             | PreparedColumnType::LastNameJa
             | PreparedColumnType::FirstNameJa
+            | PreparedColumnType::RomajiName
+            | PreparedColumnType::KatakanaLastName
+            | PreparedColumnType::KatakanaFirstName
             | PreparedColumnType::Email { .. }
             | PreparedColumnType::Date { .. }
             | PreparedColumnType::BirthDate { .. }
@@ -1173,6 +1620,16 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
             | PreparedColumnType::CityJa
             | PreparedColumnType::KatakanaName
             | PreparedColumnType::KatakanaNameHankaku
+            | PreparedColumnType::DepartmentJa
+            | PreparedColumnType::JobTitleJa
+            | PreparedColumnType::IpAddress
+            | PreparedColumnType::Jwt
+            | PreparedColumnType::ApiKey
+            | PreparedColumnType::CreditCardNumber
+            | PreparedColumnType::CreditCardExpiry
+            | PreparedColumnType::BankAccountNumber
+            | PreparedColumnType::ProductSku
+            | PreparedColumnType::MyNumber
             | PreparedColumnType::Enum { .. }
             | PreparedColumnType::Fixed { .. }
     )
@@ -1425,6 +1882,12 @@ pub fn write_csv_streaming(
     // 読み込んでしまい文字化けする。CLIからの呼び出し(main.rs)は既存の出力バイト列を
     // 一切変えないためfalseを渡す。GUIはExcelでの見た目を優先してtrueを渡す想定。
     write_bom: bool,
+    // trueのとき、全ての値をダブルクォートで囲んで書き出す(CSVの標準的な
+    // クォート規則により、値の中の"は""にエスケープされる)。名称にスペースを
+    // 含むケースなど、値の区切りを明確にしたい場合にオンにする用途を想定している。
+    // falseのとき(既定)は今まで通り、カンマ・改行・"を含む値だけを囲む
+    // (csvクレートのQuoteStyle::Necessaryのデフォルト挙動)。
+    quote_all: bool,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = std::fs::File::create(path)?;
@@ -1435,10 +1898,11 @@ pub fn write_csv_streaming(
     let mut had_sjis_errors = false;
     let total = row_count as u64;
     let mut done: u64 = 0;
+    let quote_style = if quote_all { csv::QuoteStyle::Always } else { csv::QuoteStyle::Necessary };
 
     if row_count == 0 {
         // row_countが0でも、build_csv_from_rowsと同様にヘッダー行だけは書き出す
-        let mut writer = csv::Writer::from_writer(Vec::new());
+        let mut writer = csv::WriterBuilder::new().quote_style(quote_style).from_writer(Vec::new());
         let headers: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         writer.write_record(&headers)?;
         let text = String::from_utf8(writer.into_inner()?)?;
@@ -1450,7 +1914,7 @@ pub fn write_csv_streaming(
         let chunk_end = (chunk_start + chunk_size - 1).min(row_count);
         let rows = generate_rows_range(columns, base_seed, chunk_start, chunk_end);
 
-        let mut writer = csv::Writer::from_writer(Vec::new());
+        let mut writer = csv::WriterBuilder::new().quote_style(quote_style).from_writer(Vec::new());
         if chunk_start == 1 {
             let headers: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
             writer.write_record(&headers)?;
@@ -1878,8 +2342,115 @@ mod tests {
     }
 
     #[test]
+    fn schema_file_to_yaml_single_table_round_trips_through_load_schema() {
+        let schema = schema_from_yaml(
+            "row_count: 3\ntable_name: users\ncolumns:\n  - name: id\n    type: sequence\n  - name: email\n    type: email\n    domain: test.example\n  - name: age\n    type: integer\n    min: 18\n    max: 65\n    unique: true\n",
+        );
+        let file = SchemaFile { tables: vec![schema], multi_table: false };
+
+        let yaml = schema_file_to_yaml(&file).unwrap();
+        // 単一テーブルは"tables:"では包まず、今まで通りトップレベルに直接書く見た目になる
+        assert!(!yaml.contains("tables:"));
+
+        let reloaded: RawSchemaFile = serde_yaml::from_str(&yaml).unwrap();
+        let reloaded = normalize_schema_file(reloaded).unwrap();
+        assert!(!reloaded.multi_table);
+        assert_eq!(reloaded.tables.len(), 1);
+        assert_eq!(reloaded.tables[0].row_count, 3);
+        assert_eq!(reloaded.tables[0].table_name.as_deref(), Some("users"));
+        assert_eq!(reloaded.tables[0].columns.len(), 3);
+    }
+
+    #[test]
+    fn schema_file_to_yaml_multi_table_round_trips_through_load_schema() {
+        let users = schema_from_yaml("row_count: 5\ntable_name: users\ncolumns:\n  - name: id\n    type: sequence\n");
+        let orders = schema_from_yaml(
+            "row_count: 8\ntable_name: orders\ncolumns:\n  - name: id\n    type: sequence\n  - name: user_id\n    type: foreign_key\n    references: users.id\n",
+        );
+        let file = SchemaFile { tables: vec![users, orders], multi_table: true };
+
+        let yaml = schema_file_to_yaml(&file).unwrap();
+        assert!(yaml.contains("tables:"));
+
+        let reloaded: RawSchemaFile = serde_yaml::from_str(&yaml).unwrap();
+        let reloaded = normalize_schema_file(reloaded).unwrap();
+        assert!(reloaded.multi_table);
+        assert_eq!(reloaded.tables.len(), 2);
+        assert_eq!(reloaded.tables[0].table_name.as_deref(), Some("users"));
+        assert_eq!(reloaded.tables[1].table_name.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn enum_with_heavily_skewed_weights_almost_always_picks_the_heavy_choice() {
+        let schema = schema_from_yaml(
+            "row_count: 1000\ntable_name: t\ncolumns:\n  - name: status\n    type: enum\n    choices: [\"A\", \"B\"]\n    weights: [100.0, 0.0]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let rows = generate_all_rows(schema.row_count, &columns, 42);
+
+        for row in &rows {
+            assert_eq!(row[0].as_deref(), Some("A"));
+        }
+    }
+
+    #[test]
+    fn enum_without_weights_still_picks_uniformly_at_random() {
+        // weights省略時、今まで通り両方の選択肢が出ること(後方互換の確認)
+        let schema = schema_from_yaml(
+            "row_count: 200\ntable_name: t\ncolumns:\n  - name: status\n    type: enum\n    choices: [\"A\", \"B\"]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let rows = generate_all_rows(schema.row_count, &columns, 42);
+
+        let has_a = rows.iter().any(|r| r[0].as_deref() == Some("A"));
+        let has_b = rows.iter().any(|r| r[0].as_deref() == Some("B"));
+        assert!(has_a && has_b);
+    }
+
+    #[test]
+    fn enum_weights_length_mismatch_is_rejected() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ntable_name: t\ncolumns:\n  - name: status\n    type: enum\n    choices: [\"A\", \"B\"]\n    weights: [1.0]\n",
+        );
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("weights"));
+    }
+
+    #[test]
+    fn enum_negative_weight_is_rejected() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ntable_name: t\ncolumns:\n  - name: status\n    type: enum\n    choices: [\"A\", \"B\"]\n    weights: [1.0, -1.0]\n",
+        );
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("負の数"));
+    }
+
+    #[test]
+    fn enum_all_zero_weights_is_rejected() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ntable_name: t\ncolumns:\n  - name: status\n    type: enum\n    choices: [\"A\", \"B\"]\n    weights: [0.0, 0.0]\n",
+        );
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("合計"));
+    }
+
+    #[test]
+    fn enum_unique_ignores_weights_and_still_enumerates_all_choices_exactly_once() {
+        let schema = schema_from_yaml(
+            "row_count: 2\ntable_name: t\ncolumns:\n  - name: status\n    type: enum\n    choices: [\"A\", \"B\"]\n    weights: [100.0, 1.0]\n    unique: true\n",
+        );
+        let mut columns = prepare_columns(&schema).unwrap();
+        resolve_unique_pools(&mut columns, schema.row_count, 42);
+        let rows = generate_all_rows(schema.row_count, &columns, 42);
+
+        let mut values: Vec<&str> = rows.iter().map(|r| r[0].as_deref().unwrap()).collect();
+        values.sort();
+        assert_eq!(values, vec!["A", "B"]);
+    }
+
+    #[test]
     fn sql_literal_quotes_text_columns_and_escapes_quote() {
-        let quoted = sql_literal(&PreparedColumnType::NameJa, "O'Brien");
+        let quoted = sql_literal(&PreparedColumnType::NameJa { with_space: false }, "O'Brien");
         assert_eq!(quoted, "'O''Brien'");
     }
 
@@ -1971,6 +2542,103 @@ mod tests {
     }
 
     #[test]
+    fn random_department_is_in_dictionary() {
+        let mut rng = row_rng(1, 1);
+        for _ in 0..50 {
+            assert!(DEPARTMENTS.contains(&random_department(&mut rng).as_str()));
+        }
+    }
+
+    #[test]
+    fn random_job_title_is_in_dictionary() {
+        let mut rng = row_rng(1, 1);
+        for _ in 0..50 {
+            assert!(JOB_TITLES.contains(&random_job_title(&mut rng).as_str()));
+        }
+    }
+
+    #[test]
+    fn random_ip_address_has_valid_format() {
+        let mut rng = row_rng(1, 1);
+        for _ in 0..50 {
+            let value = random_ip_address(&mut rng);
+            let octets: Vec<&str> = value.split('.').collect();
+            assert_eq!(octets.len(), 4);
+            for octet in octets {
+                let n: u32 = octet.parse().expect("各オクテットは数値のはず");
+                assert!(n <= 255);
+            }
+        }
+    }
+
+    #[test]
+    fn random_jwt_has_three_dot_separated_segments() {
+        let mut rng = row_rng(1, 1);
+        let value = random_jwt(&mut rng);
+        let segments: Vec<&str> = value.split('.').collect();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], JWT_HEADER);
+    }
+
+    #[test]
+    fn random_api_key_has_sk_prefix_and_expected_length() {
+        let mut rng = row_rng(1, 1);
+        let value = random_api_key(&mut rng);
+        assert!(value.starts_with("sk_"));
+        assert_eq!(value.len(), 35); // "sk_" (3文字) + 英数字32文字
+    }
+
+    #[test]
+    fn luhn_check_digit_matches_known_example() {
+        // "4111111111111111"(有名なVisaテストカード番号、16桁、Luhn検査済み)の
+        // 先頭15桁から検査数字(16桁目)を再計算し、実際の16桁目と一致するか確認する
+        let digits: Vec<u8> = "4111111111111111".chars().map(|c| c.to_digit(10).unwrap() as u8).collect();
+        assert_eq!(digits.len(), 16);
+        let (body, expected_check) = digits.split_at(15);
+        assert_eq!(luhn_check_digit(body), expected_check[0]);
+    }
+
+    #[test]
+    fn random_credit_card_number_passes_luhn_check() {
+        let mut rng = row_rng(1, 1);
+        for _ in 0..50 {
+            let value = random_credit_card_number(&mut rng);
+            assert_eq!(value.len(), 16);
+            let digits: Vec<u8> = value.chars().map(|c| c.to_digit(10).unwrap() as u8).collect();
+            let (body, check) = digits.split_at(15);
+            assert_eq!(luhn_check_digit(body), check[0]);
+        }
+    }
+
+    #[test]
+    fn my_number_check_digit_matches_hand_calculation() {
+        // 手計算での検算: digits(左から) = [1,2,3,4,5,6,7,8,9,0,1]
+        // 右から1始まりのi=1..11、weight(i)= i<=6 ? i+1 : i-5
+        // i:  11 10  9  8  7  6  5  4  3  2  1
+        // w:   6  5  4  3  2  7  6  5  4  3  2
+        // d:   1  2  3  4  5  6  7  8  9  0  1 (右からi=1が末尾桁)
+        // 対応する桁(左から): digits[0]=1(i=11,w=6) ... digits[10]=1(i=1,w=2)
+        let digits: [u8; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1];
+        let weights = [6, 5, 4, 3, 2, 7, 6, 5, 4, 3, 2];
+        let sum: u32 = digits.iter().zip(weights.iter()).map(|(&d, &w)| d as u32 * w as u32).sum();
+        let remainder = sum % 11;
+        let expected = if remainder <= 1 { 0 } else { (11 - remainder) as u8 };
+        assert_eq!(my_number_check_digit(&digits), expected);
+    }
+
+    #[test]
+    fn random_my_number_check_digit_is_internally_consistent() {
+        let mut rng = row_rng(1, 1);
+        for _ in 0..50 {
+            let value = random_my_number(&mut rng);
+            assert_eq!(value.len(), 12);
+            let digits: Vec<u8> = value.chars().map(|c| c.to_digit(10).unwrap() as u8).collect();
+            let body: [u8; 11] = digits[0..11].try_into().unwrap();
+            assert_eq!(my_number_check_digit(&body), digits[11]);
+        }
+    }
+
+    #[test]
     fn generate_value_integer_stays_within_range() {
         let mut rng = row_rng(42, 1);
         for _ in 0..200 {
@@ -1985,6 +2653,27 @@ mod tests {
         let mut rng = row_rng(42, 1);
         let value = generate_value(&PreparedColumnType::Boolean, 1, &mut rng);
         assert!(value == "true" || value == "false");
+    }
+
+    #[test]
+    fn format_wareki_handles_first_year_as_gannen() {
+        let date = chrono::NaiveDate::from_ymd_opt(2019, 5, 1).unwrap();
+        assert_eq!(format_wareki(date), "令和元年5月1日");
+    }
+
+    #[test]
+    fn format_wareki_handles_era_boundary() {
+        // 昭和64年は1月7日まで(1月8日から平成元年)
+        let showa_last_day = chrono::NaiveDate::from_ymd_opt(1989, 1, 7).unwrap();
+        assert_eq!(format_wareki(showa_last_day), "昭和64年1月7日");
+        let heisei_first_day = chrono::NaiveDate::from_ymd_opt(1989, 1, 8).unwrap();
+        assert_eq!(format_wareki(heisei_first_day), "平成元年1月8日");
+    }
+
+    #[test]
+    fn format_wareki_handles_ordinary_year() {
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 9, 15).unwrap();
+        assert_eq!(format_wareki(date), "令和7年9月15日");
     }
 
     #[test]
@@ -2105,6 +2794,65 @@ mod tests {
             "row_count: 5\ncolumns:\n  - name: flag\n    type: boolean\n    unique: true\n",
         );
         assert!(prepare_columns(&schema).is_err());
+    }
+
+    // name_ja(姓30×名20=600通り)はEnumerable方式でuniqueに対応できることを確認する
+    #[test]
+    fn unique_name_ja_produces_no_duplicate_full_names() {
+        let schema = schema_from_yaml(
+            "row_count: 100\ncolumns:\n  - name: n\n    type: name_ja\n    unique: true\n",
+        );
+        let mut columns = prepare_columns(&schema).unwrap();
+        resolve_unique_pools(&mut columns, schema.row_count, 7);
+        let csv_text = build_csv(schema.row_count, &columns, 7).unwrap();
+        let names: Vec<&str> = csv_text.lines().skip(1).collect();
+        let unique_count = names.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique_count, names.len());
+    }
+
+    // last_name_ja単独は30通りしかないので、row_count=30(ちょうど容量いっぱい)でも
+    // ユニークな値が過不足なく用意できることを確認する
+    #[test]
+    fn unique_last_name_ja_produces_no_duplicate_surnames() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: sei\n    type: last_name_ja\n    unique: true\n",
+        );
+        let mut columns = prepare_columns(&schema).unwrap();
+        resolve_unique_pools(&mut columns, schema.row_count, 3);
+        let csv_text = build_csv(schema.row_count, &columns, 3).unwrap();
+        let mut names: Vec<&str> = csv_text.lines().skip(1).collect();
+        names.sort_unstable();
+        let mut expected: Vec<&str> = LAST_NAMES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+    }
+
+    // name_jaの組み合わせ数(600)を超えるrow_countでuniqueを指定するとエラーになることを確認する
+    #[test]
+    fn prepare_columns_rejects_unique_name_ja_when_row_count_exceeds_capacity() {
+        let schema = schema_from_yaml(
+            "row_count: 601\ncolumns:\n  - name: n\n    type: name_ja\n    unique: true\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    // phone_ja(携帯電話番号)は組み合わせ数が膨大でEnumerable方式では列挙できないため、
+    // Retry方式(値を作って重複チェック)でuniqueに対応できることを確認する
+    #[test]
+    fn unique_phone_ja_produces_no_duplicates() {
+        let schema = schema_from_yaml(
+            "row_count: 500\ncolumns:\n  - name: tel\n    type: phone_ja\n    unique: true\n",
+        );
+        let mut columns = prepare_columns(&schema).unwrap();
+        resolve_unique_pools(&mut columns, schema.row_count, 11);
+        let csv_text = build_csv(schema.row_count, &columns, 11).unwrap();
+        let numbers: Vec<&str> = csv_text.lines().skip(1).collect();
+        let unique_count = numbers.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique_count, numbers.len());
+        for n in &numbers {
+            let prefix = n.split('-').next().unwrap();
+            assert!(PHONE_PREFIXES.contains(&prefix), "{n}");
+        }
     }
 
     #[test]
@@ -2275,6 +3023,95 @@ mod tests {
         assert!(misplaced_katakana_name_warnings(&columns).is_empty());
     }
 
+    #[test]
+    fn romaji_name_matches_preceding_name_ja() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: name\n    type: name_ja\n  - name: romaji\n    type: romaji_name\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 7).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let mut parts = line.split(',');
+            let name = parts.next().unwrap();
+            let romaji = parts.next().unwrap();
+            let last_idx = LAST_NAMES.iter().position(|&n| name.starts_with(n)).unwrap();
+            let first_idx = FIRST_NAMES.iter().position(|&n| name.ends_with(n)).unwrap();
+            assert_eq!(romaji, format!("{} {}", LAST_NAMES_ROMAJI[last_idx], FIRST_NAMES_ROMAJI[first_idx]));
+        }
+    }
+
+    #[test]
+    fn romaji_name_without_name_ja_falls_back() {
+        let schema = schema_from_yaml("row_count: 10\ncolumns:\n  - name: romaji\n    type: romaji_name\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        assert_eq!(csv_text.lines().skip(1).count(), 10);
+    }
+
+    #[test]
+    fn warns_when_name_ja_comes_after_romaji_name() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: romaji\n    type: romaji_name\n  - name: name\n    type: name_ja\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert_eq!(misplaced_katakana_name_warnings(&columns).len(), 1);
+    }
+
+    #[test]
+    fn katakana_last_name_and_katakana_first_name_only_produce_listed_readings() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: sei\n    type: katakana_last_name\n  - name: mei\n    type: katakana_first_name\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 5).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let mut parts = line.split(',');
+            assert!(LAST_NAMES_KANA.contains(&parts.next().unwrap()));
+            assert!(FIRST_NAMES_KANA.contains(&parts.next().unwrap()));
+        }
+    }
+
+    #[test]
+    fn credit_card_expiry_has_mm_slash_yy_format_and_is_in_the_future() {
+        use chrono::Datelike;
+        let schema = schema_from_yaml("row_count: 50\ncolumns:\n  - name: exp\n    type: credit_card_expiry\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 9).unwrap();
+        let this_year_2digit = (chrono::Local::now().date_naive().year() % 100) as u32;
+        for line in csv_text.lines().skip(1) {
+            let parts: Vec<&str> = line.split('/').collect();
+            assert_eq!(parts.len(), 2, "{line}");
+            assert_eq!(parts[0].len(), 2, "{line}");
+            assert_eq!(parts[1].len(), 2, "{line}");
+            let month: u32 = parts[0].parse().unwrap();
+            let year: u32 = parts[1].parse().unwrap();
+            assert!((1..=12).contains(&month), "{line}");
+            assert!(year > this_year_2digit, "{line}"); // 必ず「今年より後」の年になる
+        }
+    }
+
+    #[test]
+    fn bank_account_number_has_seven_digit_format() {
+        let schema = schema_from_yaml("row_count: 30\ncolumns:\n  - name: acc\n    type: bank_account_number\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 4).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert_eq!(line.len(), 7, "{line}");
+            assert!(line.chars().all(|c| c.is_ascii_digit()), "{line}");
+        }
+    }
+
+    #[test]
+    fn product_sku_has_sku_prefix_and_expected_length() {
+        let schema = schema_from_yaml("row_count: 30\ncolumns:\n  - name: sku\n    type: product_sku\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 6).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(line.starts_with("SKU-"), "{line}");
+            assert_eq!(line.len(), 12, "{line}"); // "SKU-"(4文字) + 英数字8文字
+        }
+    }
+
     // --- ここから F3-3(複数形式同時出力) のテスト ---
 
     #[test]
@@ -2375,7 +3212,7 @@ mod tests {
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming.csv");
         let path_str = path.to_str().unwrap();
         let mut progress_calls = Vec::new();
-        write_csv_streaming(schema.row_count, &columns, 42, path_str, Encoding::Utf8, 7, false, |done, total| {
+        write_csv_streaming(schema.row_count, &columns, 42, path_str, Encoding::Utf8, 7, false, false, |done, total| {
             progress_calls.push((done, total));
         })
         .unwrap();
@@ -2394,7 +3231,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_zero.csv");
         let path_str = path.to_str().unwrap();
-        write_csv_streaming(0, &columns, 42, path_str, Encoding::Utf8, 10, false, |_, _| {}).unwrap();
+        write_csv_streaming(0, &columns, 42, path_str, Encoding::Utf8, 10, false, false, |_, _| {}).unwrap();
 
         let actual = std::fs::read_to_string(&path).unwrap();
         assert_eq!(actual.lines().count(), 1); // ヘッダー行のみ
@@ -2412,7 +3249,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_bom.csv");
         let path_str = path.to_str().unwrap();
-        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, true, |_, _| {}).unwrap();
+        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, true, false, |_, _| {}).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
@@ -2429,10 +3266,48 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_no_bom.csv");
         let path_str = path.to_str().unwrap();
-        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, |_, _| {}).unwrap();
+        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, false, |_, _| {}).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         assert_ne!(&bytes[..3.min(bytes.len())], &[0xEF, 0xBB, 0xBF][..3.min(bytes.len())]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // quote_all: trueのとき、スペースを含む値だけでなく数値の列も含めて全ての値が
+    // ダブルクォートで囲まれ、値の中の"は""にエスケープされることを確認する
+    #[test]
+    fn write_csv_streaming_with_quote_all_true_quotes_every_field() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: fixed\n    value: \"山田 太郎\"\n  - name: note\n    type: fixed\n    value: 'he said \"hi\", ok'\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+
+        let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_quote_all.csv");
+        let path_str = path.to_str().unwrap();
+        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, true, |_, _| {}).unwrap();
+
+        let actual = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(actual, "\"id\",\"name\",\"note\"\n\"1\",\"山田 太郎\",\"he said \"\"hi\"\", ok\"\n");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // quote_all: false(既定)のときは、これまで通り必要な値だけがクォートされることを確認する
+    // (数値やスペースだけの値はクォートされない)
+    #[test]
+    fn write_csv_streaming_with_quote_all_false_only_quotes_when_necessary() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: fixed\n    value: \"山田 太郎\"\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+
+        let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_quote_none.csv");
+        let path_str = path.to_str().unwrap();
+        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, false, |_, _| {}).unwrap();
+
+        let actual = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(actual, "id,name\n1,山田 太郎\n");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2449,7 +3324,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_unique.csv");
         let path_str = path.to_str().unwrap();
-        write_csv_streaming(schema.row_count, &columns, 99, path_str, Encoding::Utf8, 5, false, |_, _| {}).unwrap();
+        write_csv_streaming(schema.row_count, &columns, 99, path_str, Encoding::Utf8, 5, false, false, |_, _| {}).unwrap();
         let actual = std::fs::read_to_string(&path).unwrap();
 
         let mut values: Vec<i64> = Vec::new();
@@ -2561,6 +3436,32 @@ mod tests {
             let parts: Vec<&str> = line.split('-').collect();
             assert_eq!(parts.len(), 3, "{line}");
             assert!(PHONE_PREFIXES_LANDLINE.contains(&parts[0]), "{line}");
+        }
+    }
+
+    #[test]
+    fn name_ja_with_space_true_inserts_space_between_surname_and_given_name() {
+        let schema = schema_from_yaml(
+            "row_count: 10\ncolumns:\n  - name: n\n    type: name_ja\n    with_space: true\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 5).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let mut parts = line.splitn(2, ' ');
+            assert!(LAST_NAMES.contains(&parts.next().unwrap()), "{line}");
+            assert!(FIRST_NAMES.contains(&parts.next().unwrap()), "{line}");
+        }
+    }
+
+    // with_spaceを省略した場合は、既存のschema.yamlとの後方互換のため今まで通り
+    // スペース無しで出力されることを確認する
+    #[test]
+    fn name_ja_without_with_space_field_defaults_to_no_space() {
+        let schema = schema_from_yaml("row_count: 10\ncolumns:\n  - name: n\n    type: name_ja\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 5).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(!line.contains(' '), "{line}");
         }
     }
 

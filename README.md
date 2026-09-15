@@ -70,22 +70,26 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `--encoding <utf8\|sjis>` | 出力の文字コード | `utf8` |
 | `--seed <数値>` | 乱数シード。指定すると毎回同じデータを再現する | 未指定(毎回ランダム) |
 | `--output <path>` | 出力先ファイルパス | 形式に応じた既定値 |
+| `--quote-all` | CSV出力で全ての値をダブルクォートで囲む(名称にスペースを含む値の区切りを明確にしたい場合向け)。`--format csv`単体のときのみ有効 | 指定なし(必要な値だけクォート) |
 
 ### 対応する列タイプ
 
 | type | 説明 | 追加パラメータ |
 |---|---|---|
 | `sequence` | 1から始まる連番 | なし |
-| `name_ja` | 日本語のランダムな氏名(フルネーム) | なし |
+| `name_ja` | 日本語のランダムな氏名(フルネーム) | `with_space`(省略時false。trueで姓と名の間にスペース、例:「山田 太郎」) |
 | `last_name_ja` | 姓(苗字)のみ | なし |
 | `first_name_ja` | 名のみ | なし |
+| `romaji_name` | 氏名のローマ字(ヘボン式、「姓 名」の順、例: `Yamada Taro`)。**直前に`name_ja`列があれば、その氏名と対応するローマ字を選ぶ**。無ければランダム | なし |
+| `katakana_last_name` | フリガナ(姓)のみ。他の列とは対応付けない独立ランダム | なし |
+| `katakana_first_name` | フリガナ(名)のみ。他の列とは対応付けない独立ランダム | なし |
 | `katakana_name` | フリガナ(全角)。**直前に`name_ja`列があれば、その氏名と対応する読みを選ぶ**。無ければランダム | なし |
 | `katakana_name_hankaku` | フリガナ(半角)。参照ロジックは`katakana_name`と同じ | なし |
 | `email` | `user{連番}@{domain}` | `domain`(省略時`example.com`) |
 | `integer` | `min`〜`max`のランダムな整数 | `min`, `max` |
 | `float` | `min`〜`max`のランダムな小数 | `min`, `max`, `decimals`(省略時2) |
 | `boolean` | `true` / `false` | なし |
-| `date` | `start`〜`end`のランダムな日付 | `start`, `end`, `format`(省略時`ymd`。`ymd`/`iso8601`/`slash`) |
+| `date` | `start`〜`end`のランダムな日付 | `start`, `end`, `format`(省略時`ymd`。`ymd`/`iso8601`/`slash`/`wareki`) |
 | `birth_date` | `min_age`〜`max_age`歳になる生年月日を、今日の日付から逆算 | `min_age`, `max_age`, `format`(dateと共通) |
 | `postal_code` | 日本の郵便番号風(`NNN-NNNN`) | なし |
 | `phone_ja` | 携帯電話番号風(`090/080/070-XXXX-XXXX`) | なし |
@@ -95,20 +99,36 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `uuid` | UUID v4形式のランダムなID(例: `550e8400-...`) | なし |
 | `prefecture_ja` | 都道府県 | なし |
 | `city_ja` | 市区町村。**直前に`prefecture_ja`列があれば、その都道府県に実在する地名を選ぶ**。無ければ全都道府県からランダム | なし |
-| `enum` | `choices`の中から均等ランダムに1つ選ぶ | `choices`(文字列のリスト) |
+| `department_ja` | 部署名(「営業部」など) | なし |
+| `job_title_ja` | 役職名(「課長」など) | なし |
+| `ip_address` | IPv4アドレス(例: `192.168.1.1`) | なし |
+| `jwt` | それっぽい形のJWT風文字列(署名検証はできないダミー) | なし |
+| `api_key` | `sk_`+英数字32文字のAPIキー風文字列 | なし |
+| `credit_card_number` | 16桁、Luhnアルゴリズムで検査数字を計算したクレジットカード番号風 | なし |
+| `credit_card_expiry` | クレジットカードの有効期限(`MM/YY`形式、今日から1〜5年後) | なし |
+| `bank_account_number` | 日本の普通預金口座番号を想定した7桁のゼロ埋め数字 | なし |
+| `product_sku` | `SKU-`+英大文字/数字8文字の商品SKU風文字列 | なし |
+| `my_number` | 12桁、個人番号法の検査数字計算方法に従ったマイナンバー風 | なし |
+| `enum` | `choices`の中からランダムに1つ選ぶ | `choices`(文字列のリスト)、`weights`(省略可。`choices`と同じ個数の数値のリストで出現比率を指定する。例: `choices: [利用中, 休止中]` に `weights: [7, 3]` で7:3の比率。省略時は均等ランダム) |
 | `fixed` | どの行でも常に同じ文字列を返す | `value` |
 | `foreign_key` | 親テーブルに実在する値からランダムに1つ選ぶ(複数テーブル形式`tables:`専用) | `references`(`"テーブル名.列名"`形式) |
 
 どの列タイプにも `null_rate`(0.0〜1.0)を追加でき、その確率でNULL(CSVでは空文字、SQLではクォートなしの`NULL`、JSONでは`null`)を出力する。
 
-生成される氏名・住所・電話番号・郵便番号・会社名はすべて固定リストからのランダムな組み合わせで、実在する個人・企業・住所・番号とは一切関係がない。
+生成される氏名・住所・電話番号・郵便番号・会社名・カード番号・口座番号等はすべて固定リストや簡易な計算式からのランダムな組み合わせで、実在する個人・企業・住所・番号とは一切関係がない。
 
 ### unique制約
 
-列に `unique: true` を付けると、その列の値が行間で重複しないようにする。対応している型は `enum` / `boolean` / `integer` / `date` のみ(`postal_code`/`phone_ja`/`address_ja`/`float`は組み合わせが多すぎる、または不連続で数えにくいため非対応)。以下の場合はエラーで停止する。
+列に `unique: true` を付けると、その列の値が行間で重複しないようにする。対応している型は以下の通り。
+
+- 組み合わせ数が少なく全列挙できる型: `enum` / `boolean` / `integer` / `date` / `name_ja`(姓30×名20=600通り) / `last_name_ja` / `first_name_ja`(`enum`に`weights`を指定していても、`unique: true`のときは全選択肢を重複なく列挙するだけなので`weights`は無視される)
+- 組み合わせ数が膨大(だが十分すぎるほど大きい)ため、値を作っては重複チェックし被ったら作り直す方式で対応する型: `phone_ja` / `phone_ja_landline`
+- それ以外(`postal_code`/`address_ja`/`float`/`romaji_name`/`credit_card_number`等)は非対応。値の重複を避けたい場合は、より小さい組み合わせ数の`enum`/`integer`で代用することを想定している
+
+以下の場合はエラーで停止する。
 
 - 値の組み合わせ数が `row_count` より少ない(例: `boolean`で行数5行にunique指定)
-- 値の組み合わせ数が200万通りを超える(範囲を絞って使う)
+- 全列挙方式の型で、値の組み合わせ数が200万通りを超える(範囲を絞って使う)
 - `null_rate` と同時に指定している
 
 ### 複数テーブルの外部キー整合性
@@ -204,7 +224,7 @@ columns:
     type: katakana_name # nameより後ろに書く
 ```
 
-`katakana_name`だけを単独で使った場合はランダムなフリガナを選ぶ。`name_ja`列は定義してあるのに`katakana_name`より後ろにある場合は、都道府県⇔市区町村のときと同様に警告が表示される。
+`katakana_name`だけを単独で使った場合はランダムなフリガナを選ぶ。`name_ja`列は定義してあるのに`katakana_name`より後ろにある場合は、都道府県⇔市区町村のときと同様に警告が表示される。`romaji_name`(氏名のローマ字)も`katakana_name`と全く同じ参照ロジックを持つ(`name_ja`より後ろに置くと対応するローマ字になる)。
 
 ### 進捗表示
 
@@ -212,7 +232,7 @@ columns:
 
 ## GUI版(DummyGen JP)について
 
-`C:\dev_2\dummygen_jp_gui` に、このツールをライブラリ(`src/lib.rs`)として組み込んだTauri v2 + React 19のデスクトップGUIアプリ「DummyGen JP」がある。コマンド操作に不慣れな担当者向けに、カラム設定・生成件数・出力形式(CSV/SQL)・文字コード(UTF-8/Shift-JIS)を画面から設定できる。GUIはCSV/SQL出力のみ対応(複数テーブル・JSON/Excel出力は今のところCLI専用)。GUIから生成したUTF-8のCSVには、Excelで開いたときに文字化けしないようファイル先頭にBOMを付けている(CLIの`--encoding utf8`出力にはBOMは付かず、これまで通り)。
+`C:\dev_2\dummygen_jp_gui` に、このツールをライブラリ(`src/lib.rs`)として組み込んだTauri v2 + React 19のデスクトップGUIアプリ「DummyGen JP」がある。コマンド操作に不慣れな担当者向けに、カラム設定・生成件数・出力形式(CSV/SQL)・文字コード(UTF-8/Shift-JIS)・値をダブルクォートで囲むかどうかを画面から設定できるほか、サンプルCSVの読み込みによる列・選択肢の自動設定、列のドラッグ並べ替え・複製、設定の保存・読み込み(プルダウン)、ワンクリックテンプレート、生成前のリアルタイムプレビュー(表示件数を変更可能)、複数テーブル(外部キー)対応、列設定のYAML書き出し/読み込み(このツールの`schema.yaml`と互換)といった画面独自の機能を持つ。GUIはCSV/SQL出力のみ対応(JSON/Excel出力は今のところCLI専用)。複数テーブルのGUI生成は、CLI(`tables:`形式)と同じく全テーブル分の行を一度メモリに載せてから書き出す方式(単一テーブルの方は今まで通りメモリを圧迫しない方式のまま)。また、GUIの複数テーブルCSV出力は`quote_all`(値を""で囲むオプション)に対応していない(単一テーブルのみ)。GUIから生成したUTF-8のCSVには、Excelで開いたときに文字化けしないようファイル先頭にBOMを付けている(CLIの`--encoding utf8`出力にはBOMは付かず、これまで通り)。
 
 ## Dr.Sum / MotionBoard / Datalizer 等での利用について
 

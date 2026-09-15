@@ -1,7 +1,5 @@
 use clap::Parser;
 use dummy_data_gen::*;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 // 「このプログラムが受け取れる引数はこれです」という設計図(struct)
 #[derive(Parser)]
@@ -31,6 +29,13 @@ struct Args {
     /// (例: --output result --format csv,json → result.csv / result.json)
     #[arg(long)]
     output: Option<String>,
+
+    /// CSV出力で、全ての値をダブルクォートで囲む(値の中の"は""にエスケープされる)。
+    /// 名称にスペースを含むケースなどで区切りを明確にしたいときに指定する。
+    /// 指定しない場合(既定)は今まで通り、カンマ・改行・"を含む値だけが囲まれる。
+    /// --format csv単体のときのみ有効(sql/json/xlsxには影響しない)
+    #[arg(long)]
+    quote_all: bool,
 }
 
 fn main() {
@@ -93,6 +98,7 @@ fn main() {
                     args.encoding,
                     DEFAULT_CHUNK_SIZE,
                     false,
+                    args.quote_all,
                     on_progress,
                 ),
                 Format::Sql => match schema.table_name.as_deref() {
@@ -173,32 +179,15 @@ fn main() {
     }
 
     let base_seed = args.seed.unwrap_or_else(rand::random);
-    let mut key_pools: HashMap<ColumnKey, Arc<Vec<String>>> = HashMap::new();
-    let mut rows_by_table: Vec<Option<Vec<Vec<Option<String>>>>> =
-        (0..tables.len()).map(|_| None).collect();
-
-    for &i in &order {
-        eprintln!("テーブル \"{}\" を生成中...", tables[i].name.as_deref().unwrap_or(""));
-
-        if let Err(e) = fill_foreign_key_pools(&mut tables[i].columns, &key_pools) {
+    let rows_by_table = match generate_multi_table_rows(&mut tables, &order, &referenced, base_seed, |_, table| {
+        eprintln!("テーブル \"{}\" を生成中...", table.name.as_deref().unwrap_or(""));
+    }) {
+        Ok(rows_by_table) => rows_by_table,
+        Err(e) => {
             eprintln!("エラーが発生しました: {}", e);
             return;
         }
-
-        // table_seedは宣言順index(i)を使う。トポロジカル順ではないので、
-        // 単一テーブル(tables.len()==1)のときは常にbase_seedそのものになる
-        let seed = table_seed(base_seed, i);
-        let row_count = tables[i].row_count;
-        resolve_unique_pools(&mut tables[i].columns, row_count, seed);
-        let rows = generate_all_rows(row_count, &tables[i].columns, seed);
-
-        if let Err(e) = collect_key_pools(&tables[i], &rows, &referenced, &mut key_pools) {
-            eprintln!("エラーが発生しました: {}", e);
-            return;
-        }
-
-        rows_by_table[i] = Some(rows);
-    }
+    };
 
     // 依存順(親が先)にGeneratedTableへまとめる(SQL1本出力のINSERT順のため)
     let generated: Vec<GeneratedTable> = order
