@@ -33,7 +33,9 @@ struct Args {
     /// CSV出力で、全ての値をダブルクォートで囲む(値の中の"は""にエスケープされる)。
     /// 名称にスペースを含むケースなどで区切りを明確にしたいときに指定する。
     /// 指定しない場合(既定)は今まで通り、カンマ・改行・"を含む値だけが囲まれる。
-    /// --format csv単体のときのみ有効(sql/json/xlsxには影響しない)
+    /// sql/json/xlsxには影響しない。単一テーブル(tables:を使わない形式)では
+    /// --format csv単体のときのみ有効。複数テーブル(tables:形式)ではcsvを含む
+    /// 出力であれば常に有効(他の形式と同時指定してもcsvの部分にだけ効く)
     #[arg(long)]
     quote_all: bool,
 }
@@ -201,7 +203,7 @@ fn main() {
 
     for format in formats {
         let base_path = output_base_path(args.output.as_deref(), format, multiple_formats);
-        match write_output_multi_table(format, &generated, &base_path, args.encoding) {
+        match write_output_multi_table(format, &generated, &base_path, args.encoding, args.quote_all) {
             Ok(written) => {
                 for (path, row_count) in written {
                     println!("{}行のデータを {} ({}) に書き出しました", row_count, path, args.encoding);

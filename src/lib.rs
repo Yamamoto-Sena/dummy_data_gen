@@ -2075,12 +2075,16 @@ pub fn write_sql_streaming(
 }
 
 // CSVの中身(行データは生成済みのものを受け取る)をUTF-8の文字列として組み立てる。
-// NULL(None)はCSVでは空文字として書き出す
+// NULL(None)はCSVでは空文字として書き出す。
+// quote_all: trueのとき全ての値をダブルクォートで囲む(write_csv_streamingのquote_allと同じ挙動)。
+// falseのとき(既定)はカンマ・改行・"を含む値だけを囲む
 pub fn build_csv_from_rows(
     columns: &[PreparedColumn],
     rows: &[Vec<Option<String>>],
+    quote_all: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut writer = csv::Writer::from_writer(Vec::new());
+    let quote_style = if quote_all { csv::QuoteStyle::Always } else { csv::QuoteStyle::Necessary };
+    let mut writer = csv::WriterBuilder::new().quote_style(quote_style).from_writer(Vec::new());
     let headers: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     writer.write_record(&headers)?; // ヘッダー行
 
@@ -2100,7 +2104,7 @@ fn build_csv(
     columns: &[PreparedColumn],
     base_seed: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    build_csv_from_rows(columns, &generate_all_rows(row_count, columns, base_seed))
+    build_csv_from_rows(columns, &generate_all_rows(row_count, columns, base_seed), false)
 }
 
 // build_csv_from_rowsとの違いは、全行をメモリに載せてから一括で書き出すのではなく、
@@ -2410,7 +2414,8 @@ pub fn write_output(
     encoding: Encoding,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match format {
-        Format::Csv => write_text(&build_csv_from_rows(columns, rows)?, path, encoding),
+        // 複数形式同時出力の経路であり、CLIの--quote-allは(ドキュメント通り)ここには適用しない
+        Format::Csv => write_text(&build_csv_from_rows(columns, rows, false)?, path, encoding),
         Format::Sql => {
             let table_name = match table_name {
                 Some(t) => t,
@@ -2524,12 +2529,15 @@ fn write_xlsx_tables(
 }
 
 // 複数テーブルのとき、指定した形式について全テーブル分を書き出す。
-// 戻り値は書き込んだ(パス, 行数)の一覧(mainが成功メッセージを1行ずつ表示するために使う)
+// 戻り値は書き込んだ(パス, 行数)の一覧(mainが成功メッセージを1行ずつ表示するために使う)。
+// quote_all: Csv形式のときだけ使う(単一テーブルのwrite_csv_streamingと同じ意味。
+// sql/json/xlsxには影響しない)
 pub fn write_output_multi_table(
     format: Format,
     tables: &[GeneratedTable],
     base_path: &str,
     encoding: Encoding,
+    quote_all: bool,
 ) -> Result<Vec<(String, u32)>, Box<dyn std::error::Error>> {
     match format {
         Format::Csv | Format::Json => {
@@ -2550,7 +2558,7 @@ pub fn write_output_multi_table(
             let mut written = Vec::with_capacity(tables.len());
             for (table, path) in tables.iter().zip(paths) {
                 let text = match format {
-                    Format::Csv => build_csv_from_rows(table.columns, table.rows)?,
+                    Format::Csv => build_csv_from_rows(table.columns, table.rows, quote_all)?,
                     Format::Json => build_json_from_rows(table.columns, table.rows)?,
                     _ => unreachable!("csv/json以外はこの分岐に来ない"),
                 };
@@ -2618,6 +2626,54 @@ mod tests {
         assert_eq!(reloaded.tables.len(), 2);
         assert_eq!(reloaded.tables[0].table_name.as_deref(), Some("users"));
         assert_eq!(reloaded.tables[1].table_name.as_deref(), Some("orders"));
+    }
+
+    // 複数テーブル(tables:形式)のCSV出力でも、quote_all: trueで全ての値がダブルクォートで
+    // 囲まれることを確認する(以前はwrite_output_multi_tableにこの引数が無く、常にfalse相当だった)
+    #[test]
+    fn write_output_multi_table_csv_with_quote_all_true_quotes_every_field() {
+        let users_schema = schema_from_yaml(
+            "row_count: 1\ntable_name: users\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: fixed\n    value: \"山田 太郎\"\n",
+        );
+        let users_columns = prepare_columns(&users_schema).unwrap();
+        let users_rows = generate_all_rows(users_schema.row_count, &users_columns, 1);
+        let users_table = GeneratedTable { name: Some("users"), columns: &users_columns, rows: &users_rows };
+
+        let dir = std::env::temp_dir();
+        let base_path = dir.join("dummy_data_gen_test_multi_quote_all.csv");
+        let base_path_str = base_path.to_str().unwrap();
+
+        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, true).unwrap();
+
+        let written_path = table_file_path(base_path_str, "users");
+        let actual = std::fs::read_to_string(&written_path).unwrap();
+        assert_eq!(actual, "\"id\",\"name\"\n\"1\",\"山田 太郎\"\n");
+
+        let _ = std::fs::remove_file(&written_path);
+    }
+
+    // quote_all: false(既定)のときは、複数テーブルのCSV出力でも今まで通り
+    // 必要な値だけがクォートされることを確認する
+    #[test]
+    fn write_output_multi_table_csv_with_quote_all_false_only_quotes_when_necessary() {
+        let users_schema = schema_from_yaml(
+            "row_count: 1\ntable_name: users\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: fixed\n    value: \"山田 太郎\"\n",
+        );
+        let users_columns = prepare_columns(&users_schema).unwrap();
+        let users_rows = generate_all_rows(users_schema.row_count, &users_columns, 1);
+        let users_table = GeneratedTable { name: Some("users"), columns: &users_columns, rows: &users_rows };
+
+        let dir = std::env::temp_dir();
+        let base_path = dir.join("dummy_data_gen_test_multi_quote_none.csv");
+        let base_path_str = base_path.to_str().unwrap();
+
+        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, false).unwrap();
+
+        let written_path = table_file_path(base_path_str, "users");
+        let actual = std::fs::read_to_string(&written_path).unwrap();
+        assert_eq!(actual, "id,name\n1,山田 太郎\n");
+
+        let _ = std::fs::remove_file(&written_path);
     }
 
     #[test]
@@ -3514,7 +3570,10 @@ mod tests {
         );
         let columns = prepare_columns(&schema).unwrap();
         let rows = generate_all_rows(schema.row_count, &columns, 42);
-        assert_eq!(build_csv_from_rows(&columns, &rows).unwrap(), build_csv(schema.row_count, &columns, 42).unwrap());
+        assert_eq!(
+            build_csv_from_rows(&columns, &rows, false).unwrap(),
+            build_csv(schema.row_count, &columns, 42).unwrap()
+        );
     }
 
     #[test]
@@ -3536,7 +3595,7 @@ mod tests {
         );
         let columns = prepare_columns(&schema).unwrap();
         let rows = generate_all_rows(schema.row_count, &columns, 99);
-        let csv_text = build_csv_from_rows(&columns, &rows).unwrap();
+        let csv_text = build_csv_from_rows(&columns, &rows, false).unwrap();
         let json_text = build_json_from_rows(&columns, &rows).unwrap();
 
         let csv_names: Vec<&str> = csv_text.lines().skip(1).map(|l| l.split(',').nth(1).unwrap()).collect();
