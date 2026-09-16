@@ -765,7 +765,7 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 match unique_capacity(&kind) {
                     UniqueCapacity::Unsupported => {
                         return Err(format!(
-                            "列 \"{}\": このtypeはuniqueに対応していません(enum/boolean/integer/date/name_ja/last_name_ja/first_name_ja/phone_ja/phone_ja_landlineのみ対応)",
+                            "列 \"{}\": このtypeはuniqueに対応していません(enum/boolean/gender/blood_type/integer/date/name_ja/last_name_ja/first_name_ja/phone_ja/phone_ja_landlineのみ対応)",
                             c.name
                         )
                         .into());

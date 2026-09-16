@@ -197,7 +197,7 @@ columns:
 
 ### 「重複しない値」(unique)にできる種類
 
-`unique: true` を指定できるのは `enum` / `boolean` / `integer` / `date` の4種類のみです(`postal_code`や`phone_ja`などは組み合わせが多すぎる、または数えにくいため対応していません)。また、以下の場合はエラーになりますので、設定を見直してください。
+`unique: true` を指定できるのは `enum` / `boolean` / `gender` / `blood_type` / `integer` / `date` / `name_ja` / `last_name_ja` / `first_name_ja` / `phone_ja` / `phone_ja_landline` のみです(`postal_code`や`address_ja`などは組み合わせが多すぎる、または数えにくいため対応していません)。また、以下の場合はエラーになりますので、設定を見直してください。
 
 - 選べる値の種類が、作りたい件数より少ない(例: `boolean`は「true/false」の2種類しかないのに、5件分をuniqueにしようとした)
 - 選べる値の組み合わせが200万通りを超える(範囲を絞ってください)
