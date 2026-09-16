@@ -765,7 +765,7 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 match unique_capacity(&kind) {
                     UniqueCapacity::Unsupported => {
                         return Err(format!(
-                            "列 \"{}\": このtypeはuniqueに対応していません(enum/boolean/gender/blood_type/integer/date/name_ja/last_name_ja/first_name_ja/phone_ja/phone_ja_landlineのみ対応)",
+                            "列 \"{}\": このtypeはuniqueに対応していません(enum/boolean/gender/blood_type/integer/date/birth_date/name_ja/last_name_ja/first_name_ja/romaji_name/katakana_last_name/katakana_first_name/prefecture_ja/company_name_ja/department_ja/job_title_ja/credit_card_expiry/phone_ja/phone_ja_landline/postal_code/address_ja/uuid/ip_address/jwt/api_key/username/password/profile_image_url/credit_card_number/bank_account_number/product_sku/my_numberのみ対応)",
                             c.name
                         )
                         .into());
@@ -883,8 +883,10 @@ enum UniqueCapacity {
 }
 
 // unique制約を付けられる列タイプが取りうる値の組み合わせ数。
-// postal_code/address_ja/floatは組み合わせが不連続・計算しづらいため非対応のまま
-// (これらの値の重複を避けたい場合は、より小さい組み合わせ数のenum/integerで代用することを想定している)。
+// fixed(常に同じ値なので2行以上では原理的にunique不可能)・pattern(組み合わせ数の計算が複雑)・
+// float(桁数によって組み合わせ数が大きく変わり計算方法の検討が必要)・
+// city_ja/katakana_name/katakana_name_hankaku(直前の列を参照する型で、uniqueと組み合わせると
+// 参照関係の設計が複雑になる)・sequence/email(後述の通り、そもそも常に重複しないため不要)は非対応のまま。
 fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
     match kind {
         PreparedColumnType::Boolean => UniqueCapacity::Enumerable(2),
@@ -894,6 +896,8 @@ fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
             UniqueCapacity::Enumerable((*max as i128 - *min as i128 + 1) as u128)
         }
         PreparedColumnType::Date { span_days, .. } => UniqueCapacity::Enumerable(*span_days as u128 + 1),
+        // birth_dateはdateと同じ「start_days〜start_days+span_days」の日数分の組み合わせを持つ
+        PreparedColumnType::BirthDate { span_days, .. } => UniqueCapacity::Enumerable(*span_days as u128 + 1),
         // unique:trueのときは(重み付けの有無にかかわらず)全選択肢を重複なく列挙するので、
         // weightsは意味を持たない(README/CLAUDE.mdに明記。エラーにはせず単に無視する)
         PreparedColumnType::Enum { choices, .. } => UniqueCapacity::Enumerable(choices.len() as u128),
@@ -907,6 +911,14 @@ fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
         }
         PreparedColumnType::KatakanaLastName => UniqueCapacity::Enumerable(LAST_NAMES_KANA.len() as u128),
         PreparedColumnType::KatakanaFirstName => UniqueCapacity::Enumerable(FIRST_NAMES_KANA.len() as u128),
+        PreparedColumnType::PrefectureJa => UniqueCapacity::Enumerable(CITIES_BY_PREFECTURE.len() as u128),
+        PreparedColumnType::CompanyNameJa => {
+            UniqueCapacity::Enumerable((LAST_NAMES.len() * COMPANY_SUFFIXES.len()) as u128)
+        }
+        PreparedColumnType::DepartmentJa => UniqueCapacity::Enumerable(DEPARTMENTS.len() as u128),
+        PreparedColumnType::JobTitleJa => UniqueCapacity::Enumerable(JOB_TITLES.len() as u128),
+        // 「今日」から1〜5年後(5通り)×1〜12月(12通り)の60通り
+        PreparedColumnType::CreditCardExpiry => UniqueCapacity::Enumerable(60),
         // 携帯電話・固定電話は組み合わせ数(市外局番の数 × 10^8)が膨大でEnumerable方式では
         // 列挙しきれないが、実務で指定されるrow_count(最大100万)に対しては十分すぎるほど
         // 大きいため、Retry方式(値を作って重複チェック)で対応する
@@ -914,6 +926,39 @@ fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
         PreparedColumnType::PhoneJaLandline => {
             UniqueCapacity::Retry(PHONE_PREFIXES_LANDLINE.len() as u128 * 100_000_000)
         }
+        // 郵便番号(NNN-NNNN): 1000 × 10000 = 1000万通り
+        PreparedColumnType::PostalCode => UniqueCapacity::Retry(1000 * 10_000),
+        // 住所(1列): (都道府県ごとの市区町村数の合計) × 番地1(1〜19) × 番地2(1〜19)
+        PreparedColumnType::AddressJa => {
+            let total_cities: u128 =
+                CITIES_BY_PREFECTURE.iter().map(|(_, cities)| cities.len() as u128).sum();
+            UniqueCapacity::Retry(total_cities * 19 * 19)
+        }
+        // UUID v4(ランダムな16バイト=2^128通り)は実質衝突しないほど巨大。u128では2^128自体を
+        // 表現できない(最大値は2^128-1)ため、u128::MAXで代用する(row_countとの比較にしか
+        // 使わないので、この近似で実用上問題ない)
+        PreparedColumnType::Uuid => UniqueCapacity::Retry(u128::MAX),
+        // IPv4アドレス: 256^4 = 約42.9億通り
+        PreparedColumnType::IpAddress => UniqueCapacity::Retry(256u128.pow(4)),
+        // JWT風文字列・APIキーは64種類/62種類の文字集合から30文字以上組み立てるため、
+        // 正確な組み合わせ数はu128の範囲(約3.4×10^38)を超えてオーバーフローする。
+        // 実質衝突しないほど巨大であることが分かれば十分なのでu128::MAXで代用する
+        PreparedColumnType::Jwt => UniqueCapacity::Retry(u128::MAX),
+        PreparedColumnType::ApiKey => UniqueCapacity::Retry(u128::MAX),
+        // ローマ字の名前(20種類)+3桁の数字(1〜999) = 19,980通り
+        PreparedColumnType::Username => UniqueCapacity::Retry(FIRST_NAMES_ROMAJI.len() as u128 * 999),
+        // 68種類の文字から12文字 = 68^12通り(オーバーフローしない範囲で計算可能)
+        PreparedColumnType::Password => UniqueCapacity::Retry(68u128.pow(12)),
+        // サイズ3種類 × id(1〜999999) ≈ 300万通り
+        PreparedColumnType::ProfileImageUrl => UniqueCapacity::Retry(3 * 999_999),
+        // 先頭4固定+検査数字を除いた14桁がランダム = 10^14通り
+        PreparedColumnType::CreditCardNumber => UniqueCapacity::Retry(10u128.pow(14)),
+        // 7桁のゼロ埋め数字 = 10^7通り
+        PreparedColumnType::BankAccountNumber => UniqueCapacity::Retry(10u128.pow(7)),
+        // 36種類の文字(英大文字+数字)から8文字 = 36^8通り
+        PreparedColumnType::ProductSku => UniqueCapacity::Retry(36u128.pow(8)),
+        // 検査数字を除いた11桁がランダム = 10^11通り
+        PreparedColumnType::MyNumber => UniqueCapacity::Retry(10u128.pow(11)),
         _ => UniqueCapacity::Unsupported,
     }
 }
@@ -957,6 +1002,35 @@ fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
             .collect(),
         PreparedColumnType::KatakanaLastName => LAST_NAMES_KANA.iter().map(|s| s.to_string()).collect(),
         PreparedColumnType::KatakanaFirstName => FIRST_NAMES_KANA.iter().map(|s| s.to_string()).collect(),
+        // birth_dateはdateと全く同じ「start_days〜start_days+span_days」の日数分を列挙するだけ
+        PreparedColumnType::BirthDate { start_days, span_days, format } => (0..=*span_days)
+            .map(|offset| {
+                format_date(
+                    chrono::NaiveDate::from_num_days_from_ce_opt(start_days + offset as i32)
+                        .expect("span_daysの範囲内なので必ず有効な日付になる"),
+                    *format,
+                )
+            })
+            .collect(),
+        PreparedColumnType::PrefectureJa => {
+            CITIES_BY_PREFECTURE.iter().map(|(pref, _)| pref.to_string()).collect()
+        }
+        PreparedColumnType::CompanyNameJa => LAST_NAMES
+            .iter()
+            .flat_map(|stem| COMPANY_SUFFIXES.iter().map(move |suffix| format!("株式会社{}{}", stem, suffix)))
+            .collect(),
+        PreparedColumnType::DepartmentJa => DEPARTMENTS.iter().map(|s| s.to_string()).collect(),
+        PreparedColumnType::JobTitleJa => JOB_TITLES.iter().map(|s| s.to_string()).collect(),
+        // random_credit_card_expiryと同じ「今日」基準で、1〜5年後×1〜12月の60通りを列挙する
+        PreparedColumnType::CreditCardExpiry => {
+            use chrono::Datelike;
+            let today = chrono::Local::now().date_naive();
+            (1..=5)
+                .flat_map(|years_ahead| {
+                    (1..=12).map(move |month| format!("{:02}/{:02}", month, (today.year() + years_ahead) % 100))
+                })
+                .collect()
+        }
         _ => unreachable!("UniqueCapacity::Enumerable以外の型はここに来ない(prepare_columnsで弾いている)"),
     }
 }
@@ -3289,10 +3363,71 @@ mod tests {
         }
     }
 
+    // 今回unique対応を拡張した型(Enumerable方式・Retry方式あわせて18型。birth_dateは
+    // min_age/max_ageの指定が必要なので別テストにしている)について、それぞれ
+    // row_count分だけ重複なく生成できることをまとめて確認する。型ごとに個別のテスト関数を
+    // 18個書く代わりに、失敗時にどの型かをassertメッセージで分かるようにしている
+    #[test]
+    fn unique_newly_supported_types_produce_no_duplicates() {
+        let cases: &[(&str, u32)] = &[
+            ("prefecture_ja", 5),
+            ("company_name_ja", 10),
+            ("department_ja", 10),
+            ("job_title_ja", 10),
+            ("credit_card_expiry", 10),
+            ("postal_code", 50),
+            ("address_ja", 50),
+            ("uuid", 50),
+            ("ip_address", 50),
+            ("jwt", 20),
+            ("api_key", 50),
+            ("username", 50),
+            ("password", 50),
+            ("profile_image_url", 50),
+            ("credit_card_number", 50),
+            ("bank_account_number", 50),
+            ("product_sku", 50),
+            ("my_number", 50),
+        ];
+
+        for (type_name, row_count) in cases {
+            let yaml = format!("row_count: {row_count}\ncolumns:\n  - name: v\n    type: {type_name}\n    unique: true\n");
+            let schema = schema_from_yaml(&yaml);
+            let mut columns =
+                prepare_columns(&schema).unwrap_or_else(|e| panic!("{type_name}: prepare_columns失敗: {e}"));
+            resolve_unique_pools(&mut columns, schema.row_count, 42);
+            let rows = generate_all_rows(schema.row_count, &columns, 42);
+            let values: std::collections::HashSet<_> = rows.iter().map(|r| r[0].clone()).collect();
+            assert_eq!(values.len(), *row_count as usize, "{type_name}: unique指定で重複が生じた");
+        }
+    }
+
+    #[test]
+    fn unique_birth_date_produces_no_duplicates() {
+        let schema = schema_from_yaml(
+            "row_count: 10\ncolumns:\n  - name: b\n    type: birth_date\n    min_age: 18\n    max_age: 65\n    unique: true\n",
+        );
+        let mut columns = prepare_columns(&schema).unwrap();
+        resolve_unique_pools(&mut columns, schema.row_count, 42);
+        let rows = generate_all_rows(schema.row_count, &columns, 42);
+        let values: std::collections::HashSet<_> = rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(values.len(), 10, "birth_date: unique指定で重複が生じた");
+    }
+
+    #[test]
+    fn prepare_columns_rejects_unique_prefecture_ja_when_row_count_exceeds_capacity() {
+        // CITIES_BY_PREFECTUREは5都道府県分しか無いため、6行以上のunique指定はエラーになる
+        let schema =
+            schema_from_yaml("row_count: 6\ncolumns:\n  - name: p\n    type: prefecture_ja\n    unique: true\n");
+        assert!(prepare_columns(&schema).is_err());
+    }
+
     #[test]
     fn prepare_columns_rejects_unique_on_unsupported_type() {
+        // fixedは常に同じ値を返す型なので、2行以上でunique:trueを付けると原理的に
+        // 満たせない(このtypeをuniqueの非対応例として使う。address_ja等は今はRetry方式で対応済み)
         let schema = schema_from_yaml(
-            "row_count: 5\ncolumns:\n  - name: a\n    type: address_ja\n    unique: true\n",
+            "row_count: 5\ncolumns:\n  - name: a\n    type: fixed\n    value: x\n    unique: true\n",
         );
         assert!(prepare_columns(&schema).is_err());
     }
