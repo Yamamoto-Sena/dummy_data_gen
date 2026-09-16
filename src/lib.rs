@@ -178,6 +178,11 @@ pub enum ColumnType {
     Gender,
     // "A型"/"O型"/"B型"/"AB型"を日本人の血液型分布に近い比率(4:3:2:1目安)で重み付けして返す
     BloodType,
+    // 正規表現に似た簡易パターンから値を生成する(例: "[A-Z]{3}-[0-9]{4}" → "ABC-1234")。
+    // 文法の詳細はcompile_patternのコメントを参照
+    Pattern {
+        pattern: String,
+    },
     Date {
         start: String,
         end: String,
@@ -210,6 +215,12 @@ pub enum ColumnType {
     // 本物の署名検証はできない「それっぽい形」のダミー値(ヘッダー部分は固定文字列)
     Jwt,
     ApiKey,
+    // ローマ字氏名の名(FIRST_NAMES_ROMAJI)を小文字にしたもの+3桁の数字(例: "taro123")
+    Username,
+    // 英大文字/小文字/数字/記号を混ぜた12文字(本物のパスワードではなくダミー値)
+    Password,
+    // プレースホルダー画像サービス(placehold.jp)のURL文字列。実際に画像を取得したりはしない
+    ProfileImageUrl,
     // 16桁、Luhnアルゴリズムで検査数字(末尾1桁)を計算する
     CreditCardNumber,
     // "MM/YY"形式(今日から1〜5年後のランダムな年月)
@@ -347,6 +358,7 @@ pub enum PreparedColumnType {
     Boolean,
     Gender,
     BloodType,
+    Pattern { pieces: Vec<PatternPiece> },
     Date { start_days: i32, span_days: i64, format: DateFormat },
     BirthDate { start_days: i32, span_days: i64, format: DateFormat },
     PostalCode,
@@ -364,6 +376,9 @@ pub enum PreparedColumnType {
     IpAddress,
     Jwt,
     ApiKey,
+    Username,
+    Password,
+    ProfileImageUrl,
     CreditCardNumber,
     CreditCardExpiry,
     BankAccountNumber,
@@ -382,6 +397,161 @@ pub enum PreparedColumnType {
         // Arcなのは、同じ親列を複数の子列が参照しても実体を1つで共有するため
         pool: Option<Arc<Vec<String>>>,
     },
+}
+
+// patternの1個分(文字または文字クラス)と、その繰り返し回数の範囲。
+// 例えば "[A-Z]{3}" は「文字クラス[A-Z]を3回繰り返す」なのでPatternPiece{
+// chars: ['A'..'Z'の26文字], min_repeat: 3, max_repeat: 3 }になる。
+// 文字クラスは(否定"^"も含めて)全て「実際に選べる文字の一覧」に展開してから持つので、
+// 生成時はcharsからrng.gen_range(0..chars.len())で1文字選ぶだけでよい
+pub struct PatternPiece {
+    chars: Vec<char>,
+    min_repeat: u32,
+    max_repeat: u32,
+}
+
+// {n,}や*のような上限の無い量指定子の、実務上十分な繰り返し回数の上限
+// (無制限にすると1文字だけの列が数十文字になり得て、値として不自然になるため)
+const PATTERN_MAX_UNBOUNDED_REPEAT: u32 = 12;
+
+// patternで使える否定文字クラス"[^...]"の元になる文字の範囲(印字可能なASCII、空白を除く)。
+// 日本語など全角文字はpatternでは非対応(半角の記号・英数字を組み合わせる用途を想定しているため)
+fn pattern_default_charset() -> Vec<char> {
+    (0x21u8..=0x7eu8).map(|b| b as char).collect()
+}
+
+/// 正規表現に似た簡易パターン文字列を、生成時にすぐ使える`Vec<PatternPiece>`に変換する。
+/// 対応する構文:
+/// - 通常の文字はそのまま1文字のリテラルになる(例: "ABC" → A,B,C)
+/// - `\` の次の1文字はリテラル文字として扱う(例: `\-`は記号の"-"そのもの、`\\`は"\")
+/// - `[...]`は文字クラス。`a-z`のような範囲、`0-9a-fA-F`のような複数範囲の組み合わせ、
+///   先頭の`^`で「それ以外の印字可能なASCII文字」を意味する否定に対応する
+/// - 直前の1文字またはクラスに続けて量指定子を書ける: `?`(0か1回)/`*`(0〜12回)/
+///   `+`(1〜12回)/`{n}`(ちょうどn回)/`{n,}`(n〜12回)/`{n,m}`(n〜m回)
+/// - グループ化`(...)`や選択`|`には対応しない(必要になれば別途拡張する)
+// 直前の1文字/文字クラス(pending)を、量指定子が無いまま次の要素が来た場合に
+// 「ちょうど1回」のPatternPieceとして確定させる(pendingが無ければ何もしない)
+fn flush_default(pending: &mut Option<Vec<char>>, pieces: &mut Vec<PatternPiece>) {
+    if let Some(chars) = pending.take() {
+        pieces.push(PatternPiece { chars, min_repeat: 1, max_repeat: 1 });
+    }
+}
+
+// 量指定子(?,*,+,{...})を読んだときに、直前のpendingをその繰り返し回数で確定させる。
+// pendingが無い(量指定子の直前に文字が無い)場合はエラーにする
+fn flush_quantified(
+    pending: &mut Option<Vec<char>>,
+    pieces: &mut Vec<PatternPiece>,
+    min: u32,
+    max: u32,
+) -> Result<(), String> {
+    let chars = pending.take().ok_or_else(|| "量指定子(?,*,+,{...})の直前に文字が無い".to_string())?;
+    pieces.push(PatternPiece { chars, min_repeat: min, max_repeat: max });
+    Ok(())
+}
+
+fn compile_pattern(pattern: &str) -> Result<Vec<PatternPiece>, String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut pieces = Vec::new();
+    let mut i = 0;
+
+    // 直前に確定した「1文字ぶんの候補一覧」を、量指定子が来るまで一時的に持っておく
+    let mut pending: Option<Vec<char>> = None;
+
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 1;
+                let escaped = *chars.get(i).ok_or_else(|| "パターンの末尾が\\で終わっている".to_string())?;
+                flush_default(&mut pending, &mut pieces);
+                pending = Some(vec![escaped]);
+                i += 1;
+            }
+            '[' => {
+                i += 1;
+                flush_default(&mut pending, &mut pieces);
+                let negate = chars.get(i) == Some(&'^');
+                if negate {
+                    i += 1;
+                }
+                let mut set = std::collections::BTreeSet::new();
+                while chars.get(i) != Some(&']') {
+                    let start = *chars.get(i).ok_or_else(|| "文字クラス[...]が]で閉じられていない".to_string())?;
+                    if chars.get(i + 1) == Some(&'-') && chars.get(i + 2).is_some_and(|c| *c != ']') {
+                        let end = chars[i + 2];
+                        if start > end {
+                            return Err(format!("文字クラスの範囲が逆順になっている: {start}-{end}"));
+                        }
+                        for c in start..=end {
+                            set.insert(c);
+                        }
+                        i += 3;
+                    } else {
+                        set.insert(start);
+                        i += 1;
+                    }
+                }
+                i += 1; // ']'を読み飛ばす
+                let resolved: Vec<char> = if negate {
+                    pattern_default_charset().into_iter().filter(|c| !set.contains(c)).collect()
+                } else {
+                    set.into_iter().collect()
+                };
+                if resolved.is_empty() {
+                    return Err("文字クラス[...]の候補が0文字になった".to_string());
+                }
+                pending = Some(resolved);
+            }
+            '?' => {
+                flush_quantified(&mut pending, &mut pieces, 0, 1)?;
+                i += 1;
+            }
+            '*' => {
+                flush_quantified(&mut pending, &mut pieces, 0, PATTERN_MAX_UNBOUNDED_REPEAT)?;
+                i += 1;
+            }
+            '+' => {
+                flush_quantified(&mut pending, &mut pieces, 1, PATTERN_MAX_UNBOUNDED_REPEAT)?;
+                i += 1;
+            }
+            '{' => {
+                let close = chars[i..].iter().position(|c| *c == '}').ok_or_else(|| "{が}で閉じられていない".to_string())?;
+                let body: String = chars[i + 1..i + close].iter().collect();
+                let (min, max) = match body.split_once(',') {
+                    Some((min, "")) => {
+                        let min = min.parse::<u32>().map_err(|_| format!("不正な繰り返し回数指定: {{{body}}}"))?;
+                        (min, PATTERN_MAX_UNBOUNDED_REPEAT.max(min))
+                    }
+                    Some((min, max)) => {
+                        let min = min.parse::<u32>().map_err(|_| format!("不正な繰り返し回数指定: {{{body}}}"))?;
+                        let max = max.parse::<u32>().map_err(|_| format!("不正な繰り返し回数指定: {{{body}}}"))?;
+                        (min, max)
+                    }
+                    None => {
+                        let n = body.parse::<u32>().map_err(|_| format!("不正な繰り返し回数指定: {{{body}}}"))?;
+                        (n, n)
+                    }
+                };
+                if min > max {
+                    return Err(format!("繰り返し回数の範囲が逆順になっている: {{{body}}}"));
+                }
+                flush_quantified(&mut pending, &mut pieces, min, max)?;
+                i += close + 1;
+            }
+            ']' | '}' => return Err(format!("対応する開き括弧の無い'{}'がある", chars[i])),
+            c => {
+                flush_default(&mut pending, &mut pieces);
+                pending = Some(vec![c]);
+                i += 1;
+            }
+        }
+    }
+    flush_default(&mut pending, &mut pieces);
+
+    if pieces.is_empty() {
+        return Err("patternが空文字列になっている".to_string());
+    }
+    Ok(pieces)
 }
 
 // 外部キーの値を、出力形式ごとにどう扱うか(参照先の列タイプから決まる)
@@ -474,6 +644,10 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 ColumnType::Boolean => PreparedColumnType::Boolean,
                 ColumnType::Gender => PreparedColumnType::Gender,
                 ColumnType::BloodType => PreparedColumnType::BloodType,
+                ColumnType::Pattern { pattern } => {
+                    let pieces = compile_pattern(pattern).map_err(|e| format!("列 \"{}\": {}", c.name, e))?;
+                    PreparedColumnType::Pattern { pieces }
+                }
                 ColumnType::Date { start, end, format } => {
                     let start_date = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
                         .map_err(|e| format!("列 \"{}\": start の日付形式が不正です({})", c.name, e))?;
@@ -525,6 +699,9 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 ColumnType::IpAddress => PreparedColumnType::IpAddress,
                 ColumnType::Jwt => PreparedColumnType::Jwt,
                 ColumnType::ApiKey => PreparedColumnType::ApiKey,
+                ColumnType::Username => PreparedColumnType::Username,
+                ColumnType::Password => PreparedColumnType::Password,
+                ColumnType::ProfileImageUrl => PreparedColumnType::ProfileImageUrl,
                 ColumnType::CreditCardNumber => PreparedColumnType::CreditCardNumber,
                 ColumnType::CreditCardExpiry => PreparedColumnType::CreditCardExpiry,
                 ColumnType::BankAccountNumber => PreparedColumnType::BankAccountNumber,
@@ -1386,6 +1563,29 @@ fn random_api_key(rng: &mut impl Rng) -> String {
     format!("sk_{body}")
 }
 
+// FIRST_NAMES_ROMAJI(名のローマ字)を小文字にしたもの+3桁の数字。
+// name_ja列との連動はしない独立乱数(katakana_last_name等と同じ考え方)
+fn random_username(rng: &mut impl Rng) -> String {
+    let first = FIRST_NAMES_ROMAJI[rng.gen_range(0..FIRST_NAMES_ROMAJI.len())].to_lowercase();
+    let number = rng.gen_range(1..1000);
+    format!("{first}{number}")
+}
+
+const PASSWORD_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&";
+
+// 本物のパスワードではなく、それっぽい形の12文字のダミー値(random_api_keyと同じ考え方)
+fn random_password(rng: &mut impl Rng) -> String {
+    (0..12).map(|_| PASSWORD_CHARS[rng.gen_range(0..PASSWORD_CHARS.len())] as char).collect()
+}
+
+// プレースホルダー画像サービス(placehold.jp)のURL文字列を組み立てるだけで、
+// 実際に画像を取得したりHTTP通信をしたりはしない(あくまで「それらしい形」の文字列)
+fn random_profile_image_url(rng: &mut impl Rng) -> String {
+    let size = [100, 150, 200][rng.gen_range(0..3)];
+    let id: u32 = rng.gen_range(1..999999);
+    format!("https://placehold.jp/{size}x{size}.png?id={id}")
+}
+
 // Luhnアルゴリズムで検査数字(0-9)を計算する。digitsは検査数字を除いた本体(左から順)。
 // 右端(digitsの最後の要素)から数えて奇数番目(1番目, 3番目, ...)の桁を2倍し、
 // 2倍した結果が9を超えたら9を引いてから合計する(これが検査数字を末尾に付けたときに
@@ -1556,6 +1756,17 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
             let pairs = [("A型", 4.0_f64), ("O型", 3.0), ("B型", 2.0), ("AB型", 1.0)];
             pairs.choose_weighted(rng, |(_, weight)| *weight).unwrap().0.to_string()
         }
+        PreparedColumnType::Pattern { pieces } => {
+            let mut value = String::new();
+            for piece in pieces {
+                let repeat =
+                    if piece.min_repeat == piece.max_repeat { piece.min_repeat } else { rng.gen_range(piece.min_repeat..=piece.max_repeat) };
+                for _ in 0..repeat {
+                    value.push(piece.chars[rng.gen_range(0..piece.chars.len())]);
+                }
+            }
+            value
+        }
         PreparedColumnType::Date { start_days, span_days, format } => {
             let offset = if *span_days == 0 { 0 } else { rng.gen_range(0..=*span_days) };
             let date = chrono::NaiveDate::from_num_days_from_ce_opt(*start_days + offset as i32)
@@ -1589,6 +1800,9 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::IpAddress => random_ip_address(rng),
         PreparedColumnType::Jwt => random_jwt(rng),
         PreparedColumnType::ApiKey => random_api_key(rng),
+        PreparedColumnType::Username => random_username(rng),
+        PreparedColumnType::Password => random_password(rng),
+        PreparedColumnType::ProfileImageUrl => random_profile_image_url(rng),
         PreparedColumnType::CreditCardNumber => random_credit_card_number(rng),
         PreparedColumnType::CreditCardExpiry => random_credit_card_expiry(rng),
         PreparedColumnType::BankAccountNumber => random_bank_account_number(rng),
@@ -1654,6 +1868,10 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
             | PreparedColumnType::Fixed { .. }
             | PreparedColumnType::Gender
             | PreparedColumnType::BloodType
+            | PreparedColumnType::Pattern { .. }
+            | PreparedColumnType::Username
+            | PreparedColumnType::Password
+            | PreparedColumnType::ProfileImageUrl
     )
 }
 
@@ -2611,6 +2829,30 @@ mod tests {
     }
 
     #[test]
+    fn random_username_is_lowercase_name_plus_number() {
+        let mut rng = row_rng(1, 1);
+        let value = random_username(&mut rng);
+        assert!(value.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(value.chars().any(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn random_password_has_expected_length() {
+        let mut rng = row_rng(1, 1);
+        let value = random_password(&mut rng);
+        assert_eq!(value.chars().count(), 12);
+    }
+
+    #[test]
+    fn random_profile_image_url_has_placehold_jp_format() {
+        let mut rng = row_rng(1, 1);
+        let value = random_profile_image_url(&mut rng);
+        assert!(value.starts_with("https://placehold.jp/"));
+        assert!(value.contains("x"));
+        assert!(value.contains(".png?id="));
+    }
+
+    #[test]
     fn luhn_check_digit_matches_known_example() {
         // "4111111111111111"(有名なVisaテストカード番号、16桁、Luhn検査済み)の
         // 先頭15桁から検査数字(16桁目)を再計算し、実際の16桁目と一致するか確認する
@@ -2711,6 +2953,84 @@ mod tests {
         let rows = generate_all_rows(schema.row_count, &columns, 42);
         let values: std::collections::HashSet<_> = rows.iter().map(|r| r[0].clone()).collect();
         assert_eq!(values.len(), 2, "genderのunique指定で2行とも異なる値になるはず");
+    }
+
+    #[test]
+    fn compile_pattern_literal_and_escape() {
+        let pieces = compile_pattern(r"AB\-C").unwrap();
+        let joined: String = pieces.iter().map(|p| p.chars[0]).collect();
+        assert_eq!(joined, "AB-C");
+        assert!(pieces.iter().all(|p| p.min_repeat == 1 && p.max_repeat == 1));
+    }
+
+    #[test]
+    fn compile_pattern_character_class_with_range() {
+        let pieces = compile_pattern("[A-C]").unwrap();
+        assert_eq!(pieces.len(), 1);
+        let mut chars = pieces[0].chars.clone();
+        chars.sort();
+        assert_eq!(chars, vec!['A', 'B', 'C']);
+    }
+
+    #[test]
+    fn compile_pattern_negated_class_excludes_listed_chars() {
+        let pieces = compile_pattern("[^A-Z]").unwrap();
+        assert!(!pieces[0].chars.contains(&'M'));
+        assert!(pieces[0].chars.contains(&'a')); // 小文字は除外対象に入れていないので残る
+        assert!(pieces[0].chars.contains(&'5'));
+    }
+
+    #[test]
+    fn compile_pattern_quantifiers() {
+        assert_eq!(compile_pattern("A?").unwrap()[0].min_repeat, 0);
+        assert_eq!(compile_pattern("A?").unwrap()[0].max_repeat, 1);
+        assert_eq!(compile_pattern("A+").unwrap()[0].min_repeat, 1);
+        let (min3, max3) = { let p = compile_pattern("A{3}").unwrap(); (p[0].min_repeat, p[0].max_repeat) };
+        assert_eq!((min3, max3), (3, 3));
+        let (min2, max5) = { let p = compile_pattern("A{2,5}").unwrap(); (p[0].min_repeat, p[0].max_repeat) };
+        assert_eq!((min2, max5), (2, 5));
+    }
+
+    #[test]
+    fn compile_pattern_rejects_dangling_quantifier() {
+        assert!(compile_pattern("*").is_err());
+    }
+
+    #[test]
+    fn compile_pattern_rejects_unclosed_bracket() {
+        assert!(compile_pattern("[A-Z").is_err());
+    }
+
+    #[test]
+    fn compile_pattern_rejects_reversed_range() {
+        assert!(compile_pattern("[Z-A]").is_err());
+    }
+
+    #[test]
+    fn compile_pattern_rejects_empty_pattern() {
+        assert!(compile_pattern("").is_err());
+    }
+
+    #[test]
+    fn generate_value_pattern_matches_expected_shape() {
+        let pieces = compile_pattern("[A-Z]{3}-[0-9]{4}").unwrap();
+        let mut rng = row_rng(42, 1);
+        let value = generate_value(&PreparedColumnType::Pattern { pieces }, 1, &mut rng);
+        let re_shape = value.len() == 8
+            && value.as_bytes()[3] == b'-'
+            && value[..3].chars().all(|c| c.is_ascii_uppercase())
+            && value[4..].chars().all(|c| c.is_ascii_digit());
+        assert!(re_shape, "生成された値がパターンの形になっていない: {value}");
+    }
+
+    #[test]
+    fn prepare_columns_rejects_invalid_pattern() {
+        let schema: Schema = serde_json::from_value(serde_json::json!({
+            "row_count": 1,
+            "columns": [{ "name": "code", "type": "pattern", "pattern": "[A-Z" }]
+        }))
+        .unwrap();
+        assert!(prepare_columns(&schema).is_err());
     }
 
     #[test]
