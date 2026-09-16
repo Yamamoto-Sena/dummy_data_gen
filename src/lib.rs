@@ -174,6 +174,10 @@ pub enum ColumnType {
         decimals: u32,
     },
     Boolean,
+    // "男性"または"女性"を50%ずつのランダムで返す
+    Gender,
+    // "A型"/"O型"/"B型"/"AB型"を日本人の血液型分布に近い比率(4:3:2:1目安)で重み付けして返す
+    BloodType,
     Date {
         start: String,
         end: String,
@@ -341,6 +345,8 @@ pub enum PreparedColumnType {
     Integer { min: i64, max: i64 },
     Float { min: f64, max: f64, decimals: u32 },
     Boolean,
+    Gender,
+    BloodType,
     Date { start_days: i32, span_days: i64, format: DateFormat },
     BirthDate { start_days: i32, span_days: i64, format: DateFormat },
     PostalCode,
@@ -466,6 +472,8 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                     PreparedColumnType::Float { min: *min, max: *max, decimals: *decimals }
                 }
                 ColumnType::Boolean => PreparedColumnType::Boolean,
+                ColumnType::Gender => PreparedColumnType::Gender,
+                ColumnType::BloodType => PreparedColumnType::BloodType,
                 ColumnType::Date { start, end, format } => {
                     let start_date = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
                         .map_err(|e| format!("列 \"{}\": start の日付形式が不正です({})", c.name, e))?;
@@ -703,6 +711,8 @@ enum UniqueCapacity {
 fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
     match kind {
         PreparedColumnType::Boolean => UniqueCapacity::Enumerable(2),
+        PreparedColumnType::Gender => UniqueCapacity::Enumerable(2),
+        PreparedColumnType::BloodType => UniqueCapacity::Enumerable(4),
         PreparedColumnType::Integer { min, max } => {
             UniqueCapacity::Enumerable((*max as i128 - *min as i128 + 1) as u128)
         }
@@ -740,6 +750,10 @@ const UNIQUE_CAPACITY_CAP: u128 = 2_000_000;
 fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
     match kind {
         PreparedColumnType::Boolean => vec!["true".to_string(), "false".to_string()],
+        PreparedColumnType::Gender => vec!["男性".to_string(), "女性".to_string()],
+        PreparedColumnType::BloodType => {
+            vec!["A型".to_string(), "O型".to_string(), "B型".to_string(), "AB型".to_string()]
+        }
         PreparedColumnType::Integer { min, max } => (*min..=*max).map(|v| v.to_string()).collect(),
         PreparedColumnType::Date { start_days, span_days, format } => (0..=*span_days)
             .map(|offset| {
@@ -1536,6 +1550,12 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
             format!("{:.*}", *decimals as usize, value)
         }
         PreparedColumnType::Boolean => rng.gen_bool(0.5).to_string(),
+        PreparedColumnType::Gender => if rng.gen_bool(0.5) { "男性".to_string() } else { "女性".to_string() },
+        // 日本人の血液型分布の目安(A:O:B:AB ≒ 4:3:2:1)で重み付け
+        PreparedColumnType::BloodType => {
+            let pairs = [("A型", 4.0_f64), ("O型", 3.0), ("B型", 2.0), ("AB型", 1.0)];
+            pairs.choose_weighted(rng, |(_, weight)| *weight).unwrap().0.to_string()
+        }
         PreparedColumnType::Date { start_days, span_days, format } => {
             let offset = if *span_days == 0 { 0 } else { rng.gen_range(0..=*span_days) };
             let date = chrono::NaiveDate::from_num_days_from_ce_opt(*start_days + offset as i32)
@@ -1632,6 +1652,8 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
             | PreparedColumnType::MyNumber
             | PreparedColumnType::Enum { .. }
             | PreparedColumnType::Fixed { .. }
+            | PreparedColumnType::Gender
+            | PreparedColumnType::BloodType
     )
 }
 
@@ -2653,6 +2675,42 @@ mod tests {
         let mut rng = row_rng(42, 1);
         let value = generate_value(&PreparedColumnType::Boolean, 1, &mut rng);
         assert!(value == "true" || value == "false");
+    }
+
+    #[test]
+    fn generate_value_gender_is_male_or_female() {
+        let mut rng = row_rng(42, 1);
+        let value = generate_value(&PreparedColumnType::Gender, 1, &mut rng);
+        assert!(value == "男性" || value == "女性");
+    }
+
+    #[test]
+    fn generate_value_blood_type_is_one_of_four_types() {
+        let mut rng = row_rng(42, 1);
+        let value = generate_value(&PreparedColumnType::BloodType, 1, &mut rng);
+        assert!(["A型", "O型", "B型", "AB型"].contains(&value.as_str()));
+    }
+
+    #[test]
+    fn gender_and_blood_type_are_quoted_as_text_in_sql() {
+        assert!(is_text_column(&PreparedColumnType::Gender));
+        assert!(is_text_column(&PreparedColumnType::BloodType));
+        assert_eq!(sql_literal(&PreparedColumnType::Gender, "男性"), "'男性'");
+        assert_eq!(sql_literal(&PreparedColumnType::BloodType, "A型"), "'A型'");
+    }
+
+    #[test]
+    fn unique_gender_produces_no_duplicates() {
+        let schema: Schema = serde_json::from_value(serde_json::json!({
+            "row_count": 2,
+            "columns": [{ "name": "gender", "type": "gender", "unique": true }]
+        }))
+        .unwrap();
+        let mut columns = prepare_columns(&schema).unwrap();
+        resolve_unique_pools(&mut columns, schema.row_count, 42);
+        let rows = generate_all_rows(schema.row_count, &columns, 42);
+        let values: std::collections::HashSet<_> = rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(values.len(), 2, "genderのunique指定で2行とも異なる値になるはず");
     }
 
     #[test]
