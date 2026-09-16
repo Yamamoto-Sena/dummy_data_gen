@@ -127,10 +127,11 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 
 列に `unique: true` を付けると、その列の値が行間で重複しないようにする。対応している型は以下の通り。
 
-- 組み合わせ数が少なく全列挙できる型: `enum` / `boolean` / `gender`(2通り) / `blood_type`(4通り) / `integer` / `date` / `birth_date`(dateと同じ日数分) / `name_ja`(姓30×名20=600通り) / `last_name_ja`(30通り) / `first_name_ja`(20通り) / `romaji_name`(600通り) / `katakana_last_name`(30通り) / `katakana_first_name`(20通り) / `prefecture_ja`(都道府県の登録数通り) / `company_name_ja`(姓30×会社の種類8=240通り) / `department_ja`(18通り) / `job_title_ja`(17通り) / `credit_card_expiry`(1〜5年後×1〜12月=60通り)(`enum`に`weights`を指定していても、`unique: true`のときは全選択肢を重複なく列挙するだけなので`weights`は無視される)
+- 組み合わせ数が少なく全列挙できる型: `enum` / `boolean` / `gender`(2通り) / `blood_type`(4通り) / `integer` / `date` / `birth_date`(dateと同じ日数分) / `name_ja`(姓30×名20=600通り) / `last_name_ja`(30通り) / `first_name_ja`(20通り) / `romaji_name`(600通り) / `katakana_last_name`(30通り) / `katakana_first_name`(20通り) / `prefecture_ja`(都道府県の登録数通り) / `company_name_ja`(姓30×会社の種類8=240通り) / `department_ja`(18通り) / `job_title_ja`(17通り) / `credit_card_expiry`(1〜5年後×1〜12月=60通り) / `fixed`(常に同じ値なので組み合わせは1通り。`row_count: 1`のときだけunique指定が成立し、2行以上を指定すると他の型と同じ「組み合わせが足りない」エラーになる)(`enum`に`weights`を指定していても、`unique: true`のときは全選択肢を重複なく列挙するだけなので`weights`は無視される)
 - 組み合わせ数が膨大(だが十分すぎるほど大きい)ため、値を作っては重複チェックし被ったら作り直す方式で対応する型: `phone_ja` / `phone_ja_landline` / `postal_code` / `address_ja` / `uuid` / `ip_address` / `jwt` / `api_key` / `username` / `password` / `profile_image_url` / `credit_card_number` / `bank_account_number` / `product_sku` / `my_number`
+- `float`は`min`/`max`/`decimals`(小数点以下の桁数)から組み合わせ数を自動計算し、200万通り以下なら上の「全列挙」方式、それより多ければ「作っては重複チェック」方式のどちらかに自動的に振り分けられる(例: `min: 0, max: 1, decimals: 1`なら11通りで全列挙、`min: 0, max: 100万, decimals: 2`のような広い範囲なら重複チェック方式になる)
 - `sequence` / `email` はそもそも仕組み上値が絶対に重複しない(`sequence`は連番そのもの、`email`は`user{連番}@ドメイン`)ため、`unique`を付ける必要が無く、`unique`自体に対応していない
-- それ以外(`fixed`(常に同じ値を返すため2行以上では原理的に不可能)/`pattern`(組み合わせ数の計算が複雑)/`float`(桁数によって組み合わせ数が大きく変わるため)/`city_ja`・`katakana_name`・`katakana_name_hankaku`(直前の列を参照して値を選ぶため`unique`との組み合わせが複雑)/`foreign_key`(1つの親の値を複数の子行が参照するのが外部キーの通常の挙動のため))は非対応。値の重複を避けたい場合は、より小さい組み合わせ数の`enum`/`integer`で代用することを想定している
+- それ以外(`pattern`(組み合わせ数の計算が複雑)/`city_ja`・`katakana_name`・`katakana_name_hankaku`(直前の列を参照して値を選ぶため`unique`との組み合わせが複雑)/`foreign_key`(1つの親の値を複数の子行が参照するのが外部キーの通常の挙動のため))は非対応。値の重複を避けたい場合は、より小さい組み合わせ数の`enum`/`integer`で代用することを想定している
 
 以下の場合はエラーで停止する。
 

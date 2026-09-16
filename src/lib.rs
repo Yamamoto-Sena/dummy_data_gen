@@ -1,3 +1,27 @@
+// dummy_data_genの生成ロジック本体(エンジン部分)。CLI(main.rs)からも、
+// dummygen_jp_gui(Tauri GUI・ブラウザ版サーバー)からも、このファイルの`pub`関数を
+// ライブラリとして呼び出す形で使われる。ここには生成ロジックの入口が3段階ある。
+//   1. `load_schema`: schema.yamlを読み込み、テーブル定義(Schema/SchemaFile)にする
+//   2. `prepare_columns`/`prepare_tables`: 列定義を検証し、生成に使う実行時の形(PreparedColumn)に変換する
+//   3. `generate_all_rows`/`write_csv_streaming`等: 実際に行データを作り、CSV/SQL/JSON/Excelとして書き出す
+// 詳しい設計判断の背景は同じフォルダのCLAUDE.mdにまとめてある。
+//
+// ここからは、この後のコードを読むうえで最初につまずきやすいRustの基本構文を先にまとめておく。
+//   - `use ○○::△△;`: 他のファイル(モジュール)や外部ライブラリ(クレート)にある機能を、
+//     このファイルの中で名前だけで使えるようにする宣言。他の言語のimportに近い
+//   - `struct`: 複数の値をひとまとめにした「型」を作る仕組み(他の言語のクラス/構造体に近い)
+//   - `enum`: 「決まった選択肢のうちどれか1つ」を表す型(例: Format::Csv/Sql/Json/Xlsxのどれか)
+//   - `impl 型名 { ... }`: その型に関数(メソッド)や、他のトレイト(後述)の実装をひも付ける場所
+//   - `pub`: 他のファイルからも見える(公開されている)という印。無いとこのファイルの中だけで使える
+//   - `#[derive(...)]`: そのstruct/enumに、決まったよくある機能を自動で追加してもらう目印
+//     (例: Cloneなら複製できるようにする、Deserializeなら「YAML/JSONから読み込めるようにする」)
+//   - `Option<T>`: 「値があるかもしれないし、無いかもしれない」ことを表す型。値があるときはSome(値)、
+//     無いときはNoneになる(他の言語のnullに近いが、Rustでは必ずこの型を通して明示的に扱う)
+//   - `Vec<T>`: 同じ型の値を可変長で並べたリスト(配列)
+//   - `Result<T, E>`: 「成功したらOk(値)、失敗したらErr(エラー)」のどちらかを表す型。
+//     関数の戻り値としてよく使われ、エラーが起きうる処理には基本的にこの型を使う
+//   - `?`演算子: `Result`を返す式の直後に付けると、「Errだったらこの関数もそこで即座にErrを
+//     返して終わる、Okだったら中身の値を取り出して続きを実行する」という省略記法になる
 use chrono::Datelike;
 use clap::ValueEnum;
 use rand::rngs::SmallRng;
@@ -9,13 +33,23 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
-// 行番号ごとに独立したRNGを作る。base_seedが同じなら常に同じ値になるため、
-// 並列実行(rayon)でどのスレッドがどの行を処理しても結果が変わらない。
-// SmallRng(暗号強度は無いが高速なPRNG)を使うのは、ダミーデータ生成に暗号学的な安全性は不要なため。
+// 行番号ごとに独立したRNG(乱数生成器。Random Number Generatorの略)を作る関数。
+// base_seedが同じなら常に同じ値になるため、並列実行(rayon)でどのスレッドがどの行を
+// 処理しても結果が変わらない。wrapping_addは「足し算した結果が桁あふれ(オーバーフロー)
+// してもエラーにせず、あふれた分を切り捨てて計算を続ける」足し算(row_numがどんな値でも
+// 必ず計算が完了する)。SmallRng(暗号強度は無いが高速なPRNG=疑似乱数生成器)を使うのは、
+// ダミーデータ生成に暗号学的な安全性は不要なため。
 pub fn row_rng(base_seed: u64, row_num: u32) -> SmallRng {
     SmallRng::seed_from_u64(base_seed.wrapping_add(row_num as u64))
 }
 
+// 出力形式を表すenum(csv/sql/json/xlsxのどれか1つだけを取りうる)。
+// #[derive(...)]は、このenumに次の機能を自動で追加している:
+//   Clone, Copy: 値を複製できるようにする(Copyがあると、代入のたびに複製が自動で起きる)
+//   ValueEnum: clapライブラリが「--format csv」のようなコマンドライン引数として
+//     このenumを直接受け取れるようにする(#[value(name = "csv")]で対応する文字列を指定している)
+//   PartialEq, Eq: `==`で比較できるようにする
+//   Hash: HashMapやHashSetのキーとして使えるようにする
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Hash)]
 pub enum Format {
     #[value(name = "csv")]
@@ -28,6 +62,9 @@ pub enum Format {
     Xlsx,
 }
 
+// Displayは「この値を人間が読める文字列にする方法」を定義するRustの仕組み(トレイトと呼ぶ)。
+// これを実装しておくと、`println!("{}", format)`のような書き方でFormatの値を
+// 文字列として表示できるようになる(mainの成功メッセージ表示で使われている)
 impl std::fmt::Display for Format {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -39,17 +76,21 @@ impl std::fmt::Display for Format {
     }
 }
 
-// schema.yaml の中身をそのまま受け止める箱(struct)。serdeが自動でYAML→structに変換する。
-// 「1テーブル分の定義」を表す型で、単一テーブル形式(schema.yamlのトップレベルに
-// row_count/columnsを直接書く形式)でも、複数テーブル形式(tables:の各要素)でも、
-// どちらも同じこの型として読み込む。tables:形式では要素のキーが"name"なので、
-// aliasでtable_nameとしても受け取れるようにしている。
+// schema.yaml の中身をそのまま受け止める箱(struct)。serdeというライブラリが自動で
+// YAML→struct(この形)に変換してくれる。「1テーブル分の定義」を表す型で、単一テーブル
+// 形式(schema.yamlのトップレベルにrow_count/columnsを直接書く形式)でも、複数テーブル
+// 形式(tables:の各要素)でも、どちらも同じこの型として読み込む。tables:形式では
+// 要素のキーが"name"なので、aliasでtable_nameとしても受け取れるようにしている。
 // Serializeも付けているのは、GUI(dummygen_jp_gui)の「列設定をYAMLとして書き出す」機能
 // (schema_file_to_yaml)のため。読み込み(Deserialize)は元々のload_schema用
 #[derive(Deserialize, Serialize)]
 pub struct Schema {
     pub row_count: u32,
-    // SQL出力(--format sql)のときや、tables:形式でのテーブル名として使う
+    // SQL出力(--format sql)のときや、tables:形式でのテーブル名として使う。
+    // #[serde(...)]はserdeへの細かい指示で、defaultは「YAMLに書かれていなければ
+    // Noneのままにする」、alias = "name"は「"table_name"の代わりに"name"というキーで
+    // 書かれていても同じ扱いにする」、skip_serializing_if(書き出すときのみ関係)は
+    // 「値がNoneなら、YAMLに書き出すときこのキー自体を省略する」という意味
     #[serde(default, alias = "name", skip_serializing_if = "Option::is_none")]
     pub table_name: Option<String>,
     pub columns: Vec<ColumnDef>,
@@ -57,7 +98,8 @@ pub struct Schema {
 
 // YAMLの最上位をいったん全部Optionとして受け止める箱。単一テーブル形式(row_count/columns
 // が直接トップレベルにある)と複数テーブル形式(tables:のリスト)のどちらで書かれているかを
-// ここではまだ判定しない(判定はnormalize_schema_fileで行う)。
+// ここではまだ判定しない(判定はnormalize_schema_fileで行う)。全フィールドをOptionにして
+// おくことで、「どちらの形式でも、書かれていないキーがあってもエラーにせず読み込める」箱になる。
 // serdeのuntagged enumを使わないのは、untaggedだと「どのバリアントにも一致しません」という
 // 分かりにくいエラーになり、既存の日本語エラーメッセージの分かりやすさが損なわれるため。
 #[derive(Deserialize)]
@@ -79,12 +121,21 @@ pub struct SchemaFile {
     pub multi_table: bool,
 }
 
+// RawSchemaFile(YAMLをそのまま受け止めた、全部Option状態の箱)を見て、単一テーブル形式か
+// 複数テーブル形式かを判定し、どちらの場合も同じSchemaFileの形に揃える(正規化する)関数。
 fn normalize_schema_file(raw: RawSchemaFile) -> Result<SchemaFile, Box<dyn std::error::Error>> {
+    // is_some()は「Optionの中身がSome(値がある)かどうか」をtrue/falseで返すメソッド。
+    // ||は「または」を表す論理演算子で、3つのうち1つでもtrueなら全体がtrueになる
     let has_single_table_fields =
         raw.row_count.is_some() || raw.columns.is_some() || raw.table_name.is_some();
 
+    // "if let Some(tables) = raw.tables"は、「raw.tablesの中身がSome(つまりtables:が
+    // 書かれていた)なら、その中身を変数tablesとして取り出して{}の中を実行する」という構文
+    // (Noneだった場合は{}の中を素通りして、この下の単一テーブル用の処理に進む)
     if let Some(tables) = raw.tables {
         if has_single_table_fields {
+            // Err(...)で関数の戻り値をエラーとして返す。文字列(&str)は.into()で
+            // 自動的にBox<dyn std::error::Error>(エラーを表す型)に変換される
             return Err(
                 "tables: と row_count:/columns:/table_name: は同時に指定できません。複数テーブルを作る場合は各テーブルの定義を tables: の中に書いてください".into(),
             );
@@ -92,11 +143,21 @@ fn normalize_schema_file(raw: RawSchemaFile) -> Result<SchemaFile, Box<dyn std::
         if tables.is_empty() {
             return Err("tables には少なくとも1つ以上のテーブルを定義してください".into());
         }
+        // iter()で一覧を1件ずつ取り出し、enumerate()で「0番目、1番目、…」という
+        // 連番(i)も一緒に取り出す。for (i, table) in ... はその2つをそれぞれ
+        // 変数i・tableとして受け取りながら繰り返す構文
         for (i, table) in tables.iter().enumerate() {
+            // as_deref()はOption<String>をOption<&str>に変換するメソッド、
+            // is_none_or(...)は「Noneなら true、Someなら中身を関数(ここではstr::is_empty=
+            // 「空文字かどうか」)に渡した結果を返す」という判定。つまりここは
+            // 「テーブル名が指定されていない、または空文字である」ことを調べている
             if table.table_name.as_deref().is_none_or(str::is_empty) {
                 return Err(format!("tables[{}]: テーブル名(name)を指定してください", i).into());
             }
         }
+        // 二重のfor文で「全てのテーブルの組み合わせ」を1つずつ比較し、同じ名前が
+        // 無いか確認する。外側のiが0,1,2...と進み、内側のjは常に「iより後ろ」の
+        // 範囲((i + 1)..tables.len())だけを見るので、同じペアを2回比較しなくて済む
         for i in 0..tables.len() {
             for j in (i + 1)..tables.len() {
                 if tables[i].table_name == tables[j].table_name {
@@ -108,9 +169,14 @@ fn normalize_schema_file(raw: RawSchemaFile) -> Result<SchemaFile, Box<dyn std::
                 }
             }
         }
+        // Ok(...)で関数の戻り値を「成功」として返す(中身はここまでで検証済みのtables)
         return Ok(SchemaFile { tables, multi_table: true });
     }
 
+    // ここに来るのは、tables:が書かれていなかった(=単一テーブル形式のはず)場合。
+    // ok_or(...)は「Optionの中身がSomeならその値を、Noneなら指定したエラーメッセージで
+    // Errにする」変換。直後の?は「Errならこの関数もそこでErrを返して終わる」という意味なので、
+    // この2行は「columns/row_countが無ければエラーメッセージ付きで即座に終了する」処理になる
     let columns = raw
         .columns
         .ok_or("columns には少なくとも1つ以上の列を定義してください")?;
@@ -122,6 +188,8 @@ fn normalize_schema_file(raw: RawSchemaFile) -> Result<SchemaFile, Box<dyn std::
     })
 }
 
+// 列1個分の設定を表す型。全ての列タイプ(sequence/name_ja/integer/...)に共通する
+// name/null_rate/uniqueと、型ごとに違う追加設定(column_type)を持つ
 #[derive(Deserialize, Serialize)]
 pub struct ColumnDef {
     pub name: String,
@@ -131,13 +199,21 @@ pub struct ColumnDef {
     // trueにすると、この列の値が行間で重複しないようにする。省略時はfalse
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique: Option<bool>,
-    // flattenにより、typeやmin/maxなどの追加情報を「nameと同じ階層」から直接読み取れる
+    // #[serde(flatten)]を付けると、column_type(ColumnType型、下で定義)が持つ
+    // フィールド(typeやmin/max等)を、入れ子にせずnameと同じ階層に展開して読み書きできる。
+    // これにより、YAML上は "name: id" と "type: integer" を同じ階層に並べて書ける
     #[serde(flatten)]
     pub column_type: ColumnType,
 }
 
-// tag = "type" にすると、YAML上の "type:" の値でどのバリアント(列タイプ)かを判定し、
-// min/maxなどの残りのフィールドをそのバリアントの中身として読み取ってくれる
+// 列のタイプ(sequence/name_ja/integer/...)を表すenum。Rustのenumは「バリアントごとに
+// 違うデータを持てる」のが特徴で、例えばIntegerはmin/maxを持つがBooleanは何も持たない、
+// というように列タイプごとに必要な追加情報だけを持たせられる。
+// #[serde(tag = "type", rename_all = "snake_case")]は、YAML上の"type:"というキーの値
+// (例: "integer")を見てどのバリアントかを判定し(内部タグ付きenumと呼ぶ)、min/maxなど
+// 残りのフィールドをそのバリアントの中身として読み取ってくれる、というserdeへの指示。
+// rename_all = "snake_case"は、バリアント名(Integer)をYAML上では小文字+アンダースコア
+// (integer)に変換する、という意味(Rust側は大文字始まりの命名規則を使うため)
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ColumnType {
@@ -450,6 +526,13 @@ fn flush_quantified(
     Ok(())
 }
 
+// pattern文字列を、先頭から1文字(または[...]のかたまり)ずつ順番に読み進めながら
+// PatternPieceの一覧に変換していく、自作の小さな構文解析器(パーサ)。
+// 変数iが「今どこまで読んだか」を表すカーソル(読み取り位置)で、while文の中でiを
+// 少しずつ進めながら、chars[i]が何の文字かによって処理を振り分ける(match文)。
+// chars.get(i)は「i番目の文字を取り出すが、範囲外ならNoneを返す(配列外アクセスで
+// 落ちない)安全な取り出し方」で、文字列の終わりを超えて読もうとしていないかの
+// チェックを兼ねている
 fn compile_pattern(pattern: &str) -> Result<Vec<PatternPiece>, String> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut pieces = Vec::new();
@@ -460,6 +543,8 @@ fn compile_pattern(pattern: &str) -> Result<Vec<PatternPiece>, String> {
 
     while i < chars.len() {
         match chars[i] {
+            // "\"(バックスラッシュ)は次の1文字をそのままリテラル文字として扱うためのエスケープ。
+            // 直前のpendingを先に確定させ(flush_default)、エスケープした文字を新しいpendingにする
             '\\' => {
                 i += 1;
                 let escaped = *chars.get(i).ok_or_else(|| "パターンの末尾が\\で終わっている".to_string())?;
@@ -467,9 +552,13 @@ fn compile_pattern(pattern: &str) -> Result<Vec<PatternPiece>, String> {
                 pending = Some(vec![escaped]);
                 i += 1;
             }
+            // "["は文字クラス(例: "[A-Z]")の始まり。"]"が出てくるまで、1文字ずつ、または
+            // "a-z"のような範囲指定を読み取り、実際に選べる文字を全部BTreeSet(重複を持たず、
+            // 順序も保たれる集合)に集めていく
             '[' => {
                 i += 1;
                 flush_default(&mut pending, &mut pieces);
+                // 先頭が"^"なら「それ以外の文字」を意味する否定文字クラスになる
                 let negate = chars.get(i) == Some(&'^');
                 if negate {
                     i += 1;
@@ -477,11 +566,14 @@ fn compile_pattern(pattern: &str) -> Result<Vec<PatternPiece>, String> {
                 let mut set = std::collections::BTreeSet::new();
                 while chars.get(i) != Some(&']') {
                     let start = *chars.get(i).ok_or_else(|| "文字クラス[...]が]で閉じられていない".to_string())?;
+                    // "a-z"のような「1文字、ハイフン、1文字」の並びなら範囲指定とみなす。
+                    // is_some_and(...)は「Optionの中身がSomeで、かつ指定した条件も満たすか」を判定するメソッド
                     if chars.get(i + 1) == Some(&'-') && chars.get(i + 2).is_some_and(|c| *c != ']') {
                         let end = chars[i + 2];
                         if start > end {
                             return Err(format!("文字クラスの範囲が逆順になっている: {start}-{end}"));
                         }
+                        // start..=endで「startからendまでの文字」を1つずつ取り出し、集合に追加する
                         for c in start..=end {
                             set.insert(c);
                         }
@@ -492,6 +584,8 @@ fn compile_pattern(pattern: &str) -> Result<Vec<PatternPiece>, String> {
                     }
                 }
                 i += 1; // ']'を読み飛ばす
+                // 否定文字クラスなら「印字可能なASCII全体から、集めた文字を除いたもの」、
+                // そうでなければ「集めた文字そのもの」が実際の候補になる
                 let resolved: Vec<char> = if negate {
                     pattern_default_charset().into_iter().filter(|c| !set.contains(c)).collect()
                 } else {
@@ -591,11 +685,20 @@ fn parse_reference(
     }
 }
 
+// schema.yamlから読み込んだ列定義(Schema、文字列や生の数値がそのまま入っている)を検証し、
+// 実際の生成処理で使う実行時の形(PreparedColumn)に変換する関数。処理の流れ:
+//   1. 列が1つも無ければエラー
+//   2. 列名の重複が無いかを確認する(二重ループで全ての組み合わせを比較)
+//   3. 各列について、型ごとに必要なバリデーション(min>maxでないか、日付形式が正しいか等)を行い、
+//      問題なければColumnType(YAML由来の型)をPreparedColumnType(生成処理で使う型)に変換する
+//   4. 最後に、null_rate/uniqueの指定が正しいかもチェックする(この関数の後半に続く)
 pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::error::Error>> {
     if schema.columns.is_empty() {
         return Err("columns には少なくとも1つ以上の列を定義してください".into());
     }
 
+    // 全ての列の組み合わせを1つずつ比較し、同じ名前の列が無いかを確認する
+    // (normalize_schema_fileのテーブル名重複チェックと同じ「二重ループで総当たり」の考え方)
     for i in 0..schema.columns.len() {
         for j in (i + 1)..schema.columns.len() {
             if schema.columns[i].name == schema.columns[j].name {
@@ -608,10 +711,19 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
         }
     }
 
+    // schema.columns(YAMLから読み込んだ列の一覧)を1つずつ処理し、それぞれ
+    // PreparedColumn(実行時用の形)に変換した新しい一覧を作る。
+    // iter()で1件ずつ取り出し、.map(|c| { ... })で「1列分の変換処理」を各列に適用し、
+    // 最後の.collect()で全部まとめる(下の方にある)。map内の処理でErrを返すと、
+    // .collect::<Result<...>>()がその時点で処理を打ち切り、全体としてErrを返す
+    // (詳しくはこの関数の末尾、.collect()の行を参照)
     schema
         .columns
         .iter()
         .map(|c| {
+            // c.column_type(YAMLに書かれた列タイプ)を見て、対応するPreparedColumnTypeに
+            // 変換する。ほとんどの型は値をコピーするだけだが、min/maxのように「値として
+            // おかしくないか」の確認が必要な型は、ここでチェックしてから変換している
             let kind = match &c.column_type {
                 ColumnType::Sequence => PreparedColumnType::Sequence,
                 ColumnType::NameJa { with_space } => PreparedColumnType::NameJa { with_space: *with_space },
@@ -711,6 +823,8 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                     if choices.is_empty() {
                         return Err(format!("列 \"{}\": choices には1つ以上の選択肢が必要です", c.name).into());
                     }
+                    // if let Some(w) = weights は「weightsが指定されていれば、その中身をwとして
+                    // 取り出して{}を実行する」という構文(weightsは省略可能なOption型のため)
                     if let Some(w) = weights {
                         if w.len() != choices.len() {
                             return Err(format!(
@@ -721,9 +835,13 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                             )
                             .into());
                         }
+                        // any(...)は「一覧の中に条件を満たす要素が1つでもあるか」を調べるメソッド。
+                        // &vは「一覧の中身を1つずつ指す参照」で、v < 0.0で「負の数かどうか」を見る
                         if w.iter().any(|&v| v < 0.0) {
                             return Err(format!("列 \"{}\": weights に負の数は指定できません", c.name).into());
                         }
+                        // sum()は一覧の値を全部足し算するメソッド。::<f64>は「f64(小数)として
+                        // 合計する」という型の指定(書かないと合計の型が決められない場合がある)
                         if w.iter().sum::<f64>() <= 0.0 {
                             return Err(format!("列 \"{}\": weights の合計は0より大きくしてください", c.name).into());
                         }
@@ -737,7 +855,11 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 }
             };
 
+            // ここまででkind(この列の型と、型ごとの追加設定)が決まった。
+            // 続けて、型に関係なく全列共通のnull_rate/uniqueの設定を確認していく
             let null_rate = c.null_rate.unwrap_or(0.0);
+            // (0.0..=1.0).contains(&null_rate)は「null_rateが0.0以上1.0以下の範囲に
+            // 収まっているか」を調べる書き方。頭に!を付けているので「範囲外なら」という判定になる
             if !(0.0..=1.0).contains(&null_rate) {
                 return Err(format!(
                     "列 \"{}\": null_rate({})は0.0〜1.0の範囲で指定してください",
@@ -748,6 +870,8 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
 
             let unique = c.unique.unwrap_or(false);
             if unique {
+                // matches!(kind, パターン)は「kindがそのパターンに一致するかどうか」を
+                // true/falseで返すマクロ(unique_capacityの説明にも出てくる考え方と同じ)
                 if matches!(kind, PreparedColumnType::ForeignKey { .. }) {
                     return Err(format!(
                         "列 \"{}\": foreign_key列には unique を指定できません(1つの親の値を複数の子行が参照するのが外部キーの通常の挙動です)",
@@ -762,6 +886,9 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                     )
                     .into());
                 }
+                // unique_capacity(&kind)が返した値ごとに、エラーにするかどうかを判定する。
+                // "パターン if 条件"は「そのパターンに一致し、かつ条件も満たす場合だけ」実行される
+                // という書き方(ガード条件と呼ぶ)。上から順に調べ、最初に一致した行だけが実行される
                 match unique_capacity(&kind) {
                     UniqueCapacity::Unsupported => {
                         return Err(format!(
@@ -777,6 +904,9 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                         )
                         .into());
                     }
+                    // "パターンA | パターンB"は「AまたはBのどちらかに一致すれば」という意味。
+                    // EnumerableでもRetryでも、組み合わせ数(capacity)がrow_countより少なければ
+                    // 同じエラーにする、という2つのケースをまとめて書いている
                     UniqueCapacity::Enumerable(capacity) | UniqueCapacity::Retry(capacity)
                         if capacity < schema.row_count as u128 =>
                     {
@@ -786,14 +916,23 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                         )
                         .into());
                     }
+                    // 上のどのエラー条件にも当てはまらなかった場合(問題なし)。
+                    // {}は「何もしない」という意味で、そのままmatchを抜けてこの下の行に進む
                     UniqueCapacity::Enumerable(_) | UniqueCapacity::Retry(_) => {}
                 }
             }
 
-            // 実際の値(unique_pool)はこの後base_seedが決まってから resolve_unique_pools で埋める
+            // 実際の値(unique_pool)はこの後base_seedが決まってから resolve_unique_pools で埋める。
+            // Ok(...)で「この1列分の変換に成功した」ことを表す
             Ok(PreparedColumn { name: c.name.clone(), kind, null_rate, unique, unique_pool: None })
         })
+        // ここまでの.map(...)は「Result<PreparedColumn, エラー>」を1列ごとに作るところまでだった。
+        // collect::<Result<Vec<_>, _>>()は、そのResultの一覧をまとめて1つのResultにする特別な
+        // 変換で、「全部がOkならOk(Vec<PreparedColumn>)に、1つでもErrがあれば最初のErrをそのまま
+        // 返す」という動きをする(1列でも設定ミスがあれば、そこで処理全体を打ち切れる)
         .collect::<Result<Vec<_>, _>>()
+        // inspectは「中身がOkのときだけ、値を変えずに追加の処理(ここでは警告メッセージの表示)を
+        // 行い、そのまま同じ値を返す」メソッド。Errのときは何もせずそのまま素通りする
         .inspect(|columns| {
             for warning in misplaced_city_ja_warnings(columns) {
                 eprintln!("{warning}");
@@ -882,39 +1021,89 @@ enum UniqueCapacity {
     Unsupported,
 }
 
-// unique制約を付けられる列タイプが取りうる値の組み合わせ数。
-// fixed(常に同じ値なので2行以上では原理的にunique不可能)・pattern(組み合わせ数の計算が複雑)・
-// float(桁数によって組み合わせ数が大きく変わり計算方法の検討が必要)・
-// city_ja/katakana_name/katakana_name_hankaku(直前の列を参照する型で、uniqueと組み合わせると
-// 参照関係の設計が複雑になる)・sequence/email(後述の通り、そもそも常に重複しないため不要)は非対応のまま。
+// 「この列タイプは、値を何通り作れるか」を1つずつ調べて返す関数。
+// match(パターンマッチ)はRustの構文で、kindの中身が`PreparedColumnType`のどのバリアント
+// (種類)かによって実行する処理を振り分ける。他の言語のswitch文に近いが、Rustでは
+// 全ての種類を書ききらないとコンパイルエラーになる(書き漏らしを防げる)。
+// 呼び出し元(prepare_columns)は、この関数の戻り値を見て
+//   - Enumerable(組み合わせ数) → 全部の値を作ってシャッフルする方式(enumerate_values)が使える
+//   - Retry(組み合わせ数)      → 値を作っては重複チェックする方式(build_unique_pool_by_retry)を使う
+//   - Unsupported              → unique指定はエラーにする
+// のどれで対応するかを決める。
+// pattern(組み合わせ数の計算が複雑)・city_ja/katakana_name/katakana_name_hankaku
+// (直前の列を参照する型で、uniqueと組み合わせると参照関係の設計が複雑になる)・
+// sequence/email(後述の通り、そもそも常に重複しないため不要)は非対応のまま。
 fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
     match kind {
+        // true/falseの2通りしかない
         PreparedColumnType::Boolean => UniqueCapacity::Enumerable(2),
+        // "男性"/"女性"の2通りしかない
         PreparedColumnType::Gender => UniqueCapacity::Enumerable(2),
+        // "A型"/"O型"/"B型"/"AB型"の4通りしかない
         PreparedColumnType::BloodType => UniqueCapacity::Enumerable(4),
+        // 常に同じ文字列しか返さないため、組み合わせは1通り(row_count=1のときだけunique指定に意味がある。
+        // 2行以上を指定すると、他のEnumerable型と同じ「組み合わせが足りない」エラーで自然に弾かれる)
+        PreparedColumnType::Fixed { .. } => UniqueCapacity::Enumerable(1),
+        // floatは他の型と違い、範囲(min〜max)と桁数(decimals)によって組み合わせ数が
+        // 大きく変わる(小数点以下0桁なら少なく、10桁なら莫大になる)ため、その場で計算する。
+        PreparedColumnType::Float { min, max, decimals } => {
+            // 10f64.powi(2) は「10の2乗」を計算するRustの書き方(10 * 10 = 100になる)。
+            // 例えばdecimals=2(小数点以下2桁)なら、値を100倍すれば整数として扱える
+            let scale = 10f64.powi(*decimals as i32);
+            // 実際の計算の流れ:
+            //   1. (max - min) で範囲の幅を求める(例: min=0, max=1 なら幅は1)
+            //   2. scaleを掛けて「刻み幅がいくつ入るか」を求める(幅1 × scale100 = 100個分)
+            //   3. round()で小数の誤差を丸め、u128(0以上の整数)に変換する
+            //   4. +1するのは、両端(minとmax自身)を含めるため(例: 0,1,2のように3個なら幅は2だが個数は3)
+            // 「as u128」はRustの型変換の書き方で、小数(f64)を整数(u128)に変換する。
+            // Rustのこの変換は特殊な安全設計になっていて、変換できない値(NaNや、
+            // u128で表せないほど大きい/小さい値)が来てもエラーで止まらず、
+            // 0またはu128の最大値に丸め込まれる(「飽和する」という)。そのため、
+            // 極端なmin/max/decimalsの組み合わせで計算結果がおかしくなっても、
+            // プログラムが落ちることはなく、安全側(Retry方式)に倒れるだけで済む
+            let capacity = (((*max - *min) * scale).round() as u128).saturating_add(1);
+            // 組み合わせ数が少なければ全部列挙する方式(Enumerable)、
+            // 多ければ値を作っては重複チェックする方式(Retry)を選ぶ
+            if capacity <= UNIQUE_CAPACITY_CAP {
+                UniqueCapacity::Enumerable(capacity)
+            } else {
+                UniqueCapacity::Retry(capacity)
+            }
+        }
+        // min〜maxの整数の個数(例: min=1, max=10なら10通り)
         PreparedColumnType::Integer { min, max } => {
             UniqueCapacity::Enumerable((*max as i128 - *min as i128 + 1) as u128)
         }
+        // start_days(開始日)からspan_days(日数の幅)日分の、選べる日付の個数
         PreparedColumnType::Date { span_days, .. } => UniqueCapacity::Enumerable(*span_days as u128 + 1),
         // birth_dateはdateと同じ「start_days〜start_days+span_days」の日数分の組み合わせを持つ
         PreparedColumnType::BirthDate { span_days, .. } => UniqueCapacity::Enumerable(*span_days as u128 + 1),
+        // choicesに書かれた選択肢の個数がそのまま組み合わせ数になる。
         // unique:trueのときは(重み付けの有無にかかわらず)全選択肢を重複なく列挙するので、
         // weightsは意味を持たない(README/CLAUDE.mdに明記。エラーにはせず単に無視する)
         PreparedColumnType::Enum { choices, .. } => UniqueCapacity::Enumerable(choices.len() as u128),
+        // 姓の辞書(LAST_NAMES)の件数 × 名の辞書(FIRST_NAMES)の件数が、作れるフルネームの総数になる
+        // (掛け算になるのは、姓と名それぞれを独立に選んで組み合わせるため。例:姓3種×名2種=6通り)
         PreparedColumnType::NameJa { .. } => {
             UniqueCapacity::Enumerable((LAST_NAMES.len() * FIRST_NAMES.len()) as u128)
         }
+        // 姓の辞書に載っている件数がそのまま組み合わせ数
         PreparedColumnType::LastNameJa => UniqueCapacity::Enumerable(LAST_NAMES.len() as u128),
+        // 名の辞書に載っている件数がそのまま組み合わせ数
         PreparedColumnType::FirstNameJa => UniqueCapacity::Enumerable(FIRST_NAMES.len() as u128),
+        // ローマ字の姓辞書 × ローマ字の名辞書(name_jaと同じ掛け算の考え方)
         PreparedColumnType::RomajiName => {
             UniqueCapacity::Enumerable((LAST_NAMES_ROMAJI.len() * FIRST_NAMES_ROMAJI.len()) as u128)
         }
         PreparedColumnType::KatakanaLastName => UniqueCapacity::Enumerable(LAST_NAMES_KANA.len() as u128),
         PreparedColumnType::KatakanaFirstName => UniqueCapacity::Enumerable(FIRST_NAMES_KANA.len() as u128),
+        // 都道府県の辞書(CITIES_BY_PREFECTURE)に載っている都道府県の数
         PreparedColumnType::PrefectureJa => UniqueCapacity::Enumerable(CITIES_BY_PREFECTURE.len() as u128),
+        // 姓の辞書 × 会社の種類(COMPANY_SUFFIXES、「商事」「工業」等)の掛け算
         PreparedColumnType::CompanyNameJa => {
             UniqueCapacity::Enumerable((LAST_NAMES.len() * COMPANY_SUFFIXES.len()) as u128)
         }
+        // 部署名・役職名の辞書に載っている件数がそのまま組み合わせ数
         PreparedColumnType::DepartmentJa => UniqueCapacity::Enumerable(DEPARTMENTS.len() as u128),
         PreparedColumnType::JobTitleJa => UniqueCapacity::Enumerable(JOB_TITLES.len() as u128),
         // 「今日」から1〜5年後(5通り)×1〜12月(12通り)の60通り
@@ -930,6 +1119,9 @@ fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
         PreparedColumnType::PostalCode => UniqueCapacity::Retry(1000 * 10_000),
         // 住所(1列): (都道府県ごとの市区町村数の合計) × 番地1(1〜19) × 番地2(1〜19)
         PreparedColumnType::AddressJa => {
+            // iter()で「(都道府県名, その市区町村一覧)」のペアを1つずつ取り出し、
+            // mapで市区町村一覧の件数だけを取り出し、sum()で全都道府県分を合計する
+            // (「都道府県ごとの市区町村数」を全部足し合わせて、日本全体の市区町村数にする処理)
             let total_cities: u128 =
                 CITIES_BY_PREFECTURE.iter().map(|(_, cities)| cities.len() as u128).sum();
             UniqueCapacity::Retry(total_cities * 19 * 19)
@@ -938,7 +1130,8 @@ fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
         // 表現できない(最大値は2^128-1)ため、u128::MAXで代用する(row_countとの比較にしか
         // 使わないので、この近似で実用上問題ない)
         PreparedColumnType::Uuid => UniqueCapacity::Retry(u128::MAX),
-        // IPv4アドレス: 256^4 = 約42.9億通り
+        // IPv4アドレス(例: 192.168.1.1)は0〜255の数字が4つ並ぶ形なので、組み合わせは
+        // 256×256×256×256=256の4乗。".pow(4)"はRustで「4乗する」ときの書き方
         PreparedColumnType::IpAddress => UniqueCapacity::Retry(256u128.pow(4)),
         // JWT風文字列・APIキーは64種類/62種類の文字集合から30文字以上組み立てるため、
         // 正確な組み合わせ数はu128の範囲(約3.4×10^38)を超えてオーバーフローする。
@@ -968,7 +1161,11 @@ fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
 // Retry方式は組み合わせを列挙しないため、この上限の対象外
 const UNIQUE_CAPACITY_CAP: u128 = 2_000_000;
 
-// UniqueCapacity::Enumerableで数えた組み合わせを、実際の文字列としてすべて列挙する
+// unique_capacityがEnumerable(組み合わせ数)と判定した列について、実際にありうる値を
+// 「1つ残らず全部」文字列のリストとして作る関数。呼び出し元(build_unique_pool)がこのリストを
+// シャッフルして先頭からrow_count件を取り出すことで、「重複しないrow_count件の値」が完成する。
+// vec![...]はRustで配列(正確にはVec)を作るマクロ。to_string()は数値や&str(文字列の参照)を
+// String(所有権を持つ文字列)に変換するメソッドで、それぞれ型を揃えるために必要
 fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
     match kind {
         PreparedColumnType::Boolean => vec!["true".to_string(), "false".to_string()],
@@ -976,7 +1173,27 @@ fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
         PreparedColumnType::BloodType => {
             vec!["A型".to_string(), "O型".to_string(), "B型".to_string(), "AB型".to_string()]
         }
+        PreparedColumnType::Fixed { value } => vec![value.clone()],
+        PreparedColumnType::Float { min, max, decimals } => {
+            let scale = 10f64.powi(*decimals as i32);
+            // min/maxを整数(scaled)に変換してから1ずつ増やしていくことで、
+            // 「0.1を何度も足し算する」ような浮動小数点の蓄積誤差(僅かなズレの積み重ね)を避けている。
+            // 最後にscaledをscaleで割って元の小数に戻し、format!でdecimals桁の文字列にする
+            let min_scaled = (min * scale).round() as i128;
+            let max_scaled = (max * scale).round() as i128;
+            // (min_scaled..=max_scaled)は「min_scaledからmax_scaledまでの連続した整数」を
+            // 表すRust の Range(範囲)。.map(...)で範囲の各値を1つずつ元の小数の文字列に変換し、
+            // .collect()で最後にVec<String>(文字列のリスト)にまとめる
+            (min_scaled..=max_scaled)
+                .map(|scaled| format!("{:.*}", *decimals as usize, scaled as f64 / scale))
+                .collect()
+        }
+        // min〜maxの範囲を1つずつ取り出し、それぞれ文字列に変換してリストにする
         PreparedColumnType::Integer { min, max } => (*min..=*max).map(|v| v.to_string()).collect(),
+        // 0日目(start_days)からspan_days日目までを1日ずつ取り出し、それぞれ日付の文字列に変換する。
+        // from_num_days_from_ce_optは「西暦1年1月1日から何日目か」という数値を実際の日付に戻す関数で、
+        // Option(値が無いかもしれない型)を返すため、.expect(...)で「無いはずが無い(必ず値がある)」
+        // ことを保証しつつ中身を取り出している(もし本当に無ければ、その理由のメッセージで停止する)
         PreparedColumnType::Date { start_days, span_days, format } => (0..=*span_days)
             .map(|offset| {
                 format_date(
@@ -986,7 +1203,14 @@ fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
                 )
             })
             .collect(),
+        // choices(選択肢のリスト)をそのまま複製して返すだけ。clone()はRustで「値を複製する」メソッド
+        // (choicesは列の設定に属していて、この関数の戻り値として別に持ち出す必要があるため複製する)
         PreparedColumnType::Enum { choices, .. } => choices.clone(),
+        // 姓のインデックス(0番目、1番目、…)を1つずつ取り出し、その姓それぞれについて名の
+        // インデックスも1つずつ組み合わせてフルネームを作る、という二重ループに相当する処理。
+        // flat_mapは「1つの入力から複数の値を作り、それを1段階平らにしてまとめる」メソッドで、
+        // ここでは「1つの姓につき名の数だけフルネームを作る」処理を全ての姓に対して行い、
+        // 結果を1つの平らなリストにまとめている(単純なmapだと「リストのリスト」になってしまう)
         PreparedColumnType::NameJa { with_space } => (0..LAST_NAMES.len())
             .flat_map(|last_idx| {
                 (0..FIRST_NAMES.len()).map(move |first_idx| format_name(last_idx, first_idx, *with_space))
@@ -994,6 +1218,7 @@ fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
             .collect(),
         PreparedColumnType::LastNameJa => LAST_NAMES.iter().map(|s| s.to_string()).collect(),
         PreparedColumnType::FirstNameJa => FIRST_NAMES.iter().map(|s| s.to_string()).collect(),
+        // NameJaと同じ「姓×名の全組み合わせ」をflat_mapで作る考え方(ローマ字表記版)
         PreparedColumnType::RomajiName => (0..LAST_NAMES_ROMAJI.len())
             .flat_map(|last_idx| {
                 (0..FIRST_NAMES_ROMAJI.len())
@@ -1012,16 +1237,23 @@ fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
                 )
             })
             .collect(),
+        // 都道府県名のリストをそのまま全部返すだけ(random_prefectureがランダムに1件選ぶのと違い、こちらは全件)。
+        // iter()は一覧を1件ずつ取り出す準備をするメソッドで、(pref, _)は「(都道府県名, 市区町村一覧)の
+        // ペアのうち都道府県名だけを使い、市区町村一覧は使わない」という意味(_は「使わない値」の印)
         PreparedColumnType::PrefectureJa => {
             CITIES_BY_PREFECTURE.iter().map(|(pref, _)| pref.to_string()).collect()
         }
+        // NameJaと同じflat_mapの考え方で、姓×会社の種類(COMPANY_SUFFIXES、「商事」「工業」等)の
+        // 全組み合わせ(30×8=240通り)を作る(random_company_nameと同じ「株式会社+姓+会社の種類」の組み立て方)
         PreparedColumnType::CompanyNameJa => LAST_NAMES
             .iter()
             .flat_map(|stem| COMPANY_SUFFIXES.iter().map(move |suffix| format!("株式会社{}{}", stem, suffix)))
             .collect(),
+        // 部署名・役職名の辞書(DEPARTMENTS/JOB_TITLES)をそのまま全部返すだけ
         PreparedColumnType::DepartmentJa => DEPARTMENTS.iter().map(|s| s.to_string()).collect(),
         PreparedColumnType::JobTitleJa => JOB_TITLES.iter().map(|s| s.to_string()).collect(),
-        // random_credit_card_expiryと同じ「今日」基準で、1〜5年後×1〜12月の60通りを列挙する
+        // random_credit_card_expiryと同じ「今日」基準で、1〜5年後×1〜12月の60通りを列挙する。
+        // ここでもflat_mapを使い、「1〜5年後それぞれについて、1〜12月の12パターンを作る」処理を行う
         PreparedColumnType::CreditCardExpiry => {
             use chrono::Datelike;
             let today = chrono::Local::now().date_naive();
@@ -1031,32 +1263,52 @@ fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
                 })
                 .collect()
         }
+        // ここに来るのは必ずEnumerable方式の型だけ(prepare_columnsが事前に弾いているため)。
+        // unreachable!はRustで「絶対に実行されないはずのコード」を明示するマクロで、
+        // もし実行されてしまった場合はここに書いたメッセージ付きでプログラムを止める
         _ => unreachable!("UniqueCapacity::Enumerable以外の型はここに来ない(prepare_columnsで弾いている)"),
     }
 }
 
 // enumerate方式が使えない(組み合わせ数が膨大な)型向け。値を作っては既出かどうかを
 // HashSetでチェックし、被っていたら作り直す方式でrow_count件のユニークな値を集める。
+// 処理の流れ:
+//   1. 空の「もう使った値の集合(seen)」と「これまでに集めた値の一覧(values)」を用意する
+//   2. 値を1個ランダムに作る(generate_value)
+//   3. seenに無ければ(=初めて出た値なら)valuesに追加する。既にあれば(=重複なら)捨てる
+//   4. valuesがrow_count件集まるまで2〜3を繰り返す
 // prepare_columnsで「組み合わせ数 >= row_count」を事前に検証済みであり、かつ対象型は
 // 組み合わせ数がrow_count(最大100万)よりずっと多いため、衝突は実務上まれで高速に集まる。
-// 試行回数の上限は「実装のバグ等で無限ループにならない」ための安全弁であり、
+// 試行回数の上限(max_attempts)は「実装のバグ等で無限ループにならない」ための安全弁であり、
 // 事前検証を正しく通過している限り実際に到達することはない
 fn build_unique_pool_by_retry(kind: &PreparedColumnType, row_count: u32, base_seed: u64, column_salt: u64) -> Vec<String> {
     let mut rng = SmallRng::seed_from_u64(base_seed.wrapping_add(column_salt));
+    // HashSetは「値が既に入っているか」をすぐ調べられる集合(数学の集合と同じで、同じ値は1個までしか持てない)。
+    // with_capacity(row_count)は「最終的にrow_count件入る見込み」を事前に伝えて、
+    // 集合が大きくなるたびに内部で確保し直す無駄を減らすための最適化(無くても動作は変わらない)
     let mut seen = std::collections::HashSet::with_capacity(row_count as usize);
     let mut values = Vec::with_capacity(row_count as usize);
+    // saturating_mulは掛け算の結果が上限を超えてもエラーにせず、上限いっぱいの値に丸める掛け算。
+    // 「row_countの1000倍」と「10万」を比べて大きい方を試行回数の上限にする
     let max_attempts = (row_count as u64).saturating_mul(1000).max(100_000);
 
+    // 0からmax_attempts回、繰り返す(forはRustの繰り返し構文。"_"は「回数は使うが値自体は使わない」の印)
     for _ in 0..max_attempts {
+        // 必要な件数が集まったら、途中でも繰り返しを打ち切る(break)
         if values.len() == row_count as usize {
             break;
         }
+        // 値を1個作る(row_num引数の0はここでは使われない値なので0を渡している)
         let candidate = generate_value(kind, 0, &mut rng);
+        // seen.insert(...)は「集合に追加を試み、既に入っていなければtrue、既に入っていればfalseを返す」
+        // メソッド。trueのとき(=初めて出た値のとき)だけ、実際の結果一覧(values)にも追加する
         if seen.insert(candidate.clone()) {
             values.push(candidate);
         }
     }
 
+    // assert_eq!は「2つの値が等しいことを確認し、違っていたらエラーメッセージ付きでプログラムを
+    // 止める」マクロ。ここでは「本当にrow_count件集まったか」の最終確認をしている
     assert_eq!(
         values.len(),
         row_count as usize,
@@ -1069,9 +1321,13 @@ fn build_unique_pool_by_retry(kind: &PreparedColumnType, row_count: u32, base_se
 // (Enumerable方式)。Retry方式の型はbuild_unique_pool_by_retryに委譲する。
 // column_saltは、同じschema内に複数のunique列があるときに、それぞれ違う乱数列になるようにするための値
 fn build_unique_pool(kind: &PreparedColumnType, row_count: u32, base_seed: u64, column_salt: u64) -> Vec<String> {
+    // matches!は「値が指定したパターンに一致するかどうか」をtrue/falseで返すマクロ。
+    // ここでは「unique_capacity(kind)の結果がRetry(中身の数値は何でもよい)かどうか」を調べている
     if matches!(unique_capacity(kind), UniqueCapacity::Retry(_)) {
         return build_unique_pool_by_retry(kind, row_count, base_seed, column_salt);
     }
+    // ここから下はEnumerable方式: 全部の候補値を作り(enumerate_values)、シャッフルして
+    // 先頭からrow_count件だけを残す(truncateは「指定した件数より後ろを切り捨てる」メソッド)
     let mut values = enumerate_values(kind);
     let mut rng = SmallRng::seed_from_u64(base_seed.wrapping_add(column_salt));
     values.shuffle(&mut rng);
@@ -1080,7 +1336,10 @@ fn build_unique_pool(kind: &PreparedColumnType, row_count: u32, base_seed: u64, 
 }
 
 // unique指定のある列すべてに対して、実際の値のプールを計算してPreparedColumnに詰める。
-// base_seedが決まった後(=prepare_columnsの後)でないと呼べない
+// base_seedが決まった後(=prepare_columnsの後)でないと呼べない。
+// iter_mut()は「一覧の各要素を、書き換え可能な形で1つずつ取り出す」メソッド、
+// enumerate()は「0番目、1番目、…という連番(i)も一緒に取り出す」メソッド
+// (連番iはcolumn_saltとして使い、列ごとに違う乱数列にするため)
 pub fn resolve_unique_pools(columns: &mut [PreparedColumn], row_count: u32, base_seed: u64) {
     for (i, column) in columns.iter_mut().enumerate() {
         if column.unique {
@@ -1123,24 +1382,42 @@ pub fn prepare_tables(file: &SchemaFile) -> Result<Vec<PreparedTable>, Box<dyn s
 // key_poolsは「実際に生成された値のプール」を持つ
 pub type ColumnKey = (String, String);
 
-// 全FK列の参照先(テーブル/列の存在)を検証し、依存辺(deps[子テーブルindex] = 親テーブルindexのVec)と、
-// 「後でプールを取り出す必要がある親の列」(referenced: (テーブル名, 列名) → 参照元の説明)を作る。
+// 全FK列(foreign_key型の列。他のテーブルの値を参照する列)の参照先(テーブル/列の存在)を
+// 検証し、次の2つを作って返す関数:
+//   - deps: 依存関係の一覧。deps[子テーブルの番号] に「親テーブルの番号」が並ぶ
+//     (例: ordersがusersを参照するなら、deps[ordersの番号] に usersの番号 が入る)
+//   - referenced: 「どの(テーブル名, 列名)が、他のどこかから参照されているか」の対応表
+//     (後で親テーブル生成後に、その列の値をプール化して子テーブルに渡すために使う)
+// pub type ColumnKey = (String, String) は、この関数より前で定義されている型で、
+// (テーブル名, 列名)という組をColumnKeyという名前で扱えるようにしたもの
 #[allow(clippy::type_complexity)] // (Vec<Vec<usize>>, HashMap<...>) は内部専用の戻り値で、これ以上分ける必要は薄い
 pub fn resolve_foreign_keys(
     tables: &mut [PreparedTable],
 ) -> Result<(Vec<Vec<usize>>, HashMap<ColumnKey, String>), Box<dyn std::error::Error>> {
+    // 「テーブル名」から「そのテーブルが tables の何番目にあるか」を引ける対応表を先に作る
+    // (このあと参照先のテーブルを名前で探すたびに毎回全部を見て回らずに済むようにするため)。
+    // filter_mapは「各要素を変換しつつ、Noneを返したものは結果から除外する」メソッド。
+    // t.name.as_deref().map(|n| (n, i))は「テーブル名があれば(名前, 番号)のペアにする、
+    // 名前(Option)が無ければNoneのまま」という変換
     let name_to_index: HashMap<&str, usize> = tables
         .iter()
         .enumerate()
         .filter_map(|(i, t)| t.name.as_deref().map(|n| (n, i)))
         .collect();
 
+    // vec![Vec::new(); tables.len()]は「空のVecを、テーブルの数だけ並べたVec」を作る書き方
+    // (深さ2重のリストの入れ物を用意している)
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); tables.len()];
     let mut referenced: HashMap<ColumnKey, String> = HashMap::new();
 
+    // 全テーブルの、全列を1つずつ調べていく(二重のfor文)
     for (child_idx, table) in tables.iter().enumerate() {
         let child_name = table.name.as_deref().unwrap_or("");
         for column in &table.columns {
+            // "let パターン = 式 else { ... };" は、if letの逆で「パターンに一致しなければ
+            // elseの中を実行して、その後の処理を打ち切る(ここではcontinueで次の列に進む)」
+            // という構文。つまりこの行は「foreign_key型の列でなければ、この列は無視して
+            // 次の列へ進む」という意味になる(一致すればref_table/ref_columnを変数として使える)
             let PreparedColumnType::ForeignKey { ref_table, ref_column, .. } = &column.kind else {
                 continue;
             };
@@ -1153,6 +1430,11 @@ pub fn resolve_foreign_keys(
                 .into());
             }
 
+            // "let Some(&値) = 式 else { ... };" も同じ考え方で、「name_to_indexに
+            // ref_tableという名前のテーブルが見つかればparent_idxとして取り出す、
+            // 見つからなければエラーで終了する」という処理。&が付いているのは、
+            // get(...)がparent_idxへの参照(&usize)を返すため、それを普通のusizeの
+            // 値として取り出すためのパターン
             let Some(&parent_idx) = name_to_index.get(ref_table.as_str()) else {
                 return Err(format!(
                     "列 \"{}\": 参照先のテーブル \"{}\" が tables に定義されていません",
@@ -1162,6 +1444,9 @@ pub fn resolve_foreign_keys(
             };
 
             let parent = &tables[parent_idx];
+            // find(...)は「条件を満たす最初の要素を探す」メソッドで、見つからなければNoneを返す。
+            // ok_or_else(...)はそのOptionを、Noneのときだけ指定したエラーに変換するメソッド
+            // (ok_orとの違いは、エラーメッセージを「実際に必要になったときだけ」作る点)
             let parent_column = parent.columns.iter().find(|c| &c.name == ref_column).ok_or_else(|| {
                 format!("列 \"{}\": テーブル \"{}\" に列 \"{}\" がありません", column.name, ref_table, ref_column)
             })?;
@@ -1174,9 +1459,15 @@ pub fn resolve_foreign_keys(
                 .into());
             }
 
+            // 同じ親を重複して記録しないようにcontainsで確認してから追加する
+            // (1つの子テーブルが同じ親テーブルの複数の列を参照していても、依存関係としては1回でよい)
             if !deps[child_idx].contains(&parent_idx) {
                 deps[child_idx].push(parent_idx);
             }
+            // entry(キー).or_insert_with(作る関数)は「そのキーが既にあれば何もしない、
+            // 無ければ関数を実行してその結果を新しい値として登録する」というHashMapの
+            // 操作方法。ここでは「同じ列が複数の子から参照されていても、説明文は
+            // 最初に見つかったものだけを残す」という意味になる
             referenced
                 .entry((ref_table.clone(), ref_column.clone()))
                 .or_insert_with(|| format!("{}.{}", child_name, column.name));
@@ -1186,12 +1477,22 @@ pub fn resolve_foreign_keys(
     Ok((deps, referenced))
 }
 
-// Kahnのアルゴリズムで親→子の順に並べる。循環していたら具体的な循環パスを1つ再構成してエラーにする
+// 複数テーブルを「親を必ず子より先に生成できる順番」に並べ替える関数。
+// Kahnのアルゴリズムという有名な手法を使っている。考え方はこう:
+//   1. 各テーブルについて「自分がいくつのテーブルから必要とされているか(入次数)」を数える
+//   2. 入次数が0のテーブル(誰からも先に生成される必要がないテーブル=親を持たないテーブル)
+//      から順に「生成してよい」とみなし、そのテーブルを必要としていた側の入次数を1減らす
+//   3. 入次数が0になったテーブルを次々追加していき、最終的に全テーブル分並べば完成
+// 循環していたら(AがBを必要とし、BもAを必要とする、のような堂々巡り)、具体的な
+// 循環パスを1つ再構成してエラーにする
 pub fn topological_order(
     deps: &[Vec<usize>],
     tables: &[PreparedTable],
 ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
     let n = tables.len();
+    // in_degree[i]は「テーブルiが依存している(参照している)相手の数」ではなく、Kahnの
+    // アルゴリズムの定義に合わせて「テーブルiに向かう辺の数」、つまり「テーブルiがまだ
+    // 生成できるようになるために、先に生成し終えていないといけない親の残り数」を表す
     let mut in_degree = vec![0usize; n];
 
     // deps[child] = [親のindex...] なので、親→子の辺リスト(children[親] = [子...])を作る
@@ -1204,12 +1505,19 @@ pub fn topological_order(
         }
     }
 
+    // VecDequeは「先頭からも末尾からも出し入れできるリスト」(キュー/待ち行列として使う)。
+    // まず「入次数が0のテーブル(=誰も先に待つ必要が無いテーブル)」を全部キューに入れる
     let mut queue: std::collections::VecDeque<usize> =
         (0..n).filter(|&i| in_degree[i] == 0).collect();
     let mut order = Vec::with_capacity(n);
 
+    // pop_front()は「キューの先頭から1つ取り出す(無ければNone)」メソッド。
+    // "while let Some(i) = ... "は「取り出せる限り繰り返す」という構文
     while let Some(i) = queue.pop_front() {
+        // このテーブル(i)はもう生成してよい状態なので、結果の並び順(order)に追加する
         order.push(i);
+        // iを親として必要としていた子テーブルたちについて、「まだ待っている親の数」を1減らす。
+        // 0になった(=もう待つ親がいなくなった)子テーブルは、次にキューへ追加して処理対象にする
         for &child in &children[i] {
             in_degree[child] -= 1;
             if in_degree[child] == 0 {
@@ -1244,18 +1552,27 @@ pub fn topological_order(
     Ok(order)
 }
 
-// トポロジカル順に走査してreprを確定させる。多段参照(c.b_id → b.a_id → a.id)で、
-// bのreprが確定してからcのreprを決めるために、順不同ではなくトポロジカル順で処理する
+// FK列(foreign_key型の列)が「参照先の値をSQL/JSON/Excelでどう表現すべきか」
+// (数値なのか文字列なのか等、reprと呼ぶ)を確定させる関数。
+// トポロジカル順(親→子の順)に走査するのがポイントで、多段参照(c.b_id → b.a_id → a.id)の
+// ようなケースで、まずbのreprを確定させてからでないとcのreprが正しく決められないため
 pub fn resolve_fk_reprs(
     tables: &mut [PreparedTable],
     order: &[usize],
 ) -> Result<(), Box<dyn std::error::Error>> {
     for &i in order {
         // (子テーブル内の列index, 新しいrepr) を先に集めてから書き込む
-        // (同じtables[i]の中で複数のFK列があっても、他のテーブルは参照しないのでここは1テーブル完結)
+        // (同じtables[i]の中で複数のFK列があっても、他のテーブルは参照しないのでここは1テーブル完結)。
+        // ここで一旦updatesに集めてから後で書き込む理由: tables[i]の列を読みながら
+        // 同時に書き換えようとすると、Rustの「同じデータを同時に借用できない」という
+        // 安全のためのルールに触れてしまうため、読む処理と書く処理を分けている
         let mut updates = Vec::new();
         for (col_idx, column) in tables[i].columns.iter().enumerate() {
             if let PreparedColumnType::ForeignKey { ref_table, ref_column, .. } = &column.kind {
+                // position(...)は「条件を満たす最初の要素が何番目にあるか」を返すメソッド。
+                // expect(...)は「Noneだったら、このメッセージを表示してプログラムを止める」
+                // という意味で、ここでは「resolve_foreign_keysで存在確認済みだから、
+                // 絶対にSomeになるはず」という前提で使っている
                 let parent_idx = tables
                     .iter()
                     .position(|t| t.name.as_deref() == Some(ref_table.as_str()))
@@ -1268,6 +1585,9 @@ pub fn resolve_fk_reprs(
                 updates.push((col_idx, fk_repr_of(&parent_column.kind)));
             }
         }
+        // 集めておいたupdatesを1つずつ書き込む。"&mut tables[i].columns[col_idx].kind"は
+        // 「書き換え可能な参照」を取り出す書き方で、*r = repr は「参照先の値そのものを
+        // 新しい値で上書きする」という意味(*は「参照が指す先の値そのもの」を表す記号)
         for (col_idx, repr) in updates {
             if let PreparedColumnType::ForeignKey { repr: r, .. } = &mut tables[i].columns[col_idx].kind {
                 *r = repr;
@@ -1280,17 +1600,26 @@ pub fn resolve_fk_reprs(
 // テーブルごとに乱数シードをずらす。table_indexは宣言順index(トポロジカル順ではない)。
 // table_index==0のとき必ずbase_seedそのものになるため、単一テーブルの出力は
 // 今まで通り1バイトも変わらない。同じ列構成の2テーブルが同一データにならないようにする目的。
+// wrapping_mul/wrapping_addは、掛け算・足し算の結果が桁あふれしてもエラーにせず
+// 続行する計算方法(row_rngのwrapping_addと同じ考え方)。掛けている大きな16進数の定数は
+// 「異なるtable_indexで、なるべく似ていない値になるように」選ばれた適当な大きい数
 pub fn table_seed(base_seed: u64, table_index: usize) -> u64 {
     base_seed.wrapping_add((table_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
-// 親テーブル生成後、参照されている列の値をプール化する
+// 親テーブルを生成し終えた直後に呼ばれる関数。「他のテーブルから参照されている列」
+// (referencedに載っている列)の実際の値を全部集めて、pools(プールの置き場)に保存する。
+// 子テーブルのforeign_key列はこのプールからランダムに1つ選ぶことで、
+// 「必ず親テーブルに実在する値」になることが保証される
 pub fn collect_key_pools(
     table: &PreparedTable,
     rows: &[Vec<Option<String>>],
     referenced: &HashMap<ColumnKey, String>,
     pools: &mut HashMap<ColumnKey, Arc<Vec<String>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // "let Some(x) = 式 else { ... };"は前に出てきた「一致しなければelseで打ち切る」構文。
+    // ここでは「テーブル名が無ければ(単一テーブル形式なら普通は無い想定だが)、
+    // 何もせず正常終了する」という意味
     let Some(table_name) = table.name.as_deref() else {
         return Ok(());
     };
@@ -1301,6 +1630,9 @@ pub fn collect_key_pools(
             continue;
         };
 
+        // 生成済みの全行から、この列(col_idx番目)の値だけを取り出して集める。
+        // filter_mapは「Noneを除外しつつ、Someの中身だけを取り出す」メソッド
+        // (NULLの行はプールに含めない、という意味になる)
         let values: Vec<String> = rows.iter().filter_map(|row| row[col_idx].clone()).collect();
         if values.is_empty() {
             return Err(format!(
@@ -1310,20 +1642,27 @@ pub fn collect_key_pools(
             .into());
         }
 
+        // Arc(Atomically Reference Counted、スレッド間で安全に共有できる参照カウント式の
+        // ポインタ)で包んで保存する。同じ親列を複数の子テーブルが参照する場合でも、
+        // 実際のデータ(values)を複製せずに1つだけ持ち、みんなで参照を共有できる
         pools.insert(key, Arc::new(values));
     }
 
     Ok(())
 }
 
-// 子テーブルの生成直前に、FK列にプールを差し込む
+// 子テーブルの生成直前に、そのテーブルのFK列(foreign_key型の列)に、対応する親の
+// プール(collect_key_poolsで作ったもの)を差し込む関数
 pub fn fill_foreign_key_pools(
     columns: &mut [PreparedColumn],
     pools: &HashMap<ColumnKey, Arc<Vec<String>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // iter_mut()は「一覧の各要素を、書き換え可能な形で1つずつ取り出す」メソッド
     for column in columns.iter_mut() {
         if let PreparedColumnType::ForeignKey { ref_table, ref_column, pool, .. } = &mut column.kind {
             let key = (ref_table.clone(), ref_column.clone());
+            // cloned()はArc(前述の共有ポインタ)の「参照カウントを1増やして複製する」
+            // メソッドで、中身のVec自体はコピーしない(軽い操作)
             let found = pools.get(&key).cloned().expect("トポロジカル順に生成しているので親のプールは必ず存在する");
             *pool = Some(found);
         }
@@ -1331,7 +1670,12 @@ pub fn fill_foreign_key_pools(
     Ok(())
 }
 
-// 複数テーブルをトポロジカル順(親→子)に1テーブルずつ生成する。
+// 複数テーブルをトポロジカル順(親→子)に1テーブルずつ生成する。処理の流れ:
+//   1. orderの順番(必ず親が先)で、テーブルを1つずつ処理する
+//   2. そのテーブルのFK列に、既に確定した親のプールを差し込む(fill_foreign_key_pools)
+//   3. このテーブル専用の乱数シードを作り、unique列のプールを確定させ、全行を生成する
+//   4. 生成した行のうち「他のテーブルから参照されている列」があれば、その値をプール化する
+//      (collect_key_pools。次以降のテーブルのFK列がこのプールを使えるようにするため)
 // main.rs(CLI)とdummygen_jp_guiのTauriコマンドの両方から呼べるよう、
 // 元々main.rs内にだけ書かれていたループをここに切り出したもの(ロジックは変更していない)。
 // on_table_startは「今どのテーブルを生成中か」を呼び出し側に知らせるコールバック
@@ -1344,6 +1688,8 @@ pub fn generate_multi_table_rows(
     mut on_table_start: impl FnMut(usize, &PreparedTable),
 ) -> Result<Vec<Option<Vec<Vec<Option<String>>>>>, Box<dyn std::error::Error>> {
     let mut key_pools: HashMap<ColumnKey, Arc<Vec<String>>> = HashMap::new();
+    // 戻り値の入れ物を先に用意する。まだどのテーブルも生成していないので、
+    // 全部Noneにしておき、生成し終えたテーブルから順にSome(行データ)で埋めていく
     let mut rows_by_table: Vec<Option<Vec<Vec<Option<String>>>>> = (0..tables.len()).map(|_| None).collect();
 
     for &i in order {
@@ -1755,8 +2101,12 @@ struct RowContext {
 // 1列分の値を作る。null_rateの確率でNone(NULL)を返す。
 // ctxには「同じ行の、これより前にある列の生成結果」が入っており、
 // city_ja列・katakana_name列がそれぞれprefecture_ja列・name_ja列の値を参照するのに使う。
-// 戻り値の2つ目は「name_ja列として新たに選んだ姓・名の添字」(それ以外の列やNULL・
+// 戻り値は「(セルの値, name_ja列として新たに選んだ姓・名の添字)」という2つの値のタプル
+// (Rustでは複数の値をまとめて返したいとき、こうしたタプル型がよく使われる)。
+// 2つ目は「name_ja列として新たに選んだ姓・名の添字」(それ以外の列やNULL・
 // unique_pool経由の場合はNone)で、generate_rowがRowContextに保存するために使う。
+// 引数のrng: &mut impl Rngは「Rngという機能(トレイト)を持つ何らかの型への、書き換え可能な
+// 参照」という意味。呼び出し元がSmallRng等どの乱数生成器を渡しても、この関数は同じように使える
 fn generate_cell(
     column: &PreparedColumn,
     row_num: u32,
@@ -1764,15 +2114,24 @@ fn generate_cell(
     ctx: &RowContext,
 ) -> (Option<String>, Option<(usize, usize)>) {
     // uniqueな列は、あらかじめ用意しておいたプールからこの行番号に対応する値を取り出すだけ
-    // (unique同士でnull_rateとの併用はprepare_columnsで禁止しているので、Noneになることは無い)
+    // (unique同士でnull_rateとの併用はprepare_columnsで禁止しているので、Noneになることは無い)。
+    // pool[(row_num - 1) as usize]は「1始まりの行番号を0始まりの配列の位置に直してから
+    // 値を取り出す」という書き方(row_num=1なら配列の0番目、row_num=2なら1番目、…)
     if let Some(pool) = &column.unique_pool {
         return (Some(pool[(row_num - 1) as usize].clone()), None);
     }
 
+    // gen_bool(確率)は「指定した確率(0.0〜1.0)でtrueを返す」メソッド。
+    // null_rateが0より大きく、かつ抽選に当たった場合だけNone(NULL)を返して、
+    // この列の値作りをここで打ち切る
     if column.null_rate > 0.0 && rng.gen_bool(column.null_rate) {
         return (None, None);
     }
 
+    // 列タイプに応じて分岐する。上の4つ(CityJa/KatakanaName/KatakanaNameHankaku/RomajiName/
+    // NameJa)は「他の列の値を参照する」「後で参照されるための添字を返す」という特別な扱いが
+    // 必要なのでここに直接書き、それ以外の型は`_`(それ以外全部、という意味)でgenerate_value
+    // にそのまま任せる
     match column.kind {
         PreparedColumnType::CityJa => (Some(random_city(rng, ctx.last_prefecture.as_deref())), None),
         PreparedColumnType::KatakanaName => {
@@ -1794,11 +2153,17 @@ fn generate_cell(
 // RowContextに覚えておいて後ろの列(city_ja/katakana_name)に渡す
 // (どちらも「参照される側」の列が「参照する側」の列より前に定義されている必要がある)
 fn generate_row(columns: &[PreparedColumn], row_num: u32, rng: &mut impl Rng) -> Vec<Option<String>> {
+    // RowContext::default()は「全フィールドを空(None)にした初期状態」を作る
+    // (structにderive(Default)が付いているとこのメソッドが自動で使えるようになる)
     let mut ctx = RowContext::default();
     let mut values = Vec::with_capacity(columns.len());
 
+    // 列を先頭から順番に1つずつ処理する(この「順番通り」というのが、prefecture_ja→city_ja
+    // のような参照関係が成立するために重要な前提になっている)
     for column in columns {
         let (cell, name_indices) = generate_cell(column, row_num, rng, &ctx);
+        // 今処理した列が「後ろの列から参照されうる列」なら、その結果をctxに覚えておく。
+        // それ以外の列タイプでは何もしない(`_ => {}`が「何もしない」という意味)
         match column.kind {
             PreparedColumnType::PrefectureJa => ctx.last_prefecture = cell.clone(),
             PreparedColumnType::NameJa { .. } => ctx.last_name_indices = name_indices,
@@ -1978,6 +2343,10 @@ fn generate_rows_range(
     start_row: u32,
     end_row: u32,
 ) -> Vec<Vec<Option<String>>> {
+    // into_par_iter()はrayonライブラリが提供するメソッドで、通常のiter()と違い
+    // 「複数のCPUコアに処理を自動で分散して、並列に実行する」イテレータを作る。
+    // 1行ごとにrow_rng(base_seed, row_num)で独立した乱数生成器を作っているため、
+    // どのスレッドがどの行を処理しても結果が変わらない(row_numが同じなら常に同じ乱数列になる)
     (start_row..=end_row)
         .into_par_iter()
         .map(|row_num| {
@@ -1993,6 +2362,9 @@ fn generate_rows_range(
 pub fn generate_all_rows(row_count: u32, columns: &[PreparedColumn], base_seed: u64) -> Vec<Vec<Option<String>>> {
     let progress = new_progress_bar(row_count);
 
+    // 1行目からrow_count行目までを並列に処理する(generate_rows_rangeと同じ考え方)。
+    // progress.inc(1)は進捗バーを1つ分だけ進める呼び出しで、複数のスレッドから同時に
+    // 呼ばれても安全なように作られている(indicatifライブラリ側の保証)
     let rows: Vec<Vec<Option<String>>> = (1..=row_count)
         .into_par_iter()
         .map(|row_num| {
@@ -2062,6 +2434,8 @@ pub fn build_sql_from_rows(
     rows: &[Vec<Option<String>>],
     table_name: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // 列名を1つずつSQL用に整形(sql_ident)し、joinで「, 」区切りの1本の文字列にまとめる
+    // (例: ["id", "name"] → "`id`, `name`"のような形)
     let column_names = columns
         .iter()
         .map(|c| sql_ident(&c.name))
@@ -2069,9 +2443,12 @@ pub fn build_sql_from_rows(
         .join(", ");
     let table_ident = sql_ident(table_name);
 
+    // 1行ずつ、VALUES句の"(値1, 値2, ...)"の形に組み立てる
     let value_rows: Vec<String> = rows
         .iter()
         .map(|row| {
+            // zip(columns)で「セルの値」と「その列の設定(型情報)」を1対1でペアにする
+            // (sql_literalが型に応じたクォートの要否を判断するために列の型が必要なため)
             let values: Vec<String> = row
                 .iter()
                 .zip(columns)
@@ -2084,7 +2461,10 @@ pub fn build_sql_from_rows(
         })
         .collect();
 
-    // INSERT文の組み立て(バッチ分割)はファイル1本を順番に書くだけなので並列化せず、直列に行う
+    // INSERT文の組み立て(バッチ分割)はファイル1本を順番に書くだけなので並列化せず、直列に行う。
+    // chunks(SQL_BATCH_SIZE)は「一覧をSQL_BATCH_SIZE件ずつのかたまりに分割する」メソッドで、
+    // 1本のINSERT文に含める行数を制限している(1本のSQL文が長くなりすぎるのを防ぐため)。
+    // push_strは「文字列の末尾に別の文字列をつなげる」メソッド
     let mut sql = String::new();
     for batch in value_rows.chunks(SQL_BATCH_SIZE as usize) {
         sql.push_str(&format!("INSERT INTO {} ({}) VALUES\n", table_ident, column_names));
@@ -2157,12 +2537,23 @@ pub fn build_csv_from_rows(
     rows: &[Vec<Option<String>>],
     quote_all: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // csvクレート(CSVの読み書きをしてくれる外部ライブラリ)のQuoteStyleは「値をいつ""で
+    // 囲むか」の設定。Alwaysは常に囲む、Necessaryは「カンマ・改行・"を含む値のときだけ」
+    // 囲む(このクレートの標準の挙動)。if式で、quote_allの真偽に応じてどちらを使うか決める
     let quote_style = if quote_all { csv::QuoteStyle::Always } else { csv::QuoteStyle::Necessary };
+    // WriterBuilderは「これから使うWriter(書き込み役)の設定を組み立てる」ためのもの。
+    // from_writer(Vec::new())で「ファイルではなく、メモリ上の空のバイト列(Vec)に書き込む」
+    // writerを作る(すぐファイルに保存せず、まず文字列として組み立てたいため)
     let mut writer = csv::WriterBuilder::new().quote_style(quote_style).from_writer(Vec::new());
+    // 各列の名前だけを取り出してVec(配列)にする(1行目=ヘッダー行にするため)
     let headers: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-    writer.write_record(&headers)?; // ヘッダー行
+    writer.write_record(&headers)?; // ヘッダー行を書き込む(?は「エラーなら即座に呼び出し元へ返す」構文)
 
+    // rowsに入っている行を1行ずつ順番に処理する
     for row in rows {
+        // 1行分のセルを見て、値があればその文字列、無ければ(None=NULL)空文字にする。
+        // as_deref()は「Option<String>からOption<&str>を取り出す」変換、
+        // unwrap_or("")は「値が無ければ代わりに空文字を使う」という意味
         let record: Vec<&str> = row.iter().map(|cell| cell.as_deref().unwrap_or("")).collect();
         writer.write_record(&record)?;
     }
@@ -2187,6 +2578,13 @@ fn build_csv(
 // on_progressはチャンクを書き終えるたびに(完了行数, 全行数)で呼ばれる。
 // CLI側はindicatif::ProgressBar::set_positionを、GUI側はTauriのイベント発火を
 // 渡すことを想定している。
+// row_countを一度に全部メモリに載せず、chunk_size行ずつ「生成してすぐファイルに書き足す」を
+// 繰り返す関数(処理の中身はbuild_csv_from_rowsと似ているが、こちらは全行を溜め込まない)。
+// 大まかな流れ:
+//   1. ファイルを開き、必要ならBOM(後述)を書く
+//   2. chunk_size行ずつ、範囲を区切って値を生成する(generate_rows_range)
+//   3. 生成した分だけCSVの文字列に組み立て、文字コードを変換してファイルに書き足す
+//   4. 全部書き終わるまで2〜3を繰り返す
 pub fn write_csv_streaming(
     row_count: u32,
     columns: &[PreparedColumn],
@@ -2208,8 +2606,13 @@ pub fn write_csv_streaming(
     quote_all: bool,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // File::create(path)は指定したパスに新しいファイルを作る(既にあれば中身を空にする)。
+    // BufWriterは「書き込みをまとめて行う」ラッパーで、1バイトずつファイルに直接書き込むより
+    // 速くなる(内部にバッファ=一時的な貯め場所を持ち、ある程度たまってからまとめて書き出す)
     let file = std::fs::File::create(path)?;
     let mut out = std::io::BufWriter::new(file);
+    // write_all(&[0xEF, 0xBB, 0xBF])は、UTF-8のBOMを表す3バイトをそのままファイルの
+    // 先頭に書き込む処理(&[...]はバイトの配列への参照)
     if write_bom && matches!(encoding, Encoding::Utf8) {
         out.write_all(&[0xEF, 0xBB, 0xBF])?;
     }
@@ -2228,10 +2631,18 @@ pub fn write_csv_streaming(
         on_progress(0, 0);
     }
 
+    // (1..=row_count).step_by(chunk_size)は「1からrow_countまでを、chunk_size個おきに
+    // 取り出す」という範囲の作り方。例えばrow_count=10000, chunk_size=1000なら、
+    // chunk_startは1, 1001, 2001, ... と1000おきの値になり、1回のループで1000行ずつ処理する
     for chunk_start in (1..=row_count).step_by(chunk_size as usize) {
+        // このチャンク(かたまり)の終わりの行番号。chunk_start+chunk_size-1が本来の終わりだが、
+        // それがrow_countを超える場合(最後のチャンクで端数が出る場合)はrow_countで打ち切る。
+        // .min(row_count)は「2つの値のうち小さい方を選ぶ」メソッド
         let chunk_end = (chunk_start + chunk_size - 1).min(row_count);
         let rows = generate_rows_range(columns, base_seed, chunk_start, chunk_end);
 
+        // このチャンク分だけのCSVテキストを組み立てる(build_csv_from_rowsと同じ要領だが、
+        // ヘッダー行は最初のチャンク(chunk_start == 1)のときだけ書く)
         let mut writer = csv::WriterBuilder::new().quote_style(quote_style).from_writer(Vec::new());
         if chunk_start == 1 {
             let headers: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
@@ -2242,12 +2653,16 @@ pub fn write_csv_streaming(
             writer.write_record(&record)?;
         }
         let text = String::from_utf8(writer.into_inner()?)?;
+        // 組み立てたテキストを、指定の文字コードに変換してファイルに書き足す
+        // (rows自体はこの後使われないので、次のループでメモリから解放される=溜め込まれない)
         write_chunk_text(&mut out, &text, encoding, &mut had_sjis_errors)?;
 
         done += (chunk_end - chunk_start + 1) as u64;
         on_progress(done, total);
     }
 
+    // flush()は「BufWriterの内部バッファに残っている分を、確実にファイルへ書き出す」処理。
+    // BufWriterは自動でも書き出すが、関数の最後で明示的に呼んで書き漏れが無いようにしている
     out.flush()?;
     if had_sjis_errors {
         eprintln!("警告: Shift-JISに変換できない文字が '?' に置き換えられました");
@@ -2343,13 +2758,21 @@ pub fn build_json_from_rows(
     columns: &[PreparedColumn],
     rows: &[Vec<Option<String>>],
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // 1行につき1つのJSONオブジェクト(文字列)を作り、linesという一覧にまとめる
     let lines: Vec<String> = rows
         .iter()
         .map(|row| {
+            // serde_json::Mapは「キーと値の組」を順序を保ったまま持てる入れ物(JSONの{}に対応する)。
+            // with_capacity(columns.len())は、最終的に列の数だけ入ることが分かっているので、
+            // 内部の領域を先に確保しておく最適化(無くても動作は変わらない)
             let mut object = serde_json::Map::with_capacity(columns.len());
             for (column, cell) in columns.iter().zip(row) {
                 object.insert(column.name.clone(), cell_to_json(&column.kind, cell.as_deref()));
             }
+            // serde_json::to_string(...)はMapをJSON形式の文字列に変換するメソッド。
+            // expect(...)は「ここで失敗するとしたらプログラムのバグなので、その場で
+            // 止めて知らせる」という意図(通常のString/数値/真偽値だけを詰めているMapが
+            // JSON化に失敗することは無い)
             serde_json::to_string(&object).expect("serde_jsonのオブジェクト直列化は失敗しない")
         })
         .collect();
@@ -2378,12 +2801,17 @@ fn write_xlsx_cell(
     kind: &PreparedColumnType,
     cell: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // セルの値がNone(NULL)なら、何も書き込まずにここで終わる(Excel上は空白セルになる)
     let Some(value) = cell else {
         return Ok(());
     };
 
     match kind {
         PreparedColumnType::Sequence | PreparedColumnType::Integer { .. } | PreparedColumnType::Float { .. } => {
+            // value.parse::<f64>()は「文字列を小数として読み取れるか試す」処理で、
+            // 成功すればOk(数値)、失敗すればErrになる。"if let Ok(number) = ... "は
+            // 「読み取れたときだけ」中に入る構文で、読み取れれば数値セルとして、
+            // 読み取れなければ(想定外の値が来た場合の保険として)文字列セルとして書き込む
             if let Ok(number) = value.parse::<f64>() {
                 worksheet.write_number(row, col, number)?;
             } else {
@@ -2614,8 +3042,12 @@ pub fn write_output_multi_table(
     quote_all: bool,
 ) -> Result<Vec<(String, u32)>, Box<dyn std::error::Error>> {
     match format {
+        // csv/jsonはテーブルごとに別ファイルに保存する形式なので、同じ処理でまとめて扱う
         Format::Csv | Format::Json => {
-            // 書き込みを始める前に、サニタイズ後のファイル名が衝突しないか確認する
+            // 書き込みを始める前に、サニタイズ後のファイル名が衝突しないか確認する。
+            // 先に全テーブル分のパスを計算してpathsに集め、containsで「もう同じパスが
+            // 無いか」を1つずつ確認する(1つでも衝突があれば、途中まで書き込んでしまう前に
+            // エラーで止められる)
             let mut paths = Vec::with_capacity(tables.len());
             for table in tables {
                 let path = table_file_path(base_path, table.name.unwrap_or(""));
@@ -2630,6 +3062,8 @@ pub fn write_output_multi_table(
             }
 
             let mut written = Vec::with_capacity(tables.len());
+            // zip(...)は「2つの一覧を先頭同士、2番目同士…と1対1でペアにする」メソッド。
+            // ここではtables(テーブルの中身)とpaths(保存先パス)を組にして、1テーブルずつ処理する
             for (table, path) in tables.iter().zip(paths) {
                 let text = match format {
                     Format::Csv => build_csv_from_rows(table.columns, table.rows, quote_all)?,
@@ -3424,10 +3858,62 @@ mod tests {
 
     #[test]
     fn prepare_columns_rejects_unique_on_unsupported_type() {
-        // fixedは常に同じ値を返す型なので、2行以上でunique:trueを付けると原理的に
-        // 満たせない(このtypeをuniqueの非対応例として使う。address_ja等は今はRetry方式で対応済み)
+        // patternは組み合わせ数の計算が複雑なため非対応のまま(このtypeを非対応の例として使う。
+        // fixed/address_ja等は現在Enumerable/Retry方式でそれぞれ対応済み)
         let schema = schema_from_yaml(
-            "row_count: 5\ncolumns:\n  - name: a\n    type: fixed\n    value: x\n    unique: true\n",
+            "row_count: 5\ncolumns:\n  - name: a\n    type: pattern\n    pattern: \"[A-Z]{3}\"\n    unique: true\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    // fixedは常に同じ値を返す型なので、唯一の組み合わせ(row_count=1)でだけunique指定が成立し、
+    // 2行以上を指定すると他のEnumerable型と同じ「組み合わせが足りない」エラーになることを確認する
+    #[test]
+    fn unique_fixed_allows_row_count_one_but_rejects_more() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: a\n    type: fixed\n    value: x\n    unique: true\n",
+        );
+        let mut columns = prepare_columns(&schema).unwrap();
+        resolve_unique_pools(&mut columns, schema.row_count, 42);
+        let rows = generate_all_rows(schema.row_count, &columns, 42);
+        assert_eq!(rows[0][0].as_deref(), Some("x"));
+
+        let schema_two_rows = schema_from_yaml(
+            "row_count: 2\ncolumns:\n  - name: a\n    type: fixed\n    value: x\n    unique: true\n",
+        );
+        assert!(prepare_columns(&schema_two_rows).is_err());
+    }
+
+    // floatは範囲・桁数から組み合わせ数を計算し、小さければEnumerable(全列挙)・
+    // 大きければRetry(作っては重複チェック)のどちらでも重複なく生成できることを確認する
+    #[test]
+    fn unique_float_produces_no_duplicates_both_enumerable_and_retry() {
+        // 組み合わせが11通り(0.0〜1.0を0.1刻み)しかない、Enumerableになる小さい範囲
+        let small_schema = schema_from_yaml(
+            "row_count: 11\ncolumns:\n  - name: v\n    type: float\n    min: 0.0\n    max: 1.0\n    decimals: 1\n    unique: true\n",
+        );
+        let mut columns = prepare_columns(&small_schema).unwrap();
+        resolve_unique_pools(&mut columns, small_schema.row_count, 42);
+        let rows = generate_all_rows(small_schema.row_count, &columns, 42);
+        let values: std::collections::HashSet<_> = rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(values.len(), 11, "float(小範囲): unique指定で重複が生じた");
+
+        // 組み合わせが1000万通りあり、Retryになる大きい範囲
+        let large_schema = schema_from_yaml(
+            "row_count: 50\ncolumns:\n  - name: v\n    type: float\n    min: 0.0\n    max: 1000.0\n    decimals: 2\n    unique: true\n",
+        );
+        let mut columns = prepare_columns(&large_schema).unwrap();
+        resolve_unique_pools(&mut columns, large_schema.row_count, 42);
+        let rows = generate_all_rows(large_schema.row_count, &columns, 42);
+        let values: std::collections::HashSet<_> = rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(values.len(), 50, "float(大範囲): unique指定で重複が生じた");
+    }
+
+    #[test]
+    fn prepare_columns_rejects_unique_float_when_row_count_exceeds_capacity() {
+        // 0.0〜1.0を1.0刻み(decimals:0)だと組み合わせは2通り(0と1)しかない
+        let schema = schema_from_yaml(
+            "row_count: 3\ncolumns:\n  - name: v\n    type: float\n    min: 0.0\n    max: 1.0\n    decimals: 0\n    unique: true\n",
         );
         assert!(prepare_columns(&schema).is_err());
     }
