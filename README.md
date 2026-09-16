@@ -85,6 +85,8 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `katakana_first_name` | フリガナ(名)のみ。他の列とは対応付けない独立ランダム | なし |
 | `katakana_name` | フリガナ(全角)。**直前に`name_ja`列があれば、その氏名と対応する読みを選ぶ**。無ければランダム | なし |
 | `katakana_name_hankaku` | フリガナ(半角)。参照ロジックは`katakana_name`と同じ | なし |
+| `gender` | "男性"/"女性"を50%ずつのランダムで返す。他の列との連動は無い独立ランダム | なし |
+| `blood_type` | "A型"/"O型"/"B型"/"AB型"を、日本人の血液型分布の目安(4:3:2:1)で重み付けして返す | なし |
 | `email` | `user{連番}@{domain}` | `domain`(省略時`example.com`) |
 | `integer` | `min`〜`max`のランダムな整数 | `min`, `max` |
 | `float` | `min`〜`max`のランダムな小数 | `min`, `max`, `decimals`(省略時2) |
@@ -104,6 +106,9 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `ip_address` | IPv4アドレス(例: `192.168.1.1`) | なし |
 | `jwt` | それっぽい形のJWT風文字列(署名検証はできないダミー) | なし |
 | `api_key` | `sk_`+英数字32文字のAPIキー風文字列 | なし |
+| `username` | ローマ字の名前(小文字)+3桁の数字(例: `taro123`) | なし |
+| `password` | 英大文字・英小文字・数字・一部記号を含むダミーのパスワード風文字列(12文字) | なし |
+| `profile_image_url` | プレースホルダー画像サービス(`placehold.jp`)のURL文字列。実際に画像を取得したり通信したりはしない | なし |
 | `credit_card_number` | 16桁、Luhnアルゴリズムで検査数字を計算したクレジットカード番号風 | なし |
 | `credit_card_expiry` | クレジットカードの有効期限(`MM/YY`形式、今日から1〜5年後) | なし |
 | `bank_account_number` | 日本の普通預金口座番号を想定した7桁のゼロ埋め数字 | なし |
@@ -111,6 +116,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `my_number` | 12桁、個人番号法の検査数字計算方法に従ったマイナンバー風 | なし |
 | `enum` | `choices`の中からランダムに1つ選ぶ | `choices`(文字列のリスト)、`weights`(省略可。`choices`と同じ個数の数値のリストで出現比率を指定する。例: `choices: [利用中, 休止中]` に `weights: [7, 3]` で7:3の比率。省略時は均等ランダム) |
 | `fixed` | どの行でも常に同じ文字列を返す | `value` |
+| `pattern` | 正規表現に似た簡易記法から値を生成する(例: `"[A-Z]{3}-[0-9]{4}"` → `"ABC-1234"`)。対応するのはリテラル文字・`[...]`文字クラス(範囲`a-z`・`^`否定)・量指定子`?`/`*`/`+`/`{n}`/`{n,}`/`{n,m}`のみで、グループ化`(...)`や選択`\|`は非対応 | `pattern` |
 | `foreign_key` | 親テーブルに実在する値からランダムに1つ選ぶ(複数テーブル形式`tables:`専用) | `references`(`"テーブル名.列名"`形式) |
 
 どの列タイプにも `null_rate`(0.0〜1.0)を追加でき、その確率でNULL(CSVでは空文字、SQLではクォートなしの`NULL`、JSONでは`null`)を出力する。
@@ -121,7 +127,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 
 列に `unique: true` を付けると、その列の値が行間で重複しないようにする。対応している型は以下の通り。
 
-- 組み合わせ数が少なく全列挙できる型: `enum` / `boolean` / `integer` / `date` / `name_ja`(姓30×名20=600通り) / `last_name_ja` / `first_name_ja`(`enum`に`weights`を指定していても、`unique: true`のときは全選択肢を重複なく列挙するだけなので`weights`は無視される)
+- 組み合わせ数が少なく全列挙できる型: `enum` / `boolean` / `gender`(2通り) / `blood_type`(4通り) / `integer` / `date` / `name_ja`(姓30×名20=600通り) / `last_name_ja` / `first_name_ja`(`enum`に`weights`を指定していても、`unique: true`のときは全選択肢を重複なく列挙するだけなので`weights`は無視される)
 - 組み合わせ数が膨大(だが十分すぎるほど大きい)ため、値を作っては重複チェックし被ったら作り直す方式で対応する型: `phone_ja` / `phone_ja_landline`
 - それ以外(`postal_code`/`address_ja`/`float`/`romaji_name`/`credit_card_number`等)は非対応。値の重複を避けたい場合は、より小さい組み合わせ数の`enum`/`integer`で代用することを想定している
 
@@ -232,7 +238,7 @@ columns:
 
 ## GUI版(DummyGen JP)について
 
-`C:\dev_2\dummygen_jp_gui` に、このツールをライブラリ(`src/lib.rs`)として組み込んだTauri v2 + React 19のデスクトップGUIアプリ「DummyGen JP」がある。コマンド操作に不慣れな担当者向けに、カラム設定・生成件数・出力形式(CSV/SQL)・文字コード(UTF-8/Shift-JIS)・値をダブルクォートで囲むかどうかを画面から設定できるほか、サンプルCSVの読み込みによる列・選択肢の自動設定、列のドラッグ並べ替え・複製、設定の保存・読み込み(プルダウン)、ワンクリックテンプレート、生成前のリアルタイムプレビュー(表示件数を変更可能)、複数テーブル(外部キー)対応、列設定のYAML書き出し/読み込み(このツールの`schema.yaml`と互換)といった画面独自の機能を持つ。GUIはCSV/SQL出力のみ対応(JSON/Excel出力は今のところCLI専用)。複数テーブルのGUI生成は、CLI(`tables:`形式)と同じく全テーブル分の行を一度メモリに載せてから書き出す方式(単一テーブルの方は今まで通りメモリを圧迫しない方式のまま)。また、GUIの複数テーブルCSV出力は`quote_all`(値を""で囲むオプション)に対応していない(単一テーブルのみ)。GUIから生成したUTF-8のCSVには、Excelで開いたときに文字化けしないようファイル先頭にBOMを付けている(CLIの`--encoding utf8`出力にはBOMは付かず、これまで通り)。
+`C:\dev_2\dummygen_jp_gui` に、このツールをライブラリ(`src/lib.rs`)として組み込んだTauri v2 + React 19のデスクトップGUIアプリ「DummyGen JP」がある。コマンド操作に不慣れな担当者向けに、カラム設定・生成件数・出力形式(CSV/SQL/Excel)・文字コード(UTF-8/Shift-JIS。Excel選択時は文字コードの概念が無いため設定不要)・値をダブルクォートで囲むかどうかを画面から設定できるほか、サンプルCSVの読み込みによる列・選択肢の自動設定、列のドラッグ並べ替え・複製、設定の保存・読み込み(プルダウン)、ワンクリックテンプレート、生成前のリアルタイムプレビュー(表示件数を変更可能)、複数テーブル(外部キー)対応、列設定のYAML書き出し/読み込み(このツールの`schema.yaml`と互換)といった画面独自の機能を持つ。GUIはCSV/SQL/Excel出力に対応(JSON出力は今のところCLI専用)。Excel(xlsx)出力は単一テーブル・複数テーブルのどちらも、CLIと同じく全行を一度メモリに載せてから書き出す方式(ストリーミング書き込みは無い)。複数テーブルのCSV/SQL生成も、CLI(`tables:`形式)と同じく全テーブル分の行を一度メモリに載せてから書き出す方式(単一テーブルのCSV/SQLは今まで通りメモリを圧迫しない方式のまま)。また、GUIの複数テーブルCSV出力は`quote_all`(値を""で囲むオプション)に対応していない(単一テーブルのみ)。GUIから生成したUTF-8のCSVには、Excelで開いたときに文字化けしないようファイル先頭にBOMを付けている(CLIの`--encoding utf8`出力にはBOMは付かず、これまで通り)。
 
 ## Dr.Sum / MotionBoard / Datalizer 等での利用について
 
