@@ -151,7 +151,9 @@ fn normalize_schema_file(raw: RawSchemaFile) -> Result<SchemaFile, Box<dyn std::
             // is_none_or(...)は「Noneなら true、Someなら中身を関数(ここではstr::is_empty=
             // 「空文字かどうか」)に渡した結果を返す」という判定。つまりここは
             // 「テーブル名が指定されていない、または空文字である」ことを調べている
-            if table.table_name.as_deref().is_none_or(str::is_empty) {
+            // is_none_or(...)の中身をstr::is_emptyから「trim後が空文字か」に変えることで、
+            // 未指定・空文字だけでなく空白だけの名前(例: "   ")も同じくエラーにする
+            if table.table_name.as_deref().is_none_or(|s| s.trim().is_empty()) {
                 return Err(format!("tables[{}]: テーブル名(name)を指定してください", i).into());
             }
         }
@@ -281,9 +283,17 @@ pub enum ColumnType {
     Uuid,
     PrefectureJa,
     CityJa,
-    KatakanaName,
-    // katakana_nameの半角カタカナ版。直前のname_ja列を参照する挙動は同じ
-    KatakanaNameHankaku,
+    KatakanaName {
+        // name_jaのwith_spaceと同じ意味・既定値(省略時false=既存のschema.yamlと同じ姓名連結)。
+        // trueのとき姓の読みと名の読みの間に半角スペースを入れる(例: "ヤマダ タロウ")
+        #[serde(default)]
+        with_space: bool,
+    },
+    // katakana_nameの半角カタカナ版。直前のname_ja列を参照する挙動・with_spaceの意味は同じ
+    KatakanaNameHankaku {
+        #[serde(default)]
+        with_space: bool,
+    },
     DepartmentJa,
     JobTitleJa,
     // IPv4のみ対応(IPv6は現状スコープ外)
@@ -445,8 +455,8 @@ pub enum PreparedColumnType {
     Uuid,
     PrefectureJa,
     CityJa,
-    KatakanaName,
-    KatakanaNameHankaku,
+    KatakanaName { with_space: bool },
+    KatakanaNameHankaku { with_space: bool },
     DepartmentJa,
     JobTitleJa,
     IpAddress,
@@ -633,6 +643,17 @@ fn compile_pattern(pattern: &str) -> Result<Vec<PatternPiece>, String> {
                 i += close + 1;
             }
             ']' | '}' => return Err(format!("対応する開き括弧の無い'{}'がある", chars[i])),
+            // グループ化"(...)"と選択"a|b"は非対応の構文(README/CLAUDE.md記載の通り)。
+            // 対応表に無い記号として黙って1文字ずつのリテラル扱いにしてしまうと、
+            // 例えば"(abc)"や"a|b"がそのまま固定文字列として生成されてしまい、
+            // ユーザーが意図した挙動(繰り返しのグループ化・二択)が全く効かないのに
+            // 気づきにくい。他の非対応構文と同様、はっきりエラーにする
+            '(' | ')' | '|' => {
+                return Err(format!(
+                    "'{}'はこのpatternでは使えません(グループ化\"(...)\"や選択\"a|b\"は非対応です)",
+                    chars[i]
+                ));
+            }
             c => {
                 flush_default(&mut pending, &mut pieces);
                 pending = Some(vec![c]);
@@ -696,10 +717,18 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
     if schema.columns.is_empty() {
         return Err("columns には少なくとも1つ以上の列を定義してください".into());
     }
+    if schema.row_count == 0 {
+        return Err("row_count には1以上を指定してください".into());
+    }
 
     // 全ての列の組み合わせを1つずつ比較し、同じ名前の列が無いかを確認する
     // (normalize_schema_fileのテーブル名重複チェックと同じ「二重ループで総当たり」の考え方)
     for i in 0..schema.columns.len() {
+        // trim()で前後の空白を取り除いた結果が空文字なら、空文字自体はもちろん
+        // 空白だけの列名(例: "   ")も列名としては使えないため弾く
+        if schema.columns[i].name.trim().is_empty() {
+            return Err("列名は空文字・空白だけにはできません".into());
+        }
         for j in (i + 1)..schema.columns.len() {
             if schema.columns[i].name == schema.columns[j].name {
                 return Err(format!(
@@ -804,8 +833,12 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 ColumnType::Uuid => PreparedColumnType::Uuid,
                 ColumnType::PrefectureJa => PreparedColumnType::PrefectureJa,
                 ColumnType::CityJa => PreparedColumnType::CityJa,
-                ColumnType::KatakanaName => PreparedColumnType::KatakanaName,
-                ColumnType::KatakanaNameHankaku => PreparedColumnType::KatakanaNameHankaku,
+                ColumnType::KatakanaName { with_space } => {
+                    PreparedColumnType::KatakanaName { with_space: *with_space }
+                }
+                ColumnType::KatakanaNameHankaku { with_space } => {
+                    PreparedColumnType::KatakanaNameHankaku { with_space: *with_space }
+                }
                 ColumnType::DepartmentJa => PreparedColumnType::DepartmentJa,
                 ColumnType::JobTitleJa => PreparedColumnType::JobTitleJa,
                 ColumnType::IpAddress => PreparedColumnType::IpAddress,
@@ -977,8 +1010,8 @@ fn misplaced_city_ja_warnings(columns: &[PreparedColumn]) -> Vec<String> {
 fn misplaced_katakana_name_warnings(columns: &[PreparedColumn]) -> Vec<String> {
     fn type_label(kind: &PreparedColumnType) -> &'static str {
         match kind {
-            PreparedColumnType::KatakanaName => "katakana_name",
-            PreparedColumnType::KatakanaNameHankaku => "katakana_name_hankaku",
+            PreparedColumnType::KatakanaName { .. } => "katakana_name",
+            PreparedColumnType::KatakanaNameHankaku { .. } => "katakana_name_hankaku",
             PreparedColumnType::RomajiName => "romaji_name",
             _ => unreachable!("直前のfilterでこの3型に絞り込み済み"),
         }
@@ -990,8 +1023,8 @@ fn misplaced_katakana_name_warnings(columns: &[PreparedColumn]) -> Vec<String> {
         .filter(|(_, c)| {
             matches!(
                 c.kind,
-                PreparedColumnType::KatakanaName
-                    | PreparedColumnType::KatakanaNameHankaku
+                PreparedColumnType::KatakanaName { .. }
+                    | PreparedColumnType::KatakanaNameHankaku { .. }
                     | PreparedColumnType::RomajiName
             )
         })
@@ -1840,10 +1873,26 @@ fn random_name(rng: &mut impl Rng, with_space: bool) -> String {
 }
 
 // context(前の列のname_ja)がSomeなら、その氏名と同じ添字のカタカナ読みを返す。
-// Noneなら独自にランダムな氏名の読みを作る(katakana_name単独使用時のフォールバック)
-fn random_katakana_name(rng: &mut impl Rng, context: Option<(usize, usize)>) -> String {
+// Noneなら独自にランダムな氏名の読みを作る(katakana_name単独使用時のフォールバック)。
+// with_spaceはname_jaのformat_nameと同じ意味(trueで姓の読みと名の読みの間に半角スペース)
+fn random_katakana_name(rng: &mut impl Rng, context: Option<(usize, usize)>, with_space: bool) -> String {
     let (last_idx, first_idx) = context.unwrap_or_else(|| random_name_indices(rng));
-    format!("{}{}", LAST_NAMES_KANA[last_idx], FIRST_NAMES_KANA[first_idx])
+    let separator = if with_space { " " } else { "" };
+    format!("{}{}{}", LAST_NAMES_KANA[last_idx], separator, FIRST_NAMES_KANA[first_idx])
+}
+
+// katakana_name_hankaku用。姓の読み・名の読みをそれぞれ個別に半角変換してから連結する
+// (先に全角のまま連結してto_hankaku_katakanaへ通すと、区切りの半角スペースが
+// KATAKANA_FULL_TO_HALFに載っていない文字として空文字に落とされてしまうため)
+fn random_katakana_name_hankaku(rng: &mut impl Rng, context: Option<(usize, usize)>, with_space: bool) -> String {
+    let (last_idx, first_idx) = context.unwrap_or_else(|| random_name_indices(rng));
+    let separator = if with_space { " " } else { "" };
+    format!(
+        "{}{}{}",
+        to_hankaku_katakana(LAST_NAMES_KANA[last_idx]),
+        separator,
+        to_hankaku_katakana(FIRST_NAMES_KANA[first_idx])
+    )
 }
 
 // random_katakana_nameと同じ考え方で、直前のname_ja列と同じ氏名のローマ字表記を返す。
@@ -2134,11 +2183,11 @@ fn generate_cell(
     // にそのまま任せる
     match column.kind {
         PreparedColumnType::CityJa => (Some(random_city(rng, ctx.last_prefecture.as_deref())), None),
-        PreparedColumnType::KatakanaName => {
-            (Some(random_katakana_name(rng, ctx.last_name_indices)), None)
+        PreparedColumnType::KatakanaName { with_space } => {
+            (Some(random_katakana_name(rng, ctx.last_name_indices, with_space)), None)
         }
-        PreparedColumnType::KatakanaNameHankaku => {
-            (Some(to_hankaku_katakana(&random_katakana_name(rng, ctx.last_name_indices))), None)
+        PreparedColumnType::KatakanaNameHankaku { with_space } => {
+            (Some(random_katakana_name_hankaku(rng, ctx.last_name_indices, with_space)), None)
         }
         PreparedColumnType::RomajiName => (Some(random_romaji_name(rng, ctx.last_name_indices)), None),
         PreparedColumnType::NameJa { with_space } => {
@@ -2228,8 +2277,10 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         // context(前の列のprefecture_ja/name_ja)が無い状態での単独生成。
         // 文脈付きの生成はgenerate_cellが行う
         PreparedColumnType::CityJa => random_city(rng, None),
-        PreparedColumnType::KatakanaName => random_katakana_name(rng, None),
-        PreparedColumnType::KatakanaNameHankaku => to_hankaku_katakana(&random_katakana_name(rng, None)),
+        PreparedColumnType::KatakanaName { with_space } => random_katakana_name(rng, None, *with_space),
+        PreparedColumnType::KatakanaNameHankaku { with_space } => {
+            random_katakana_name_hankaku(rng, None, *with_space)
+        }
         // context(前の列のname_ja)が無い状態での単独生成。文脈付きの生成はgenerate_cellが行う
         PreparedColumnType::RomajiName => random_romaji_name(rng, None),
         PreparedColumnType::KatakanaLastName => random_katakana_last_name(rng),
@@ -2291,8 +2342,8 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
             | PreparedColumnType::Uuid
             | PreparedColumnType::PrefectureJa
             | PreparedColumnType::CityJa
-            | PreparedColumnType::KatakanaName
-            | PreparedColumnType::KatakanaNameHankaku
+            | PreparedColumnType::KatakanaName { .. }
+            | PreparedColumnType::KatakanaNameHankaku { .. }
             | PreparedColumnType::DepartmentJa
             | PreparedColumnType::JobTitleJa
             | PreparedColumnType::IpAddress
@@ -2434,6 +2485,14 @@ pub fn build_sql_from_rows(
     rows: &[Vec<Option<String>>],
     table_name: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // table_nameが空文字・空白だけ(例: "   ")だと、そのままではINSERT INTO "   "のような
+    // 実用上意味のない(データベースによっては構文エラーになる)SQLになってしまうため、
+    // ここで一括して弾く。呼び出し元(単一テーブル・複数テーブルどちらも)は全てこの関数を
+    // 経由するため、ここ1箇所でチェックすれば十分
+    if table_name.trim().is_empty() {
+        return Err("SQL出力(--format sql)には、schema.yamlに table_name の指定が必要です".into());
+    }
+
     // 列名を1つずつSQL用に整形(sql_ident)し、joinで「, 」区切りの1本の文字列にまとめる
     // (例: ["id", "name"] → "`id`, `name`"のような形)
     let column_names = columns
@@ -3136,6 +3195,17 @@ mod tests {
         assert_eq!(reloaded.tables[1].table_name.as_deref(), Some("orders"));
     }
 
+    // 回帰テスト: 以前はtables:形式のテーブル名が空白だけ(例: "   ")でも
+    // 「テーブル名が指定されていない」扱いにならず、そのまま通ってしまっていた
+    #[test]
+    fn normalize_schema_file_rejects_whitespace_only_table_name() {
+        let raw: RawSchemaFile = serde_yaml::from_str(
+            "tables:\n  - name: \"   \"\n    row_count: 5\n    columns:\n      - name: id\n        type: sequence\n",
+        )
+        .unwrap();
+        assert!(normalize_schema_file(raw).is_err());
+    }
+
     // 複数テーブル(tables:形式)のCSV出力でも、quote_all: trueで全ての値がダブルクォートで
     // 囲まれることを確認する(以前はwrite_output_multi_tableにこの引数が無く、常にfalse相当だった)
     #[test]
@@ -3280,12 +3350,43 @@ mod tests {
         assert!(prepare_columns(&schema).is_err());
     }
 
+    // 回帰テスト: 以前はrow_count: 0でもエラーにならず、ヘッダ行だけの0行ファイルが
+    // 何も警告なく生成できてしまっていた
+    #[test]
+    fn prepare_columns_rejects_row_count_zero() {
+        let schema = schema_from_yaml("row_count: 0\ncolumns:\n  - name: id\n    type: sequence\n");
+        assert!(prepare_columns(&schema).is_err());
+    }
+
     #[test]
     fn prepare_columns_rejects_duplicate_column_names() {
         let schema = schema_from_yaml(
             "row_count: 1\ncolumns:\n  - name: id\n    type: sequence\n  - name: id\n    type: email\n",
         );
         assert!(prepare_columns(&schema).is_err());
+    }
+
+    // 回帰テスト: 以前は列名が空文字・空白だけでもエラーにならず、SQL出力すると
+    // INSERT INTO "t" ("") VALUES ... のような、実際のデータベースでは無効な
+    // 識別子としてエラーになりうるSQLが生成できてしまっていた
+    #[test]
+    fn prepare_columns_rejects_blank_column_name() {
+        let empty = schema_from_yaml("row_count: 1\ncolumns:\n  - name: \"\"\n    type: sequence\n");
+        assert!(prepare_columns(&empty).is_err());
+        let whitespace_only =
+            schema_from_yaml("row_count: 1\ncolumns:\n  - name: \"   \"\n    type: sequence\n");
+        assert!(prepare_columns(&whitespace_only).is_err());
+    }
+
+    // 回帰テスト: 以前はtable_nameが空白だけ(例: "   ")でもSQL出力時にエラーにならず、
+    // INSERT INTO "   " (...) のような実用上意味のないSQLが生成できてしまっていた
+    #[test]
+    fn build_sql_from_rows_rejects_blank_table_name() {
+        let schema = schema_from_yaml("row_count: 1\ncolumns:\n  - name: id\n    type: sequence\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let rows = generate_all_rows(1, &columns, 1);
+        assert!(build_sql_from_rows(&columns, &rows, "").is_err());
+        assert!(build_sql_from_rows(&columns, &rows, "   ").is_err());
     }
 
     // 回帰テスト: 以前はShift-JISで表現できない文字をHTML文字参照("&#12345;")に
@@ -3573,6 +3674,29 @@ mod tests {
     #[test]
     fn compile_pattern_rejects_empty_pattern() {
         assert!(compile_pattern("").is_err());
+    }
+
+    // 回帰テスト: 以前はグループ化"(...)"や選択"a|b"が非対応構文にもかかわらず
+    // エラーにも警告にもならず、かっこ・|の記号ごと固定文字列としてそのまま
+    // 生成されてしまっていた(ユーザーが意図した繰り返し・二択が全く効かないのに気づきにくい)
+    #[test]
+    fn compile_pattern_rejects_grouping() {
+        assert!(compile_pattern("(abc)").is_err());
+    }
+
+    #[test]
+    fn compile_pattern_rejects_alternation() {
+        assert!(compile_pattern("a|b").is_err());
+    }
+
+    // エスケープすれば、かっこ・|自体を1文字のリテラルとして使えることの確認
+    // (非対応なのはあくまで「特殊記号としての」グループ化・選択であって、
+    // その文字自体を値に含めたい場合の逃げ道は塞がない)
+    #[test]
+    fn compile_pattern_allows_escaped_grouping_chars_as_literals() {
+        let pieces = compile_pattern(r"\(\)\|").unwrap();
+        let joined: String = pieces.iter().map(|p| p.chars[0]).collect();
+        assert_eq!(joined, "()|");
     }
 
     #[test]
@@ -4284,7 +4408,13 @@ mod tests {
 
     #[test]
     fn write_csv_streaming_with_zero_rows_writes_header_only() {
-        let schema = schema_from_yaml("row_count: 0\ncolumns:\n  - name: id\n    type: sequence\n");
+        // schema.row_count自体は(prepare_columns_rejects_row_count_zeroの通り)0を
+        // 許可しなくなったが、この関数の呼び出し元(GUI側の内部計算等)がrow_countとは
+        // 別に0を渡してくる可能性はゼロではないため、write_csv_streaming自体が
+        // 0行でもクラッシュせずヘッダーだけ書き出せることは引き続き保証しておく。
+        // schemaのrow_countは検証を通すためだけの値(1)にし、実際にstreaming関数へ
+        // 渡すrow_countだけを0にする
+        let schema = schema_from_yaml("row_count: 1\ncolumns:\n  - name: id\n    type: sequence\n");
         let columns = prepare_columns(&schema).unwrap();
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_zero.csv");
@@ -4564,6 +4694,54 @@ mod tests {
             let first_idx = FIRST_NAMES.iter().position(|&n| name.ends_with(n)).unwrap();
             let expected_full = format!("{}{}", LAST_NAMES_KANA[last_idx], FIRST_NAMES_KANA[first_idx]);
             assert_eq!(kana, to_hankaku_katakana(&expected_full));
+        }
+    }
+
+    #[test]
+    fn katakana_name_with_space_true_inserts_space_between_surname_and_given_name() {
+        let schema = schema_from_yaml(
+            "row_count: 10\ncolumns:\n  - name: kana\n    type: katakana_name\n    with_space: true\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 5).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let mut parts = line.splitn(2, ' ');
+            assert!(LAST_NAMES_KANA.contains(&parts.next().unwrap()), "{line}");
+            assert!(FIRST_NAMES_KANA.contains(&parts.next().unwrap()), "{line}");
+        }
+    }
+
+    // with_spaceを省略した場合は、既存のschema.yamlとの後方互換のため今まで通り
+    // スペース無しで出力されることを確認する(name_ja側の同名テストと同じ考え方)
+    #[test]
+    fn katakana_name_without_with_space_field_defaults_to_no_space() {
+        let schema = schema_from_yaml("row_count: 10\ncolumns:\n  - name: kana\n    type: katakana_name\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 5).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(!line.contains(' '), "{line}");
+        }
+    }
+
+    #[test]
+    fn katakana_name_hankaku_with_space_true_inserts_half_width_space() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: name\n    type: name_ja\n  - name: kana\n    type: katakana_name_hankaku\n    with_space: true\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 7).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let mut parts = line.split(',');
+            let name = parts.next().unwrap();
+            let kana = parts.next().unwrap();
+            let last_idx = LAST_NAMES.iter().position(|&n| name.starts_with(n)).unwrap();
+            let first_idx = FIRST_NAMES.iter().position(|&n| name.ends_with(n)).unwrap();
+            let expected = format!(
+                "{} {}",
+                to_hankaku_katakana(LAST_NAMES_KANA[last_idx]),
+                to_hankaku_katakana(FIRST_NAMES_KANA[first_idx])
+            );
+            assert_eq!(kana, expected);
         }
     }
 
