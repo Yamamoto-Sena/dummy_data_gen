@@ -121,6 +121,43 @@ pub struct SchemaFile {
     pub multi_table: bool,
 }
 
+// 複数テーブル形式で「テーブル名が空(または空白だけ)になっていないか」「同じ名前の
+// テーブルが2つ以上無いか」を検証する。schema.yaml読み込み時(normalize_schema_file)と、
+// dummygen_jp_guiから直接呼ばれる複数テーブル生成・プレビュー(prepare_tables。
+// normalize_schema_fileを経由しないため、ここで検証しないとテーブル名の重複が
+// そのまま素通りしてしまう)の両方から使う共通チェック。
+fn validate_multi_table_names(tables: &[Schema]) -> Result<(), Box<dyn std::error::Error>> {
+    // iter()で一覧を1件ずつ取り出し、enumerate()で「0番目、1番目、…」という
+    // 連番(i)も一緒に取り出す。for (i, table) in ... はその2つをそれぞれ
+    // 変数i・tableとして受け取りながら繰り返す構文
+    for (i, table) in tables.iter().enumerate() {
+        // as_deref()はOption<String>をOption<&str>に変換するメソッド、
+        // is_none_or(...)は「Noneなら true、Someなら中身を関数(ここではstr::is_empty=
+        // 「空文字かどうか」)に渡した結果を返す」という判定。つまりここは
+        // 「テーブル名が指定されていない、または空文字である」ことを調べている
+        // is_none_or(...)の中身をstr::is_emptyから「trim後が空文字か」に変えることで、
+        // 未指定・空文字だけでなく空白だけの名前(例: "   ")も同じくエラーにする
+        if table.table_name.as_deref().is_none_or(|s| s.trim().is_empty()) {
+            return Err(format!("tables[{}]: テーブル名(name)を指定してください", i).into());
+        }
+    }
+    // 二重のfor文で「全てのテーブルの組み合わせ」を1つずつ比較し、同じ名前が
+    // 無いか確認する。外側のiが0,1,2...と進み、内側のjは常に「iより後ろ」の
+    // 範囲((i + 1)..tables.len())だけを見るので、同じペアを2回比較しなくて済む
+    for i in 0..tables.len() {
+        for j in (i + 1)..tables.len() {
+            if tables[i].table_name == tables[j].table_name {
+                return Err(format!(
+                    "テーブル名 \"{}\" が重複しています",
+                    tables[i].table_name.as_deref().unwrap_or("")
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
 // RawSchemaFile(YAMLをそのまま受け止めた、全部Option状態の箱)を見て、単一テーブル形式か
 // 複数テーブル形式かを判定し、どちらの場合も同じSchemaFileの形に揃える(正規化する)関数。
 fn normalize_schema_file(raw: RawSchemaFile) -> Result<SchemaFile, Box<dyn std::error::Error>> {
@@ -143,34 +180,7 @@ fn normalize_schema_file(raw: RawSchemaFile) -> Result<SchemaFile, Box<dyn std::
         if tables.is_empty() {
             return Err("tables には少なくとも1つ以上のテーブルを定義してください".into());
         }
-        // iter()で一覧を1件ずつ取り出し、enumerate()で「0番目、1番目、…」という
-        // 連番(i)も一緒に取り出す。for (i, table) in ... はその2つをそれぞれ
-        // 変数i・tableとして受け取りながら繰り返す構文
-        for (i, table) in tables.iter().enumerate() {
-            // as_deref()はOption<String>をOption<&str>に変換するメソッド、
-            // is_none_or(...)は「Noneなら true、Someなら中身を関数(ここではstr::is_empty=
-            // 「空文字かどうか」)に渡した結果を返す」という判定。つまりここは
-            // 「テーブル名が指定されていない、または空文字である」ことを調べている
-            // is_none_or(...)の中身をstr::is_emptyから「trim後が空文字か」に変えることで、
-            // 未指定・空文字だけでなく空白だけの名前(例: "   ")も同じくエラーにする
-            if table.table_name.as_deref().is_none_or(|s| s.trim().is_empty()) {
-                return Err(format!("tables[{}]: テーブル名(name)を指定してください", i).into());
-            }
-        }
-        // 二重のfor文で「全てのテーブルの組み合わせ」を1つずつ比較し、同じ名前が
-        // 無いか確認する。外側のiが0,1,2...と進み、内側のjは常に「iより後ろ」の
-        // 範囲((i + 1)..tables.len())だけを見るので、同じペアを2回比較しなくて済む
-        for i in 0..tables.len() {
-            for j in (i + 1)..tables.len() {
-                if tables[i].table_name == tables[j].table_name {
-                    return Err(format!(
-                        "テーブル名 \"{}\" が重複しています",
-                        tables[i].table_name.as_deref().unwrap_or("")
-                    )
-                    .into());
-                }
-            }
-        }
+        validate_multi_table_names(&tables)?;
         // Ok(...)で関数の戻り値を「成功」として返す(中身はここまでで検証済みのtables)
         return Ok(SchemaFile { tables, multi_table: true });
     }
@@ -1391,6 +1401,14 @@ pub struct PreparedTable {
 
 // SchemaFileの各テーブルにprepare_columnsを適用する
 pub fn prepare_tables(file: &SchemaFile) -> Result<Vec<PreparedTable>, Box<dyn std::error::Error>> {
+    // dummygen_jp_guiから複数テーブルを直接生成・プレビューする経路はSchemaFileを
+    // normalize_schema_fileを経由せず自分で組み立てるため、テーブル名の検証をここでも行う
+    // (schema.yaml経由のときはnormalize_schema_fileで既に検証済みだが、二重にチェックしても
+    // 実害は無い)。
+    if file.multi_table {
+        validate_multi_table_names(&file.tables)?;
+    }
+
     file.tables
         .iter()
         .map(|schema| {
@@ -3204,6 +3222,49 @@ mod tests {
         )
         .unwrap();
         assert!(normalize_schema_file(raw).is_err());
+    }
+
+    // 回帰テスト: dummygen_jp_gui(GUI)から複数テーブルを直接生成・プレビューする経路は
+    // SchemaFileをnormalize_schema_file(schema.yaml読み込み時の検証)を経由せず自分で
+    // 組み立てるため、以前はテーブル名が重複していても・空でもprepare_tablesを素通りしてしまい、
+    // SQL出力(build_sql_multi)で2つの別テーブルが同じテーブル名のINSERT文に混ざったり、
+    // 外部キーの参照先(resolve_foreign_keysのname_to_index)が意図しない方のテーブルに
+    // すり替わったりしていた
+    #[test]
+    fn prepare_tables_rejects_duplicate_table_names_without_going_through_yaml() {
+        let users_a = schema_from_yaml("row_count: 5\ntable_name: users\ncolumns:\n  - name: id\n    type: sequence\n");
+        let users_b = schema_from_yaml(
+            "row_count: 5\ntable_name: users\ncolumns:\n  - name: id\n    type: sequence\n  - name: score\n    type: integer\n    min: 0\n    max: 100\n",
+        );
+        let file = SchemaFile { tables: vec![users_a, users_b], multi_table: true };
+
+        // PreparedTableはDebugを持たないため、unwrap_err()ではなくerr().unwrap()を使う
+        let err = prepare_tables(&file).err().unwrap();
+        assert!(err.to_string().contains("重複しています"), "エラーメッセージ: {}", err);
+    }
+
+    #[test]
+    fn prepare_tables_rejects_blank_table_name_in_multi_table_mode() {
+        let file = SchemaFile {
+            tables: vec![schema_from_yaml(
+                "row_count: 5\ntable_name: \"   \"\ncolumns:\n  - name: id\n    type: sequence\n",
+            )],
+            multi_table: true,
+        };
+
+        assert!(prepare_tables(&file).is_err());
+    }
+
+    // 単一テーブル形式(multi_table: false)ではtable_name未指定が正当な使い方
+    // (CSV/Excel出力等)なので、この検証で誤ってエラーにしないことを確認する
+    #[test]
+    fn prepare_tables_allows_missing_table_name_in_single_table_mode() {
+        let file = SchemaFile {
+            tables: vec![schema_from_yaml("row_count: 3\ncolumns:\n  - name: id\n    type: sequence\n")],
+            multi_table: false,
+        };
+
+        assert!(prepare_tables(&file).is_ok());
     }
 
     // 複数テーブル(tables:形式)のCSV出力でも、quote_all: trueで全ての値がダブルクォートで
