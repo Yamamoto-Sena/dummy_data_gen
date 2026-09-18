@@ -144,14 +144,14 @@ fn validate_multi_table_names(tables: &[Schema]) -> Result<(), Box<dyn std::erro
     // 二重のfor文で「全てのテーブルの組み合わせ」を1つずつ比較し、同じ名前が
     // 無いか確認する。外側のiが0,1,2...と進み、内側のjは常に「iより後ろ」の
     // 範囲((i + 1)..tables.len())だけを見るので、同じペアを2回比較しなくて済む
+    // 上の空欄チェックと同じくtrim後の文字列で比較する。trimしないと"users"と"users "
+    // (末尾に空白)が「別名」と判定されて重複エラーをすり抜けてしまう
     for i in 0..tables.len() {
         for j in (i + 1)..tables.len() {
-            if tables[i].table_name == tables[j].table_name {
-                return Err(format!(
-                    "テーブル名 \"{}\" が重複しています",
-                    tables[i].table_name.as_deref().unwrap_or("")
-                )
-                .into());
+            let name_i = tables[i].table_name.as_deref().unwrap_or("").trim();
+            let name_j = tables[j].table_name.as_deref().unwrap_or("").trim();
+            if name_i == name_j {
+                return Err(format!("テーブル名 \"{}\" が重複しています", name_i).into());
             }
         }
     }
@@ -1858,12 +1858,60 @@ const KATAKANA_FULL_TO_HALF: &[(char, &str)] = &[
 // address_ja(1列で住所)と、prefecture_ja + city_ja(2列に分けたとき)の両方で
 // このテーブルを共有することで、「東京都なのに市区町村は北海道の地名」のような
 // 不自然な組み合わせが起きないようにしている(F4-2: 列間整合性)。
+// 47都道府県すべてに対応(元は東京都・大阪府・愛知県・北海道・福岡県の5件のみだった)。
+// 各都道府県5件ずつ、実在する市区町村名(基本は政令指定都市の区・県庁所在地・人口の多い市)を
+// 載せている。並び順はJIS X 0401の都道府県コード順(北海道→沖縄県)。
+// 注意: この配列の件数・並び順は--seed指定時の再現性(rng.gen_range(0..len())で
+// 何番目を選ぶか)に直接影響するため、47件への拡充前に作られたseed付きデータとは
+// 都道府県・市区町村の出現結果が変わる(氏名辞書を拡充したときと同じ、既知の仕様)。
 const CITIES_BY_PREFECTURE: &[(&str, &[&str])] = &[
-    ("東京都", &["新宿区", "渋谷区", "港区", "台東区", "世田谷区"]),
-    ("大阪府", &["中央区", "北区", "天王寺区", "堺市", "豊中市"]),
-    ("愛知県", &["中区", "東区", "豊田市", "岡崎市", "一宮市"]),
     ("北海道", &["札幌市中央区", "函館市", "旭川市", "小樽市", "帯広市"]),
+    ("青森県", &["青森市", "弘前市", "八戸市", "十和田市", "むつ市"]),
+    ("岩手県", &["盛岡市", "一関市", "奥州市", "花巻市", "北上市"]),
+    ("宮城県", &["仙台市青葉区", "仙台市宮城野区", "石巻市", "大崎市", "気仙沼市"]),
+    ("秋田県", &["秋田市", "横手市", "大仙市", "由利本荘市", "能代市"]),
+    ("山形県", &["山形市", "鶴岡市", "酒田市", "米沢市", "天童市"]),
+    ("福島県", &["福島市", "郡山市", "いわき市", "会津若松市", "白河市"]),
+    ("茨城県", &["水戸市", "つくば市", "日立市", "土浦市", "古河市"]),
+    ("栃木県", &["宇都宮市", "小山市", "足利市", "栃木市", "那須塩原市"]),
+    ("群馬県", &["前橋市", "高崎市", "太田市", "伊勢崎市", "桐生市"]),
+    ("埼玉県", &["さいたま市大宮区", "川口市", "川越市", "所沢市", "越谷市"]),
+    ("千葉県", &["千葉市中央区", "船橋市", "柏市", "市川市", "松戸市"]),
+    ("東京都", &["新宿区", "渋谷区", "港区", "台東区", "世田谷区"]),
+    ("神奈川県", &["横浜市中区", "川崎市川崎区", "相模原市中央区", "藤沢市", "鎌倉市"]),
+    ("新潟県", &["新潟市中央区", "長岡市", "上越市", "三条市", "柏崎市"]),
+    ("富山県", &["富山市", "高岡市", "射水市", "魚津市", "砺波市"]),
+    ("石川県", &["金沢市", "小松市", "白山市", "加賀市", "能美市"]),
+    ("福井県", &["福井市", "敦賀市", "越前市", "鯖江市", "坂井市"]),
+    ("山梨県", &["甲府市", "甲斐市", "富士吉田市", "南アルプス市", "山梨市"]),
+    ("長野県", &["長野市", "松本市", "上田市", "飯田市", "岡谷市"]),
+    ("岐阜県", &["岐阜市", "大垣市", "各務原市", "多治見市", "高山市"]),
+    ("静岡県", &["静岡市葵区", "浜松市中央区", "沼津市", "富士市", "磐田市"]),
+    ("愛知県", &["中区", "東区", "豊田市", "岡崎市", "一宮市"]),
+    ("三重県", &["津市", "四日市市", "松阪市", "鈴鹿市", "伊勢市"]),
+    ("滋賀県", &["大津市", "草津市", "彦根市", "長浜市", "東近江市"]),
+    ("京都府", &["京都市中京区", "京都市左京区", "宇治市", "亀岡市", "舞鶴市"]),
+    ("大阪府", &["中央区", "北区", "天王寺区", "堺市", "豊中市"]),
+    ("兵庫県", &["神戸市中央区", "姫路市", "西宮市", "尼崎市", "明石市"]),
+    ("奈良県", &["奈良市", "橿原市", "生駒市", "大和郡山市", "香芝市"]),
+    ("和歌山県", &["和歌山市", "田辺市", "橋本市", "新宮市", "海南市"]),
+    ("鳥取県", &["鳥取市", "米子市", "倉吉市", "境港市", "岩美町"]),
+    ("島根県", &["松江市", "出雲市", "浜田市", "益田市", "大田市"]),
+    ("岡山県", &["岡山市北区", "倉敷市", "津山市", "玉野市", "総社市"]),
+    ("広島県", &["広島市中区", "福山市", "呉市", "尾道市", "東広島市"]),
+    ("山口県", &["山口市", "下関市", "宇部市", "周南市", "岩国市"]),
+    ("徳島県", &["徳島市", "鳴門市", "阿南市", "吉野川市", "小松島市"]),
+    ("香川県", &["高松市", "丸亀市", "坂出市", "善通寺市", "観音寺市"]),
+    ("愛媛県", &["松山市", "今治市", "新居浜市", "西条市", "宇和島市"]),
+    ("高知県", &["高知市", "南国市", "四万十市", "土佐市", "香南市"]),
     ("福岡県", &["博多区", "北九州市", "久留米市", "大野城市", "春日市"]),
+    ("佐賀県", &["佐賀市", "唐津市", "鳥栖市", "伊万里市", "武雄市"]),
+    ("長崎県", &["長崎市", "佐世保市", "諫早市", "大村市", "島原市"]),
+    ("熊本県", &["熊本市中央区", "八代市", "天草市", "玉名市", "菊池市"]),
+    ("大分県", &["大分市", "別府市", "中津市", "日田市", "佐伯市"]),
+    ("宮崎県", &["宮崎市", "都城市", "延岡市", "日南市", "小林市"]),
+    ("鹿児島県", &["鹿児島市", "霧島市", "鹿屋市", "薩摩川内市", "姶良市"]),
+    ("沖縄県", &["那覇市", "沖縄市", "うるま市", "浦添市", "宜野湾市"]),
 ];
 
 // city_ja列だけを単独で(prefecture_ja列との組み合わせなしで)使ったときのために、
@@ -3243,6 +3291,20 @@ mod tests {
         assert!(err.to_string().contains("重複しています"), "エラーメッセージ: {}", err);
     }
 
+    // 回帰テスト: 空欄チェック(is_none_or)はtrim後で判定するのに対し、重複チェックが
+    // trimせずに文字列比較していたため、"users"と"users "(末尾に半角スペース)が
+    // 「別名」扱いになり重複エラーをすり抜けていた
+    #[test]
+    fn prepare_tables_rejects_duplicate_table_names_that_only_differ_by_whitespace() {
+        let users_a = schema_from_yaml("row_count: 5\ntable_name: users\ncolumns:\n  - name: id\n    type: sequence\n");
+        let users_b =
+            schema_from_yaml("row_count: 5\ntable_name: \"users \"\ncolumns:\n  - name: id\n    type: sequence\n");
+        let file = SchemaFile { tables: vec![users_a, users_b], multi_table: true };
+
+        let err = prepare_tables(&file).err().unwrap();
+        assert!(err.to_string().contains("重複しています"), "エラーメッセージ: {}", err);
+    }
+
     #[test]
     fn prepare_tables_rejects_blank_table_name_in_multi_table_mode() {
         let file = SchemaFile {
@@ -4035,9 +4097,10 @@ mod tests {
 
     #[test]
     fn prepare_columns_rejects_unique_prefecture_ja_when_row_count_exceeds_capacity() {
-        // CITIES_BY_PREFECTUREは5都道府県分しか無いため、6行以上のunique指定はエラーになる
+        // CITIES_BY_PREFECTUREは47都道府県分(全都道府県)しか無いため、48行以上の
+        // unique指定はエラーになる
         let schema =
-            schema_from_yaml("row_count: 6\ncolumns:\n  - name: p\n    type: prefecture_ja\n    unique: true\n");
+            schema_from_yaml("row_count: 48\ncolumns:\n  - name: p\n    type: prefecture_ja\n    unique: true\n");
         assert!(prepare_columns(&schema).is_err());
     }
 
@@ -4158,6 +4221,16 @@ mod tests {
         // (ProgressBar::hidden()は長さを持たない)
         assert_eq!(new_progress_bar(PROGRESS_BAR_THRESHOLD - 1).length(), None);
         assert_eq!(new_progress_bar(PROGRESS_BAR_THRESHOLD).length(), Some(PROGRESS_BAR_THRESHOLD as u64));
+    }
+
+    #[test]
+    fn cities_by_prefecture_covers_all_47_prefectures_with_no_duplicates() {
+        assert_eq!(CITIES_BY_PREFECTURE.len(), 47);
+        let names: std::collections::HashSet<_> = CITIES_BY_PREFECTURE.iter().map(|(pref, _)| *pref).collect();
+        assert_eq!(names.len(), 47, "都道府県名が重複している");
+        for (pref, cities) in CITIES_BY_PREFECTURE {
+            assert!(!cities.is_empty(), "{pref}: 市区町村が1件も無い");
+        }
     }
 
     #[test]
