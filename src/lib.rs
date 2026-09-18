@@ -1399,6 +1399,23 @@ pub struct PreparedTable {
     pub columns: Vec<PreparedColumn>,
 }
 
+// 単一テーブル形式(tables:形式ではない、参照先のテーブルがそもそも存在しえない状況)で
+// foreign_key列が使われていたら弾く。prepare_tables(schema.yaml経由・複数テーブル生成の
+// 経路)だけでなく、dummygen_jp_gui/src-serverの単一テーブル用コマンド(prepare_tablesを
+// 経由せずprepare_columnsを直接呼ぶ経路)からも呼ぶための共通関数(元はprepare_tables内に
+// 直接書かれていたが、単一テーブル用コマンドがprepare_tablesを経由しないため、そちら側では
+// この検証が素通りしてしまい、生成時にFKプールが埋まらないままpanicする不具合があった)
+pub fn reject_foreign_key_in_single_table(columns: &[PreparedColumn]) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(c) = columns.iter().find(|c| matches!(c.kind, PreparedColumnType::ForeignKey { .. })) {
+        return Err(format!(
+            "列 \"{}\": foreign_key列は tables: 形式のスキーマでのみ使用できます(1テーブルだけのスキーマには参照先のテーブルがありません)",
+            c.name
+        )
+        .into());
+    }
+    Ok(())
+}
+
 // SchemaFileの各テーブルにprepare_columnsを適用する
 pub fn prepare_tables(file: &SchemaFile) -> Result<Vec<PreparedTable>, Box<dyn std::error::Error>> {
     // dummygen_jp_guiから複数テーブルを直接生成・プレビューする経路はSchemaFileを
@@ -1413,16 +1430,8 @@ pub fn prepare_tables(file: &SchemaFile) -> Result<Vec<PreparedTable>, Box<dyn s
         .iter()
         .map(|schema| {
             let columns = prepare_columns(schema)?;
-            // 単一テーブル形式でforeign_key列が使われていたら、参照先のテーブルが
-            // そもそも存在しえないのでここで弾く
-            if !file.multi_table
-                && let Some(c) = columns.iter().find(|c| matches!(c.kind, PreparedColumnType::ForeignKey { .. }))
-            {
-                return Err(format!(
-                    "列 \"{}\": foreign_key列は tables: 形式のスキーマでのみ使用できます(1テーブルだけのスキーマには参照先のテーブルがありません)",
-                    c.name
-                )
-                .into());
+            if !file.multi_table {
+                reject_foreign_key_in_single_table(&columns)?;
             }
             Ok(PreparedTable { name: schema.table_name.clone(), row_count: schema.row_count, columns })
         })
@@ -4926,5 +4935,112 @@ mod tests {
         for line in csv_text.lines().skip(1) {
             assert!(line.starts_with("2020-01-"), "{line}");
         }
+    }
+
+    // resolve_foreign_keys/topological_order/resolve_fk_reprs/generate_multi_table_rowsを
+    // 決まった順番で呼ぶだけの、下のFKテストで繰り返し使うヘルパー
+    // (dummygen_jp_gui/src-tauri/src/lib.rsのrun_generate_multiと同じ手順)
+    fn run_multi(tables: Vec<Schema>) -> Result<(), Box<dyn std::error::Error>> {
+        let schema_file = SchemaFile { tables, multi_table: true };
+        let mut prepared = prepare_tables(&schema_file)?;
+        let (deps, referenced) = resolve_foreign_keys(&mut prepared)?;
+        let order = topological_order(&deps, &prepared)?;
+        resolve_fk_reprs(&mut prepared, &order)?;
+        generate_multi_table_rows(&mut prepared, &order, &referenced, 42, |_, _| {})?;
+        Ok(())
+    }
+
+    // 以下のFK(外部キー)関連テストは、アプリ起動直後にクラッシュする不具合の調査で
+    // 追加した(dummygen_jp_gui/src-tauri側にはFKのテストがあったが、この
+    // dummy_data_gen本体側にはresolve_foreign_keys/topological_order/
+    // generate_multi_table_rowsを実際にFK付きで動かすテストが1つも無かった)。
+    // 3段の親子関係・複数の子から同じ親を参照・宣言順と生成順(トポロジカル順)が
+    // 食い違うケース・unique制約との組み合わせ・多段参照など、幅広いパターンを
+    // 試したが、いずれも正常に完走しクラッシュの再現には至らなかった
+    // (クラッシュ自体はdummygen_jp_gui/src-tauri/src/lib.rsのcatch_panic_as_errで
+    // 「アプリごと落ちる」ことは防いだが、根本原因は特定できていない)。
+    #[test]
+    fn multi_table_fk_chain_of_three_handles_various_row_counts() {
+        for row_counts in [[1u32, 1, 1], [3, 5, 8], [5, 5, 5], [1, 8, 1], [8, 1, 8], [20, 5, 3], [5, 20, 3], [5, 3, 20]] {
+            let a = schema_from_yaml(&format!(
+                "row_count: {}\ntable_name: a\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n",
+                row_counts[0]
+            ));
+            let b = schema_from_yaml(&format!(
+                "row_count: {}\ntable_name: b\ncolumns:\n  - name: id\n    type: sequence\n  - name: a_id\n    type: foreign_key\n    references: a.id\n",
+                row_counts[1]
+            ));
+            let c = schema_from_yaml(&format!(
+                "row_count: {}\ntable_name: c\ncolumns:\n  - name: id\n    type: sequence\n  - name: b_id\n    type: foreign_key\n    references: b.id\n",
+                row_counts[2]
+            ));
+            run_multi(vec![a, b, c]).unwrap_or_else(|e| panic!("row_counts={:?}: {}", row_counts, e));
+        }
+    }
+
+    #[test]
+    fn multi_table_fk_fanout_two_children_reference_same_parent() {
+        for row_counts in [[5u32, 5, 5], [1, 8, 8], [3, 20, 1], [20, 1, 1]] {
+            let a = schema_from_yaml(&format!(
+                "row_count: {}\ntable_name: a\ncolumns:\n  - name: id\n    type: sequence\n",
+                row_counts[0]
+            ));
+            let b = schema_from_yaml(&format!(
+                "row_count: {}\ntable_name: b\ncolumns:\n  - name: id\n    type: sequence\n  - name: a_id\n    type: foreign_key\n    references: a.id\n",
+                row_counts[1]
+            ));
+            let c = schema_from_yaml(&format!(
+                "row_count: {}\ntable_name: c\ncolumns:\n  - name: id\n    type: sequence\n  - name: a_id\n    type: foreign_key\n    references: a.id\n",
+                row_counts[2]
+            ));
+            run_multi(vec![a, b, c]).unwrap_or_else(|e| panic!("row_counts={:?}: {}", row_counts, e));
+        }
+    }
+
+    #[test]
+    fn multi_table_fk_generation_does_not_depend_on_declaration_order() {
+        // わざと宣言順を子→親にする(GUIのtables一覧では、テーブルはこの順で並ぶことがある)
+        let b = schema_from_yaml(
+            "row_count: 5\ntable_name: b\ncolumns:\n  - name: id\n    type: sequence\n  - name: a_id\n    type: foreign_key\n    references: a.id\n",
+        );
+        let a = schema_from_yaml("row_count: 5\ntable_name: a\ncolumns:\n  - name: id\n    type: sequence\n");
+        run_multi(vec![b, a]).unwrap_or_else(|e| panic!("{}", e));
+    }
+
+    #[test]
+    fn multi_table_fk_coexists_with_unique_constraints() {
+        for row_counts in [[5u32, 5], [3, 8], [5, 20]] {
+            let a = schema_from_yaml(&format!(
+                "row_count: {}\ntable_name: a\ncolumns:\n  - name: id\n    type: sequence\n  - name: sku\n    type: product_sku\n    unique: true\n",
+                row_counts[0]
+            ));
+            let b = schema_from_yaml(&format!(
+                "row_count: {}\ntable_name: b\ncolumns:\n  - name: id\n    type: sequence\n  - name: a_id\n    type: foreign_key\n    references: a.id\n  - name: code\n    type: product_sku\n    unique: true\n",
+                row_counts[1]
+            ));
+            run_multi(vec![a, b]).unwrap_or_else(|e| panic!("row_counts={:?}: {}", row_counts, e));
+        }
+    }
+
+    #[test]
+    fn multi_table_fk_two_columns_in_same_table_reference_same_parent() {
+        let a = schema_from_yaml("row_count: 5\ntable_name: a\ncolumns:\n  - name: id\n    type: sequence\n");
+        let b = schema_from_yaml(
+            "row_count: 8\ntable_name: b\ncolumns:\n  - name: id\n    type: sequence\n  - name: created_by\n    type: foreign_key\n    references: a.id\n  - name: updated_by\n    type: foreign_key\n    references: a.id\n",
+        );
+        run_multi(vec![a, b]).unwrap_or_else(|e| panic!("{}", e));
+    }
+
+    #[test]
+    fn multi_table_fk_can_reference_another_foreign_key_column() {
+        // cのfkが、bのidではなく「bのfk列(a_id)」自体を参照する多段パターン
+        let a = schema_from_yaml("row_count: 5\ntable_name: a\ncolumns:\n  - name: id\n    type: sequence\n");
+        let b = schema_from_yaml(
+            "row_count: 5\ntable_name: b\ncolumns:\n  - name: id\n    type: sequence\n  - name: a_id\n    type: foreign_key\n    references: a.id\n",
+        );
+        let c = schema_from_yaml(
+            "row_count: 8\ntable_name: c\ncolumns:\n  - name: id\n    type: sequence\n  - name: b_a_id\n    type: foreign_key\n    references: b.a_id\n",
+        );
+        run_multi(vec![a, b, c]).unwrap_or_else(|e| panic!("{}", e));
     }
 }
