@@ -510,6 +510,12 @@ pub struct PatternPiece {
 // (無制限にすると1文字だけの列が数十文字になり得て、値として不自然になるため)
 const PATTERN_MAX_UNBOUNDED_REPEAT: u32 = 12;
 
+// {n}/{n,m}のように上限を明示した量指定子でも、あまりに大きい値(例: {4000000000})を
+// 指定されると1セルぶんの文字列を巨大に確保しようとしてメモリを使い切ってしまう
+// (OOMはpanicと違いcatch_unwindで捕まえられないため、生成前に弾いておく必要がある)。
+// 実務でパターン列にこれ以上の長さが必要になることはまず無いはずの、十分に大きい上限
+const PATTERN_MAX_EXPLICIT_REPEAT: u32 = 10_000;
+
 // patternで使える否定文字クラス"[^...]"の元になる文字の範囲(印字可能なASCII、空白を除く)。
 // 日本語など全角文字はpatternでは非対応(半角の記号・英数字を組み合わせる用途を想定しているため)
 fn pattern_default_charset() -> Vec<char> {
@@ -649,6 +655,12 @@ fn compile_pattern(pattern: &str) -> Result<Vec<PatternPiece>, String> {
                 if min > max {
                     return Err(format!("繰り返し回数の範囲が逆順になっている: {{{body}}}"));
                 }
+                if max > PATTERN_MAX_EXPLICIT_REPEAT {
+                    return Err(format!(
+                        "繰り返し回数が大きすぎます: {{{body}}}({}以下にしてください)",
+                        PATTERN_MAX_EXPLICIT_REPEAT
+                    ));
+                }
                 flush_quantified(&mut pending, &mut pieces, min, max)?;
                 i += close + 1;
             }
@@ -716,6 +728,11 @@ fn parse_reference(
     }
 }
 
+// row_countの実務上の上限(README/CLAUDE.mdに書かれている「最大100万」と同じ値)。
+// GUIの入力欄はこの値を上限にクランプしているが、スキーマYAMLの読み込み経路には
+// 元々この制限が無かった
+const MAX_ROW_COUNT: u32 = 1_000_000;
+
 // schema.yamlから読み込んだ列定義(Schema、文字列や生の数値がそのまま入っている)を検証し、
 // 実際の生成処理で使う実行時の形(PreparedColumn)に変換する関数。処理の流れ:
 //   1. 列が1つも無ければエラー
@@ -729,6 +746,14 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
     }
     if schema.row_count == 0 {
         return Err("row_count には1以上を指定してください".into());
+    }
+    // row_countの上限は元々GUI(dummygen_jp_gui/src/App.tsx)の入力欄でしか強制されておらず、
+    // スキーマYAMLの読み込み(手書き・GUIの「スキーマYAML読み込み」機能のどちらも)では
+    // 素通りしていた。極端に大きいrow_count(例: 数十億)を指定すると、行データを溜め込む
+    // Vecの確保でメモリを使い切って落ちる(OOM。panicと違いcatch_unwindで捕まえられない)ため、
+    // エンジン側でも明示的に上限を設ける(値はCLAUDE.md/READMEに既に書かれている「最大100万」に合わせる)
+    if schema.row_count > MAX_ROW_COUNT {
+        return Err(format!("row_count は{}以下にしてください(現在: {})", MAX_ROW_COUNT, schema.row_count).into());
     }
 
     // 全ての列の組み合わせを1つずつ比較し、同じ名前の列が無いかを確認する
@@ -783,10 +808,34 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                     PreparedColumnType::Integer { min: *min, max: *max }
                 }
                 ColumnType::Float { min, max, decimals } => {
+                    // NaN(非数)・無限大は`min > max`の比較が常にfalseになる(NaNとの比較は
+                    // IEEE754の仕様で必ずfalseを返す)ため、上のmin>maxチェックをすり抜けてしまう。
+                    // すり抜けると生成時にrng.gen_range(min..=max)が「空の範囲」としてpanicするため、
+                    // ここで先にNaN・無限大を弾く(YAMLの`.nan`/`.inf`は有効な浮動小数点として
+                    // パースされてしまうため、値そのものの妥当性チェックが別途必要)
+                    if !min.is_finite() || !max.is_finite() {
+                        return Err(format!(
+                            "列 \"{}\": min({})・max({})には有限の数値を指定してください(NaN・無限大は使えません)",
+                            c.name, min, max
+                        )
+                        .into());
+                    }
                     if min > max {
                         return Err(format!(
                             "列 \"{}\": min({})がmax({})より大きくなっています",
                             c.name, min, max
+                        )
+                        .into());
+                    }
+                    // decimalsが極端に大きいと、値の文字列化(format!("{:.*}", decimals, value))で
+                    // Rust自身の書式指定の上限を超えて「Formatting argument out of range」でpanicする。
+                    // f64の有効桁数(15〜17桁程度)を大きく超える桁数はどのみち意味を持たないため、
+                    // 十分すぎる上限として50桁を設ける
+                    const MAX_DECIMALS: u32 = 50;
+                    if *decimals > MAX_DECIMALS {
+                        return Err(format!(
+                            "列 \"{}\": decimals({})が大きすぎます({}以下にしてください)",
+                            c.name, decimals, MAX_DECIMALS
                         )
                         .into());
                     }
@@ -819,6 +868,18 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                         return Err(format!(
                             "列 \"{}\": min_age({})がmax_age({})より大きくなっています",
                             c.name, min_age, max_age
+                        )
+                        .into());
+                    }
+                    // max_ageが極端に大きいと、下のchrono::Duration::days(365*(max_age+1)+1)の
+                    // 日数がchronoの内部表現(i64ミリ秒)の範囲を超えてpanicする
+                    // (「TimeDelta::days out of bounds」)。現実的な年齢の範囲を大きく超える
+                    // 1000歳を上限として、ここで先に分かりやすいエラーにする
+                    const MAX_REASONABLE_AGE: u32 = 1000;
+                    if *max_age > MAX_REASONABLE_AGE {
+                        return Err(format!(
+                            "列 \"{}\": max_age({})が大きすぎます({}以下にしてください)",
+                            c.name, max_age, MAX_REASONABLE_AGE
                         )
                         .into());
                     }
@@ -877,6 +938,13 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                                 choices.len()
                             )
                             .into());
+                        }
+                        // NaN(非数)はv < 0.0のような比較が常にfalseになる(IEEE754の仕様)ため、
+                        // 下の負の数チェック・合計チェックの両方をすり抜けてしまう。すり抜けると
+                        // 生成時にchoose_weightedがErr(InvalidWeight)を返し、それをunwrap()している
+                        // 箇所でpanicするため、ここで先に弾く
+                        if w.iter().any(|v| v.is_nan()) {
+                            return Err(format!("列 \"{}\": weights にNaN(非数)は指定できません", c.name).into());
                         }
                         // any(...)は「一覧の中に条件を満たす要素が1つでもあるか」を調べるメソッド。
                         // &vは「一覧の中身を1つずつ指す参照」で、v < 0.0で「負の数かどうか」を見る
@@ -3440,6 +3508,19 @@ mod tests {
         assert!(err.to_string().contains("合計"));
     }
 
+    // 回帰テスト: NaN(非数)はv < 0.0やsum() <= 0.0のような比較で常にfalseを返すため、
+    // 負の数チェック・合計チェックの両方をすり抜けて生成まで進んでしまい、choose_weightedが
+    // 返すErr(InvalidWeight)をunwrap()している箇所でpanicしていた(YAMLの`.nan`は
+    // 有効な浮動小数点としてパースされるため、実際にYAML経由で到達できる不具合だった)
+    #[test]
+    fn enum_weights_containing_nan_is_rejected() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ntable_name: t\ncolumns:\n  - name: status\n    type: enum\n    choices: [\"A\", \"B\"]\n    weights: [.nan, 1.0]\n",
+        );
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("NaN"), "エラーメッセージ: {}", err);
+    }
+
     #[test]
     fn enum_unique_ignores_weights_and_still_enumerates_all_choices_exactly_once() {
         let schema = schema_from_yaml(
@@ -3488,6 +3569,24 @@ mod tests {
     fn prepare_columns_rejects_row_count_zero() {
         let schema = schema_from_yaml("row_count: 0\ncolumns:\n  - name: id\n    type: sequence\n");
         assert!(prepare_columns(&schema).is_err());
+    }
+
+    // 回帰テスト: row_countの上限は元々GUI(App.tsx)の入力欄でしか強制されておらず、
+    // スキーマYAMLの読み込み経路(手書き・GUIの「スキーマYAML読み込み」機能のどちらも)は
+    // 素通りしていた。極端に大きいrow_countを指定すると、行データを溜め込むVecの確保で
+    // メモリを使い切って落ちる(OOM。panicと違いcatch_unwindで捕まえられない)ため、
+    // エンジン側でも明示的に上限を設けた
+    #[test]
+    fn prepare_columns_rejects_row_count_over_one_million() {
+        let schema = schema_from_yaml("row_count: 4000000000\ncolumns:\n  - name: id\n    type: sequence\n");
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("1000000"), "エラーメッセージ: {}", err);
+    }
+
+    #[test]
+    fn prepare_columns_allows_row_count_exactly_one_million() {
+        let schema = schema_from_yaml("row_count: 1000000\ncolumns:\n  - name: id\n    type: sequence\n");
+        assert!(prepare_columns(&schema).is_ok());
     }
 
     #[test]
@@ -3543,6 +3642,39 @@ mod tests {
             "row_count: 1\ncolumns:\n  - name: age\n    type: integer\n    min: 65\n    max: 18\n",
         );
         assert!(prepare_columns(&schema).is_err());
+    }
+
+    // 回帰テスト: NaN(非数)・無限大はmin > maxの比較が常にfalseになる(IEEE754の仕様、
+    // NaNとの比較は常にfalse)ため、上のmin>maxチェックをすり抜けて生成まで進んでしまい、
+    // rng.gen_range(min..=max)が「空の範囲」としてpanicしていた(YAMLの`.nan`/`.inf`は
+    // 有効な浮動小数点としてパースされるため、実際にYAML経由で到達できる不具合だった)
+    #[test]
+    fn prepare_columns_rejects_float_nan_min() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: score\n    type: float\n    min: .nan\n    max: 10.0\n    decimals: 2\n",
+        );
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("有限"), "エラーメッセージ: {}", err);
+    }
+
+    #[test]
+    fn prepare_columns_rejects_float_infinite_max() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: score\n    type: float\n    min: 0.0\n    max: .inf\n    decimals: 2\n",
+        );
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("有限"), "エラーメッセージ: {}", err);
+    }
+
+    // 回帰テスト: decimalsが極端に大きいと、値の文字列化(format!("{:.*}", decimals, value))が
+    // Rust自身の書式指定の上限を超えて「Formatting argument out of range」でpanicしていた
+    #[test]
+    fn prepare_columns_rejects_float_decimals_too_large() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: score\n    type: float\n    min: 0.0\n    max: 10.0\n    decimals: 4000000000\n",
+        );
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("大きすぎます"), "エラーメッセージ: {}", err);
     }
 
     #[test]
@@ -3791,6 +3923,18 @@ mod tests {
     #[test]
     fn compile_pattern_rejects_dangling_quantifier() {
         assert!(compile_pattern("*").is_err());
+    }
+
+    // 回帰テスト: {n}/{n,m}は?/*/+/{n,}と違って繰り返し回数に上限が無かったため、
+    // {4000000000}のような極端な値を指定すると1セルぶんの文字列を巨大に確保しようとして
+    // メモリを使い切ってしまう(OOM。panicと違いcatch_unwindで捕まえられない)恐れがあった
+    #[test]
+    fn compile_pattern_rejects_excessively_large_explicit_repeat() {
+        let err = compile_pattern("A{4000000000}").err().unwrap();
+        assert!(err.contains("大きすぎます"), "エラーメッセージ: {}", err);
+
+        let err = compile_pattern("A{1,4000000000}").err().unwrap();
+        assert!(err.contains("大きすぎます"), "エラーメッセージ: {}", err);
     }
 
     #[test]
@@ -4910,6 +5054,17 @@ mod tests {
             "row_count: 1\ncolumns:\n  - name: b\n    type: birth_date\n    min_age: 30\n    max_age: 20\n",
         );
         assert!(prepare_columns(&schema).is_err());
+    }
+
+    // 回帰テスト: max_ageが極端に大きいと、365*(max_age+1)+1日をchrono::Duration::daysに
+    // 渡す際にi64ミリ秒の範囲を超えて「TimeDelta::days out of bounds」でpanicしていた
+    #[test]
+    fn prepare_columns_rejects_birth_date_max_age_too_large() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: b\n    type: birth_date\n    min_age: 0\n    max_age: 4000000000\n",
+        );
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("大きすぎます"), "エラーメッセージ: {}", err);
     }
 
     #[test]
