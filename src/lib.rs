@@ -288,10 +288,19 @@ pub enum ColumnType {
     PhoneJa,
     // 携帯電話番号(phone_ja)とは別に、市外局番付きの固定電話番号を生成する
     PhoneJaLandline,
-    AddressJa,
+    AddressJa {
+        // 指定した都道府県名だけからランダムに選ぶ(例: ["東京都", "大阪府"])。
+        // 省略時(None)は今まで通り47都道府県すべてが対象(既存のschema.yamlとの後方互換のため)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_prefectures: Option<Vec<String>>,
+    },
     CompanyNameJa,
     Uuid,
-    PrefectureJa,
+    PrefectureJa {
+        // address_jaのallowed_prefecturesと同じ意味・同じ既定値(省略時は47都道府県すべて)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_prefectures: Option<Vec<String>>,
+    },
     CityJa,
     KatakanaName {
         // name_jaのwith_spaceと同じ意味・既定値(省略時false=既存のschema.yamlと同じ姓名連結)。
@@ -460,10 +469,10 @@ pub enum PreparedColumnType {
     PostalCode,
     PhoneJa,
     PhoneJaLandline,
-    AddressJa,
+    AddressJa { allowed_prefectures: Option<Arc<Vec<&'static str>>> },
     CompanyNameJa,
     Uuid,
-    PrefectureJa,
+    PrefectureJa { allowed_prefectures: Option<Arc<Vec<&'static str>>> },
     CityJa,
     KatakanaName { with_space: bool },
     KatakanaNameHankaku { with_space: bool },
@@ -740,6 +749,44 @@ const MAX_ROW_COUNT: u32 = 1_000_000;
 //   3. 各列について、型ごとに必要なバリデーション(min>maxでないか、日付形式が正しいか等)を行い、
 //      問題なければColumnType(YAML由来の型)をPreparedColumnType(生成処理で使う型)に変換する
 //   4. 最後に、null_rate/uniqueの指定が正しいかもチェックする(この関数の後半に続く)
+// prefecture_ja/address_ja列のallowed_prefectures(YAMLに書かれた都道府県名のリスト)を検証し、
+// PreparedColumnTypeに持たせる形(Arc<Vec<&'static str>>)に変換する。
+// Arcは「複数の場所から安く共有するための仕組み」で、foreign_key列のpoolと同じ考え方。
+// &'static strにするのは、CITIES_BY_PREFECTURE(プログラム起動時からずっと存在する定数)側の
+// 文字列をそのまま使い回すため(Stringのコピーを増やさずに済む)
+fn validate_allowed_prefectures(
+    allowed: &Option<Vec<String>>,
+    column_name: &str,
+) -> Result<Option<Arc<Vec<&'static str>>>, Box<dyn std::error::Error>> {
+    // allowed_prefecturesが指定されていなければ(None)、絞り込みなし(47都道府県すべてが対象)
+    let Some(names) = allowed else {
+        return Ok(None);
+    };
+    if names.is_empty() {
+        return Err(format!(
+            "列 \"{}\": allowed_prefectures には1つ以上の都道府県名を指定してください",
+            column_name
+        )
+        .into());
+    }
+    // 指定された都道府県名(文字列)が、実在する47都道府県のどれかと一致するかを1つずつ確認する。
+    // 一致すればCITIES_BY_PREFECTURE側の&'static str(静的な文字列)を使う
+    let mut resolved: Vec<&'static str> = Vec::with_capacity(names.len());
+    for name in names {
+        match CITIES_BY_PREFECTURE.iter().find(|(pref, _)| pref == name) {
+            Some((pref, _)) => resolved.push(pref),
+            None => {
+                return Err(format!(
+                    "列 \"{}\": allowed_prefectures に実在しない都道府県名 \"{}\" が含まれています",
+                    column_name, name
+                )
+                .into());
+            }
+        }
+    }
+    Ok(Some(Arc::new(resolved)))
+}
+
 pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn std::error::Error>> {
     if schema.columns.is_empty() {
         return Err("columns には少なくとも1つ以上の列を定義してください".into());
@@ -899,10 +946,14 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 ColumnType::PostalCode => PreparedColumnType::PostalCode,
                 ColumnType::PhoneJa => PreparedColumnType::PhoneJa,
                 ColumnType::PhoneJaLandline => PreparedColumnType::PhoneJaLandline,
-                ColumnType::AddressJa => PreparedColumnType::AddressJa,
+                ColumnType::AddressJa { allowed_prefectures } => PreparedColumnType::AddressJa {
+                    allowed_prefectures: validate_allowed_prefectures(allowed_prefectures, &c.name)?,
+                },
                 ColumnType::CompanyNameJa => PreparedColumnType::CompanyNameJa,
                 ColumnType::Uuid => PreparedColumnType::Uuid,
-                ColumnType::PrefectureJa => PreparedColumnType::PrefectureJa,
+                ColumnType::PrefectureJa { allowed_prefectures } => PreparedColumnType::PrefectureJa {
+                    allowed_prefectures: validate_allowed_prefectures(allowed_prefectures, &c.name)?,
+                },
                 ColumnType::CityJa => PreparedColumnType::CityJa,
                 ColumnType::KatakanaName { with_space } => {
                     PreparedColumnType::KatakanaName { with_space: *with_space }
@@ -1066,9 +1117,10 @@ fn misplaced_city_ja_warnings(columns: &[PreparedColumn]) -> Vec<String> {
         .filter(|(_, c)| matches!(c.kind, PreparedColumnType::CityJa))
         .filter(|(city_idx, _)| {
             let has_preceding_prefecture =
-                columns[..*city_idx].iter().any(|c| matches!(c.kind, PreparedColumnType::PrefectureJa));
-            let has_following_prefecture =
-                columns[*city_idx + 1..].iter().any(|c| matches!(c.kind, PreparedColumnType::PrefectureJa));
+                columns[..*city_idx].iter().any(|c| matches!(c.kind, PreparedColumnType::PrefectureJa { .. }));
+            let has_following_prefecture = columns[*city_idx + 1..]
+                .iter()
+                .any(|c| matches!(c.kind, PreparedColumnType::PrefectureJa { .. }));
             !has_preceding_prefecture && has_following_prefecture
         })
         .map(|(_, city_col)| {
@@ -1208,8 +1260,11 @@ fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
         }
         PreparedColumnType::KatakanaLastName => UniqueCapacity::Enumerable(LAST_NAMES_KANA.len() as u128),
         PreparedColumnType::KatakanaFirstName => UniqueCapacity::Enumerable(FIRST_NAMES_KANA.len() as u128),
-        // 都道府県の辞書(CITIES_BY_PREFECTURE)に載っている都道府県の数
-        PreparedColumnType::PrefectureJa => UniqueCapacity::Enumerable(CITIES_BY_PREFECTURE.len() as u128),
+        // 都道府県の辞書(CITIES_BY_PREFECTURE)に載っている都道府県の数。
+        // allowed_prefecturesで絞り込まれていれば、その件数だけが対象になる
+        PreparedColumnType::PrefectureJa { allowed_prefectures } => UniqueCapacity::Enumerable(
+            allowed_prefectures.as_ref().map(|list| list.len()).unwrap_or(CITIES_BY_PREFECTURE.len()) as u128,
+        ),
         // 姓の辞書 × 会社の種類(COMPANY_SUFFIXES、「商事」「工業」等)の掛け算
         PreparedColumnType::CompanyNameJa => {
             UniqueCapacity::Enumerable((LAST_NAMES.len() * COMPANY_SUFFIXES.len()) as u128)
@@ -1228,13 +1283,25 @@ fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
         }
         // 郵便番号(NNN-NNNN): 1000 × 10000 = 1000万通り
         PreparedColumnType::PostalCode => UniqueCapacity::Retry(1000 * 10_000),
-        // 住所(1列): (都道府県ごとの市区町村数の合計) × 番地1(1〜19) × 番地2(1〜19)
-        PreparedColumnType::AddressJa => {
+        // 住所(1列): (都道府県ごとの市区町村数の合計) × 番地1(1〜19) × 番地2(1〜19)。
+        // allowed_prefecturesで絞り込まれていれば、対象の都道府県分だけを合計する
+        PreparedColumnType::AddressJa { allowed_prefectures } => {
             // iter()で「(都道府県名, その市区町村一覧)」のペアを1つずつ取り出し、
             // mapで市区町村一覧の件数だけを取り出し、sum()で全都道府県分を合計する
             // (「都道府県ごとの市区町村数」を全部足し合わせて、日本全体の市区町村数にする処理)
-            let total_cities: u128 =
-                CITIES_BY_PREFECTURE.iter().map(|(_, cities)| cities.len() as u128).sum();
+            let total_cities: u128 = match allowed_prefectures {
+                Some(list) => list
+                    .iter()
+                    .map(|pref| {
+                        CITIES_BY_PREFECTURE
+                            .iter()
+                            .find(|(p, _)| p == pref)
+                            .map(|(_, cities)| cities.len())
+                            .unwrap_or(0) as u128
+                    })
+                    .sum(),
+                None => CITIES_BY_PREFECTURE.iter().map(|(_, cities)| cities.len() as u128).sum(),
+            };
             UniqueCapacity::Retry(total_cities * 19 * 19)
         }
         // UUID v4(ランダムな16バイト=2^128通り)は実質衝突しないほど巨大。u128では2^128自体を
@@ -1351,9 +1418,10 @@ fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
         // 都道府県名のリストをそのまま全部返すだけ(random_prefectureがランダムに1件選ぶのと違い、こちらは全件)。
         // iter()は一覧を1件ずつ取り出す準備をするメソッドで、(pref, _)は「(都道府県名, 市区町村一覧)の
         // ペアのうち都道府県名だけを使い、市区町村一覧は使わない」という意味(_は「使わない値」の印)
-        PreparedColumnType::PrefectureJa => {
-            CITIES_BY_PREFECTURE.iter().map(|(pref, _)| pref.to_string()).collect()
-        }
+        PreparedColumnType::PrefectureJa { allowed_prefectures } => match allowed_prefectures {
+            Some(list) => list.iter().map(|s| s.to_string()).collect(),
+            None => CITIES_BY_PREFECTURE.iter().map(|(pref, _)| pref.to_string()).collect(),
+        },
         // NameJaと同じflat_mapの考え方で、姓×会社の種類(COMPANY_SUFFIXES、「商事」「工業」等)の
         // 全組み合わせ(30×8=240通り)を作る(random_company_nameと同じ「株式会社+姓+会社の種類」の組み立て方)
         PreparedColumnType::CompanyNameJa => LAST_NAMES
@@ -2095,14 +2163,30 @@ fn random_phone_landline(rng: &mut impl Rng) -> String {
     format!("{}-{:04}-{:04}", prefix, rng.gen_range(0..10000), rng.gen_range(0..10000))
 }
 
-fn random_address(rng: &mut impl Rng) -> String {
-    let (pref, cities) = CITIES_BY_PREFECTURE[rng.gen_range(0..CITIES_BY_PREFECTURE.len())];
+// allowedがSome(絞り込み済みの都道府県名一覧)なら、その中からだけ都道府県を選ぶ。
+// None(絞り込み無し)なら今まで通り47都道府県すべてから選ぶ
+fn random_address(rng: &mut impl Rng, allowed: Option<&[&'static str]>) -> String {
+    let (pref, cities) = match allowed {
+        Some(list) => {
+            let pref = list[rng.gen_range(0..list.len())];
+            let cities = CITIES_BY_PREFECTURE
+                .iter()
+                .find(|(p, _)| *p == pref)
+                .expect("allowedはvalidate_allowed_prefecturesで実在を検証済みの都道府県名のみ")
+                .1;
+            (pref, cities)
+        }
+        None => CITIES_BY_PREFECTURE[rng.gen_range(0..CITIES_BY_PREFECTURE.len())],
+    };
     let city = cities[rng.gen_range(0..cities.len())];
     format!("{}{}{}-{}", pref, city, rng.gen_range(1..20), rng.gen_range(1..20))
 }
 
-fn random_prefecture(rng: &mut impl Rng) -> String {
-    CITIES_BY_PREFECTURE[rng.gen_range(0..CITIES_BY_PREFECTURE.len())].0.to_string()
+fn random_prefecture(rng: &mut impl Rng, allowed: Option<&[&'static str]>) -> String {
+    match allowed {
+        Some(list) => list[rng.gen_range(0..list.len())].to_string(),
+        None => CITIES_BY_PREFECTURE[rng.gen_range(0..CITIES_BY_PREFECTURE.len())].0.to_string(),
+    }
 }
 
 // context_prefectureがSome(その行のprefecture_ja列の値)なら、その都道府県に実在する
@@ -2357,7 +2441,7 @@ fn generate_row(columns: &[PreparedColumn], row_num: u32, rng: &mut impl Rng) ->
         // 今処理した列が「後ろの列から参照されうる列」なら、その結果をctxに覚えておく。
         // それ以外の列タイプでは何もしない(`_ => {}`が「何もしない」という意味)
         match column.kind {
-            PreparedColumnType::PrefectureJa => ctx.last_prefecture = cell.clone(),
+            PreparedColumnType::PrefectureJa { .. } => ctx.last_prefecture = cell.clone(),
             PreparedColumnType::NameJa { .. } => ctx.last_name_indices = name_indices,
             _ => {}
         }
@@ -2413,10 +2497,14 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::PostalCode => random_postal_code(rng),
         PreparedColumnType::PhoneJa => random_phone(rng),
         PreparedColumnType::PhoneJaLandline => random_phone_landline(rng),
-        PreparedColumnType::AddressJa => random_address(rng),
+        PreparedColumnType::AddressJa { allowed_prefectures } => {
+            random_address(rng, allowed_prefectures.as_ref().map(|a| a.as_slice()))
+        }
         PreparedColumnType::CompanyNameJa => random_company_name(rng),
         PreparedColumnType::Uuid => random_uuid(rng),
-        PreparedColumnType::PrefectureJa => random_prefecture(rng),
+        PreparedColumnType::PrefectureJa { allowed_prefectures } => {
+            random_prefecture(rng, allowed_prefectures.as_ref().map(|a| a.as_slice()))
+        }
         // context(前の列のprefecture_ja/name_ja)が無い状態での単独生成。
         // 文脈付きの生成はgenerate_cellが行う
         PreparedColumnType::CityJa => random_city(rng, None),
@@ -2480,10 +2568,10 @@ fn is_text_column(kind: &PreparedColumnType) -> bool {
             | PreparedColumnType::PostalCode
             | PreparedColumnType::PhoneJa
             | PreparedColumnType::PhoneJaLandline
-            | PreparedColumnType::AddressJa
+            | PreparedColumnType::AddressJa { .. }
             | PreparedColumnType::CompanyNameJa
             | PreparedColumnType::Uuid
-            | PreparedColumnType::PrefectureJa
+            | PreparedColumnType::PrefectureJa { .. }
             | PreparedColumnType::CityJa
             | PreparedColumnType::KatakanaName { .. }
             | PreparedColumnType::KatakanaNameHankaku { .. }
@@ -4410,6 +4498,87 @@ mod tests {
         let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
         for line in csv_text.lines().skip(1) {
             assert!(ALL_CITIES.contains(&line));
+        }
+    }
+
+    #[test]
+    fn prefecture_ja_allowed_prefectures_restricts_generated_values() {
+        let schema = schema_from_yaml(
+            "row_count: 200\ncolumns:\n  - name: pref\n    type: prefecture_ja\n    allowed_prefectures: [\"東京都\", \"大阪府\"]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 42).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(line == "東京都" || line == "大阪府", "想定外の都道府県: {line}");
+        }
+    }
+
+    #[test]
+    fn address_ja_allowed_prefectures_restricts_generated_values() {
+        let schema = schema_from_yaml(
+            "row_count: 200\ncolumns:\n  - name: addr\n    type: address_ja\n    allowed_prefectures: [\"北海道\"]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 42).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(line.starts_with("北海道"), "想定外の住所: {line}");
+        }
+    }
+
+    #[test]
+    fn allowed_prefectures_rejects_unknown_prefecture_name() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: pref\n    type: prefecture_ja\n    allowed_prefectures: [\"存在しない県\"]\n",
+        );
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("実在しない都道府県名"), "エラーメッセージ: {}", err);
+    }
+
+    #[test]
+    fn allowed_prefectures_rejects_empty_list() {
+        let schema =
+            schema_from_yaml("row_count: 1\ncolumns:\n  - name: pref\n    type: prefecture_ja\n    allowed_prefectures: []\n");
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("allowed_prefectures"), "エラーメッセージ: {}", err);
+    }
+
+    // unique制約と組み合わせたとき、capacity(重複なしで作れる件数)が47ではなく
+    // allowed_prefecturesで絞り込んだ件数(ここでは2)になることを確認する
+    #[test]
+    fn unique_prefecture_ja_with_allowed_prefectures_uses_reduced_capacity() {
+        let ok_schema = schema_from_yaml(
+            "row_count: 2\ncolumns:\n  - name: pref\n    type: prefecture_ja\n    allowed_prefectures: [\"東京都\", \"大阪府\"]\n    unique: true\n",
+        );
+        let mut columns = prepare_columns(&ok_schema).unwrap();
+        resolve_unique_pools(&mut columns, ok_schema.row_count, 42);
+        let rows = generate_all_rows(ok_schema.row_count, &columns, 42);
+        let values: std::collections::HashSet<_> = rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(values.len(), 2, "絞り込んだ2都道府県のunique指定で重複が生じた");
+
+        // 3行要求すると、絞り込んだ2件分のcapacityを超えるためエラーになる
+        let over_capacity_schema = schema_from_yaml(
+            "row_count: 3\ncolumns:\n  - name: pref\n    type: prefecture_ja\n    allowed_prefectures: [\"東京都\", \"大阪府\"]\n    unique: true\n",
+        );
+        assert!(prepare_columns(&over_capacity_schema).is_err());
+    }
+
+    // city_ja列は、絞り込まれたprefecture_ja列の実際の生成結果(東京都 or 大阪府)に
+    // 正しく連動することを確認する(絞り込み自体はprefecture_ja側で完結しているため、
+    // city_ja側の実装は変更していないが、連動が壊れていないことの回帰確認として置く)
+    #[test]
+    fn city_ja_matches_restricted_prefecture_ja_column() {
+        let schema = schema_from_yaml(
+            "row_count: 50\ncolumns:\n  - name: pref\n    type: prefecture_ja\n    allowed_prefectures: [\"東京都\", \"大阪府\"]\n  - name: city\n    type: city_ja\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 7).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let mut parts = line.split(',');
+            let pref = parts.next().unwrap();
+            let city = parts.next().unwrap();
+            assert!(pref == "東京都" || pref == "大阪府", "想定外の都道府県: {pref}");
+            let (_, cities) = CITIES_BY_PREFECTURE.iter().find(|(p, _)| *p == pref).unwrap();
+            assert!(cities.contains(&city), "{city} is not a city of {pref}");
         }
     }
 

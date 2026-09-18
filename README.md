@@ -96,10 +96,10 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `postal_code` | 日本の郵便番号風(`NNN-NNNN`) | なし |
 | `phone_ja` | 携帯電話番号風(`090/080/070-XXXX-XXXX`) | なし |
 | `phone_ja_landline` | 固定電話番号風(市外局番+`XXXX-XXXX`) | なし |
-| `address_ja` | 都道府県+市区町村の簡易住所 | なし |
+| `address_ja` | 都道府県+市区町村の簡易住所 | `allowed_prefectures`(省略可。指定した都道府県名のリストからだけ選ぶ。例: `["東京都", "大阪府"]`。省略時は47都道府県すべて) |
 | `company_name_ja` | 「株式会社〇〇商事」のような会社名 | なし |
 | `uuid` | UUID v4形式のランダムなID(例: `550e8400-...`) | なし |
-| `prefecture_ja` | 都道府県 | なし |
+| `prefecture_ja` | 都道府県 | `allowed_prefectures`(省略可。`address_ja`と同じ意味) |
 | `city_ja` | 市区町村。**直前に`prefecture_ja`列があれば、その都道府県に実在する地名を選ぶ**。無ければ全都道府県からランダム | なし |
 | `department_ja` | 部署名(「営業部」など) | なし |
 | `job_title_ja` | 役職名(「課長」など) | なし |
@@ -221,6 +221,17 @@ columns:
 `city_ja`だけを単独で使った場合は、全都道府県の市区町村からランダムに選ぶ。`prefecture_ja`列は定義してあるのに`city_ja`より**後ろ**にある場合(順序を間違えた場合)は、対応関係が保てないため実行時に警告が表示される。
 
 `prefecture_ja`/`city_ja`/`address_ja`は47都道府県すべてに対応しており、各都道府県につき5件ずつ実在する市区町村名(政令指定都市の区・県庁所在地など)を収録している。
+
+`prefecture_ja`/`address_ja`は`allowed_prefectures`(都道府県名のリスト)を指定すると、その都道府県だけからランダムに選ぶように絞り込める(省略時は今まで通り47都道府県すべてが対象)。
+
+```yaml
+columns:
+  - name: prefecture
+    type: prefecture_ja
+    allowed_prefectures: ["東京都", "大阪府"] # この2つだけから選ぶ
+```
+
+`allowed_prefectures`で絞り込んだ`prefecture_ja`列の後ろに`city_ja`列を置いた場合も、その行で実際に選ばれた都道府県(絞り込んだ範囲内のどれか)に対応する市区町村が選ばれる(`city_ja`自体に絞り込みの指定はできないが、前の`prefecture_ja`列の絞り込みに自動で追従する)。
 
 ### 氏名の整合性
 
