@@ -377,6 +377,33 @@ pub enum ColumnType {
     ForeignKey {
         references: String,
     },
+    // 他の列の値から計算する数値列(例: 売上金額 = 数量 × 単価)。
+    // 参照する列(base_columns/category_column/date_column)は、この列より前に定義されている必要がある
+    CorrelatedNumber {
+        // 掛け合わせる元になる数値列名のリスト(integer/float/sequence/correlated_numberのみ指定可)。1つ以上必須
+        base_columns: Vec<String>,
+        // 指定した列の実際の値(文字列)ごとに倍率を変える。category_multipliersとセットで指定する
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category_column: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category_multipliers: Option<HashMap<String, f64>>,
+        // 指定した日付列(date/birth_date)の月ごとに倍率を変える。monthly_multipliers(1〜12月の12個)とセットで指定する
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        date_column: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        monthly_multipliers: Option<[f64; 12]>,
+        // 最後に掛けるランダムなブレ幅(0.0〜)。例: 0.1なら±10%のランダムな乱数を掛ける。省略時0.0(ブレ無し)
+        #[serde(default)]
+        noise: f64,
+        // 結果の小数桁数。省略時0(整数)
+        #[serde(default)]
+        decimals: u32,
+        // 結果の下限・上限でクランプする(省略可)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<f64>,
+    },
 }
 
 fn default_decimals() -> u32 {
@@ -535,6 +562,17 @@ pub enum PreparedColumnType {
         // 生成時はこの中から一様ランダムに1つ選ぶだけになる(unique_poolと同じ二段構えの設計)。
         // Arcなのは、同じ親列を複数の子列が参照しても実体を1つで共有するため
         pool: Option<Arc<Vec<String>>>,
+    },
+    CorrelatedNumber {
+        base_columns: Vec<String>,
+        category_column: Option<String>,
+        category_multipliers: Option<HashMap<String, f64>>,
+        date_column: Option<String>,
+        monthly_multipliers: Option<[f64; 12]>,
+        noise: f64,
+        decimals: u32,
+        min: Option<f64>,
+        max: Option<f64>,
     },
 }
 
@@ -861,11 +899,14 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
     // iter()で1件ずつ取り出し、.map(|c| { ... })で「1列分の変換処理」を各列に適用し、
     // 最後の.collect()で全部まとめる(下の方にある)。map内の処理でErrを返すと、
     // .collect::<Result<...>>()がその時点で処理を打ち切り、全体としてErrを返す
-    // (詳しくはこの関数の末尾、.collect()の行を参照)
+    // (詳しくはこの関数の末尾、.collect()の行を参照)。
+    // enumerate()で列番号iも一緒に取り出しているのは、correlated_numberが「自分より前の列だけ
+    // 参照できる」という制約を検証するのに必要なため(それ以外の型はiを使わない)
     schema
         .columns
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             // c.column_type(YAMLに書かれた列タイプ)を見て、対応するPreparedColumnTypeに
             // 変換する。ほとんどの型は値をコピーするだけだが、min/maxのように「値として
             // おかしくないか」の確認が必要な型は、ここでチェックしてから変換している
@@ -1052,6 +1093,128 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 ColumnType::ForeignKey { references } => {
                     let (ref_table, ref_column) = parse_reference(references, &c.name)?;
                     PreparedColumnType::ForeignKey { ref_table, ref_column, repr: FkRepr::Text, pool: None }
+                }
+                ColumnType::CorrelatedNumber {
+                    base_columns,
+                    category_column,
+                    category_multipliers,
+                    date_column,
+                    monthly_multipliers,
+                    noise,
+                    decimals,
+                    min,
+                    max,
+                } => {
+                    if base_columns.is_empty() {
+                        return Err(format!("列 \"{}\": base_columns には1つ以上の列名を指定してください", c.name).into());
+                    }
+                    // この列より前に定義された列だけが参照できる(prefecture_ja→city_jaと同じ制約)。
+                    // schema.columns[..i]が「この列より前の列一覧」(iはenumerate()由来の自分の位置)
+                    let preceding = &schema.columns[..i];
+                    for name in base_columns {
+                        match preceding.iter().find(|other| &other.name == name) {
+                            Some(other) if matches!(
+                                other.column_type,
+                                ColumnType::Integer { .. }
+                                    | ColumnType::Float { .. }
+                                    | ColumnType::Sequence
+                                    | ColumnType::CorrelatedNumber { .. }
+                            ) => {}
+                            Some(_) => {
+                                return Err(format!(
+                                    "列 \"{}\": base_columnsの \"{}\" は数値の列(integer/float/sequence/correlated_number)ではありません",
+                                    c.name, name
+                                )
+                                .into());
+                            }
+                            None => {
+                                return Err(format!(
+                                    "列 \"{}\": base_columnsの \"{}\" が見つかりません(この列より前に定義された数値の列を指定してください)",
+                                    c.name, name
+                                )
+                                .into());
+                            }
+                        }
+                    }
+
+                    if category_column.is_some() != category_multipliers.is_some() {
+                        return Err(format!(
+                            "列 \"{}\": category_column と category_multipliers は両方一緒に指定してください",
+                            c.name
+                        )
+                        .into());
+                    }
+                    if let Some(name) = category_column {
+                        if !preceding.iter().any(|other| &other.name == name) {
+                            return Err(format!(
+                                "列 \"{}\": category_columnの \"{}\" が見つかりません(この列より前に定義された列を指定してください)",
+                                c.name, name
+                            )
+                            .into());
+                        }
+                    }
+
+                    if date_column.is_some() != monthly_multipliers.is_some() {
+                        return Err(format!(
+                            "列 \"{}\": date_column と monthly_multipliers は両方一緒に指定してください",
+                            c.name
+                        )
+                        .into());
+                    }
+                    if let Some(name) = date_column {
+                        match preceding.iter().find(|other| &other.name == name) {
+                            Some(other)
+                                if matches!(other.column_type, ColumnType::Date { .. } | ColumnType::BirthDate { .. }) => {}
+                            Some(_) => {
+                                return Err(format!(
+                                    "列 \"{}\": date_columnの \"{}\" はdate/birth_date列ではありません",
+                                    c.name, name
+                                )
+                                .into());
+                            }
+                            None => {
+                                return Err(format!(
+                                    "列 \"{}\": date_columnの \"{}\" が見つかりません(この列より前に定義されたdate/birth_date列を指定してください)",
+                                    c.name, name
+                                )
+                                .into());
+                            }
+                        }
+                    }
+
+                    if *noise < 0.0 {
+                        return Err(format!("列 \"{}\": noiseは0以上にしてください", c.name).into());
+                    }
+                    // Float.decimalsと同じ上限(このバリデーションもFloat側と同様、ここでしか使わないローカル定数にしてある)
+                    const MAX_DECIMALS: u32 = 50;
+                    if *decimals > MAX_DECIMALS {
+                        return Err(format!(
+                            "列 \"{}\": decimals({})が大きすぎます({}以下にしてください)",
+                            c.name, decimals, MAX_DECIMALS
+                        )
+                        .into());
+                    }
+                    if let (Some(min_v), Some(max_v)) = (min, max) {
+                        if min_v > max_v {
+                            return Err(format!(
+                                "列 \"{}\": min({})がmax({})より大きくなっています",
+                                c.name, min_v, max_v
+                            )
+                            .into());
+                        }
+                    }
+
+                    PreparedColumnType::CorrelatedNumber {
+                        base_columns: base_columns.clone(),
+                        category_column: category_column.clone(),
+                        category_multipliers: category_multipliers.clone(),
+                        date_column: date_column.clone(),
+                        monthly_multipliers: *monthly_multipliers,
+                        noise: *noise,
+                        decimals: *decimals,
+                        min: *min,
+                        max: *max,
+                    }
                 }
             };
 
@@ -2420,6 +2583,83 @@ fn random_my_number(rng: &mut impl Rng) -> String {
 }
 
 // 同じ行の中で、前の列の生成結果を後ろの列に伝えるための文脈。
+// 日付列の書式(DateFormat)ごとに、format_dateが作った文字列から月だけを取り出す。
+// correlated_number列のmonthly_multipliers(季節変動)で使う
+fn extract_month_from_date_string(value: &str, format: DateFormat) -> Option<u32> {
+    match format {
+        DateFormat::Ymd | DateFormat::Iso8601 => value.split('-').nth(1)?.parse().ok(),
+        DateFormat::Slash => value.split('/').nth(1)?.parse().ok(),
+        // format_warekiが作る文字列は必ず「元号+年+月+日」の順(例: "令和6年3月15日"、
+        // 元年なら"令和元年3月15日")なので、"年"の後ろ〜"月"の前の部分が月の数字になる
+        DateFormat::Wareki => value.split('年').nth(1)?.split('月').next()?.parse().ok(),
+    }
+}
+
+// correlated_number列(他の列から計算する数値)の値を作る。preceding_columns/preceding_valuesは
+// 同じ添字で対応しており(例: preceding_columns[2]の名前が"quantity"ならpreceding_values[2]が
+// その値)、prepare_columnsで存在・型を検証済みのため、通常は全て見つかる想定
+fn generate_correlated_number(
+    rng: &mut impl Rng,
+    base_columns: &[String],
+    category_column: Option<&str>,
+    category_multipliers: Option<&HashMap<String, f64>>,
+    date_column: Option<&str>,
+    monthly_multipliers: Option<&[f64; 12]>,
+    noise: f64,
+    decimals: u32,
+    min: Option<f64>,
+    max: Option<f64>,
+    preceding_columns: &[PreparedColumn],
+    preceding_values: &[Option<String>],
+) -> String {
+    // 列名からpreceding_columns/preceding_valuesを探す小さなヘルパー。見つからない・NULLの場合はNone
+    let find_value = |name: &str| -> Option<&str> {
+        preceding_columns.iter().position(|c| c.name == name).and_then(|i| preceding_values[i].as_deref())
+    };
+
+    // base_columnsの値を全部掛け算する(数値として読めなければ掛け算に参加させない=無視する。
+    // NULLになった場合の保険で、prepare_columnsが数値の列であることを検証済みのため通常は起きない)
+    let mut value: f64 =
+        base_columns.iter().filter_map(|name| find_value(name)?.parse::<f64>().ok()).product();
+
+    // カテゴリ別倍率: 指定した列の実際の値が倍率テーブルに載っていれば掛ける。載っていなければ1.0(変化なし)
+    if let (Some(col), Some(multipliers)) = (category_column, category_multipliers) {
+        if let Some(v) = find_value(col) {
+            if let Some(m) = multipliers.get(v) {
+                value *= m;
+            }
+        }
+    }
+
+    // 季節変動: 指定した日付列の書式を調べてから月を取り出し、その月の倍率を掛ける
+    if let (Some(col), Some(multipliers)) = (date_column, monthly_multipliers) {
+        let format = preceding_columns.iter().find(|c| c.name == col).and_then(|c| match &c.kind {
+            PreparedColumnType::Date { format, .. } | PreparedColumnType::BirthDate { format, .. } => Some(*format),
+            _ => None,
+        });
+        if let (Some(format), Some(v)) = (format, find_value(col)) {
+            if let Some(month) = extract_month_from_date_string(v, format) {
+                value *= multipliers[(month - 1) as usize];
+            }
+        }
+    }
+
+    // ランダムなブレ: 1 + (-noise〜+noise)の乱数係数を最後に掛ける(noise=0なら何もしない)
+    if noise > 0.0 {
+        value *= 1.0 + rng.gen_range(-noise..=noise);
+    }
+
+    if let Some(min) = min {
+        value = value.max(min);
+    }
+    if let Some(max) = max {
+        value = value.min(max);
+    }
+
+    format!("{:.*}", decimals as usize, value)
+}
+
+// 同じ行の中で、前の列の生成結果を後ろの列に伝えるための文脈。
 // 列間で参照し合う列タイプ(prefecture_ja→city_ja、name_ja→katakana_name)が増えたため、
 // 個別の引数(context_prefectureなど)を都度増やす代わりに、まとめて1つのstructにしている。
 #[derive(Default)]
@@ -2437,11 +2677,17 @@ struct RowContext {
 // unique_pool経由の場合はNone)で、generate_rowがRowContextに保存するために使う。
 // 引数のrng: &mut impl Rngは「Rngという機能(トレイト)を持つ何らかの型への、書き換え可能な
 // 参照」という意味。呼び出し元がSmallRng等どの乱数生成器を渡しても、この関数は同じように使える
+// preceding_columns/preceding_valuesは「この列より前にある列」の定義と、その行での生成済みの
+// 値(同じ添字で対応する)。correlated_number列が列名から値を探すのに使う。RowContextとは違い
+// 「直前の1件だけ」ではなく任意の前方列を名前で引きたいため、専用のフィールドは作らずスライスを
+// そのまま渡している
 fn generate_cell(
     column: &PreparedColumn,
     row_num: u32,
     rng: &mut impl Rng,
     ctx: &RowContext,
+    preceding_columns: &[PreparedColumn],
+    preceding_values: &[Option<String>],
 ) -> (Option<String>, Option<(usize, usize)>) {
     // uniqueな列は、あらかじめ用意しておいたプールからこの行番号に対応する値を取り出すだけ
     // (unique同士でnull_rateとの併用はprepare_columnsで禁止しているので、Noneになることは無い)。
@@ -2475,6 +2721,36 @@ fn generate_cell(
             let (last_idx, first_idx) = random_name_indices(rng);
             (Some(format_name(last_idx, first_idx, with_space)), Some((last_idx, first_idx)))
         }
+        // base_columns等(Vec<String>/Option<String>/Option<HashMap<...>>)はCopyではないため、
+        // 参照経由(column: &PreparedColumn)の場所から値を取り出す(=移動する)ことができない。
+        // refを付けて「参照として束縛する」ことでこれを避ける(noise等はCopyな型なのでref不要)
+        PreparedColumnType::CorrelatedNumber {
+            ref base_columns,
+            ref category_column,
+            ref category_multipliers,
+            ref date_column,
+            monthly_multipliers,
+            noise,
+            decimals,
+            min,
+            max,
+        } => (
+            Some(generate_correlated_number(
+                rng,
+                base_columns,
+                category_column.as_deref(),
+                category_multipliers.as_ref(),
+                date_column.as_deref(),
+                monthly_multipliers.as_ref(),
+                noise,
+                decimals,
+                min,
+                max,
+                preceding_columns,
+                preceding_values,
+            )),
+            None,
+        ),
         _ => (Some(generate_value(&column.kind, row_num, rng)), None),
     }
 }
@@ -2489,9 +2765,11 @@ fn generate_row(columns: &[PreparedColumn], row_num: u32, rng: &mut impl Rng) ->
     let mut values = Vec::with_capacity(columns.len());
 
     // 列を先頭から順番に1つずつ処理する(この「順番通り」というのが、prefecture_ja→city_ja
-    // のような参照関係が成立するために重要な前提になっている)
-    for column in columns {
-        let (cell, name_indices) = generate_cell(column, row_num, rng, &ctx);
+    // のような参照関係が成立するために重要な前提になっている)。
+    // enumerate()のiは「今何列目を処理しているか」で、correlated_number列が
+    // columns[..i]/values(=ここまでに積み上げた前方列の値)を名前で参照するのに使う
+    for (i, column) in columns.iter().enumerate() {
+        let (cell, name_indices) = generate_cell(column, row_num, rng, &ctx, &columns[..i], &values);
         // 今処理した列が「後ろの列から参照されうる列」なら、その結果をctxに覚えておく。
         // それ以外の列タイプでは何もしない(`_ => {}`が「何もしない」という意味)
         match column.kind {
@@ -2508,6 +2786,12 @@ fn generate_row(columns: &[PreparedColumn], row_num: u32, rng: &mut impl Rng) ->
 // 列タイプに応じて、1つ分の値を作る。row_numは「今何行目か(1始まり)」
 fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -> String {
     match kind {
+        // correlated_number(前の列の値を参照して計算する列)はgenerate_cellが必ず先に
+        // 専用の分岐で処理するため、ここには来ない(前の列の値が無いと計算できず、
+        // CityJa/KatakanaNameのような「参照無しでもランダムに代替できる」フォールバックが作れないため)
+        PreparedColumnType::CorrelatedNumber { .. } => {
+            unreachable!("correlated_number列はgenerate_cellが必ず先に処理する")
+        }
         PreparedColumnType::Sequence => row_num.to_string(),
         PreparedColumnType::NameJa { with_space } => random_name(rng, *with_space),
         PreparedColumnType::LastNameJa => random_last_name(rng),
@@ -2639,7 +2923,7 @@ fn classify_data_type_name(name: &str) -> ValueCategory {
 fn default_value_category(kind: &PreparedColumnType) -> ValueCategory {
     match kind {
         PreparedColumnType::Sequence | PreparedColumnType::Integer { .. } => ValueCategory::Integer,
-        PreparedColumnType::Float { .. } => ValueCategory::Float,
+        PreparedColumnType::Float { .. } | PreparedColumnType::CorrelatedNumber { .. } => ValueCategory::Float,
         PreparedColumnType::Boolean => ValueCategory::Boolean,
         PreparedColumnType::ForeignKey { repr, .. } => match repr {
             FkRepr::Integer => ValueCategory::Integer,
@@ -5487,5 +5771,185 @@ mod tests {
             "row_count: 8\ntable_name: c\ncolumns:\n  - name: id\n    type: sequence\n  - name: b_a_id\n    type: foreign_key\n    references: b.a_id\n",
         );
         run_multi(vec![a, b, c]).unwrap_or_else(|e| panic!("{}", e));
+    }
+
+    #[test]
+    fn extract_month_from_date_string_handles_all_formats() {
+        assert_eq!(extract_month_from_date_string("2024-03-15", DateFormat::Ymd), Some(3));
+        assert_eq!(extract_month_from_date_string("2024-03-15", DateFormat::Iso8601), Some(3));
+        assert_eq!(extract_month_from_date_string("2024/03/15", DateFormat::Slash), Some(3));
+        assert_eq!(extract_month_from_date_string("令和6年3月15日", DateFormat::Wareki), Some(3));
+        // 元年(その元号の最初の年)は「6年」のような数字が付かず「元年」表記になる
+        // (format_warekiのyear_label参照)。月の取り出しには影響しないことを確認する
+        assert_eq!(extract_month_from_date_string("令和元年3月15日", DateFormat::Wareki), Some(3));
+    }
+
+    #[test]
+    fn correlated_number_multiplies_base_columns() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: quantity\n    type: integer\n    min: 3\n    max: 3\n  - name: unit_price\n    type: integer\n    min: 100\n    max: 100\n  - name: amount\n    type: correlated_number\n    base_columns: [quantity, unit_price]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert_eq!(line.split(',').nth(2).unwrap(), "300", "{line}");
+        }
+    }
+
+    #[test]
+    fn correlated_number_can_reference_another_correlated_number() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: base\n    type: integer\n    min: 10\n    max: 10\n  - name: step1\n    type: correlated_number\n    base_columns: [base]\n  - name: step2\n    type: correlated_number\n    base_columns: [step1]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 2).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert_eq!(line.split(',').nth(2).unwrap(), "10", "{line}");
+        }
+    }
+
+    #[test]
+    fn correlated_number_applies_category_multiplier_and_defaults_to_one_for_unknown_value() {
+        let schema = schema_from_yaml(
+            "row_count: 20\ncolumns:\n  - name: base\n    type: integer\n    min: 100\n    max: 100\n  - name: category\n    type: enum\n    choices: [A, B, C]\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n    category_column: category\n    category_multipliers:\n      A: 2.0\n      B: 0.5\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 3).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let parts: Vec<&str> = line.split(',').collect();
+            let expected = match parts[1] {
+                "A" => 200.0,
+                "B" => 50.0,
+                // 倍率テーブルに無い値(C)は倍率1.0のまま(=baseそのまま)
+                "C" => 100.0,
+                other => panic!("想定外のcategory: {other}"),
+            };
+            assert_eq!(parts[2].parse::<f64>().unwrap(), expected, "{line}");
+        }
+    }
+
+    #[test]
+    fn correlated_number_applies_monthly_multiplier() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: base\n    type: integer\n    min: 100\n    max: 100\n  - name: d\n    type: date\n    start: \"2024-01-01\"\n    end: \"2024-12-31\"\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n    date_column: d\n    monthly_multipliers: [1,1,1,1,1,1,1,1,1,1,1,2]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 5).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let parts: Vec<&str> = line.split(',').collect();
+            let month: u32 = parts[1][5..7].parse().unwrap(); // "YYYY-MM-DD"の5〜6文字目(0始まり)がMM
+            let expected = if month == 12 { 200.0 } else { 100.0 };
+            assert_eq!(parts[2].parse::<f64>().unwrap(), expected, "{line}");
+        }
+    }
+
+    #[test]
+    fn correlated_number_noise_zero_is_deterministic_and_nonzero_varies() {
+        let schema_no_noise = schema_from_yaml(
+            "row_count: 20\ncolumns:\n  - name: base\n    type: integer\n    min: 100\n    max: 100\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n    noise: 0.0\n",
+        );
+        let columns = prepare_columns(&schema_no_noise).unwrap();
+        let csv_text = build_csv(schema_no_noise.row_count, &columns, 9).unwrap();
+        let values: std::collections::HashSet<&str> =
+            csv_text.lines().skip(1).map(|l| l.split(',').nth(1).unwrap()).collect();
+        assert_eq!(values.len(), 1, "noise:0なら常に同じ値のはず: {values:?}");
+
+        let schema_with_noise = schema_from_yaml(
+            "row_count: 20\ncolumns:\n  - name: base\n    type: integer\n    min: 100\n    max: 100\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n    noise: 0.2\n    decimals: 4\n",
+        );
+        let columns = prepare_columns(&schema_with_noise).unwrap();
+        let csv_text = build_csv(schema_with_noise.row_count, &columns, 9).unwrap();
+        let values: std::collections::HashSet<&str> =
+            csv_text.lines().skip(1).map(|l| l.split(',').nth(1).unwrap()).collect();
+        assert!(values.len() > 1, "noise>0ならばらつくはず: {values:?}");
+    }
+
+    #[test]
+    fn correlated_number_clamps_to_min_and_max() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: base\n    type: integer\n    min: 100\n    max: 100\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n    noise: 0.9\n    min: 90\n    max: 110\n    decimals: 2\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 11).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let amount: f64 = line.split(',').nth(1).unwrap().parse().unwrap();
+            assert!((90.0..=110.0).contains(&amount), "{line}");
+        }
+    }
+
+    #[test]
+    fn correlated_number_is_unquoted_in_sql_and_numeric_in_json() {
+        let kind = PreparedColumnType::CorrelatedNumber {
+            base_columns: vec!["x".to_string()],
+            category_column: None,
+            category_multipliers: None,
+            date_column: None,
+            monthly_multipliers: None,
+            noise: 0.0,
+            decimals: 0,
+            min: None,
+            max: None,
+        };
+        assert_eq!(sql_literal(&kind, None, "300"), "300");
+        assert_eq!(
+            cell_to_json(&kind, None, Some("300")),
+            serde_json::Value::Number(serde_json::Number::from_f64(300.0).unwrap())
+        );
+    }
+
+    #[test]
+    fn correlated_number_rejects_empty_base_columns() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: amount\n    type: correlated_number\n    base_columns: []\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn correlated_number_rejects_base_column_not_defined_before() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: amount\n    type: correlated_number\n    base_columns: [quantity]\n  - name: quantity\n    type: integer\n    min: 1\n    max: 5\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn correlated_number_rejects_non_numeric_base_column() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: name\n    type: name_ja\n  - name: amount\n    type: correlated_number\n    base_columns: [name]\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn correlated_number_rejects_category_column_without_multipliers() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: base\n    type: integer\n    min: 1\n    max: 1\n  - name: cat\n    type: gender\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n    category_column: cat\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn correlated_number_rejects_date_column_with_wrong_type() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: base\n    type: integer\n    min: 1\n    max: 1\n  - name: notdate\n    type: gender\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n    date_column: notdate\n    monthly_multipliers: [1,1,1,1,1,1,1,1,1,1,1,1]\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn correlated_number_rejects_negative_noise() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: base\n    type: integer\n    min: 1\n    max: 1\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n    noise: -0.1\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn correlated_number_rejects_min_greater_than_max() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: base\n    type: integer\n    min: 1\n    max: 1\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n    min: 100\n    max: 10\n",
+        );
+        assert!(prepare_columns(&schema).is_err());
     }
 }

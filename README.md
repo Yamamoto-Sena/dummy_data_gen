@@ -118,6 +118,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `fixed` | どの行でも常に同じ文字列を返す | `value` |
 | `pattern` | 正規表現に似た簡易記法から値を生成する(例: `"[A-Z]{3}-[0-9]{4}"` → `"ABC-1234"`)。対応するのはリテラル文字・`[...]`文字クラス(範囲`a-z`・`^`否定)・量指定子`?`/`*`/`+`/`{n}`/`{n,}`/`{n,m}`のみで、グループ化`(...)`や選択`\|`を使うとエラーになる(その文字自体を値に含めたい場合は`\(`のように`\`でエスケープする) | `pattern` |
 | `foreign_key` | 親テーブルに実在する値からランダムに1つ選ぶ(複数テーブル形式`tables:`専用) | `references`(`"テーブル名.列名"`形式) |
+| `correlated_number` | 他の列の値から計算する数値(例: 売上金額 = 数量 × 単価)。この列より**前**に定義された列だけを参照できる | `base_columns`(掛け合わせる数値列名のリスト。`integer`/`float`/`sequence`/`correlated_number`のみ指定可、1つ以上必須)。`category_column`+`category_multipliers`(省略可。指定した列の実際の値ごとに倍率を変える。例: `category_column: category`、`category_multipliers: {食品: 0.8, 家電: 3.0}`。一致しない値は倍率1.0のまま)。`date_column`+`monthly_multipliers`(省略可。指定した`date`/`birth_date`列の月によって倍率を変える。12個の数値、1月始まり)。`noise`(省略可・既定0.0。`±noise`のランダムな乱数を最後に掛ける。例: 0.1で±10%)。`decimals`(省略可・既定0)。`min`/`max`(省略可。結果をこの範囲でクランプする) |
 
 どの列タイプにも `null_rate`(0.0〜1.0)を追加でき、その確率でNULL(CSVでは空文字、SQLではクォートなしの`NULL`、JSONでは`null`)を出力する。
 
@@ -248,6 +249,42 @@ columns:
 ```
 
 `katakana_name`だけを単独で使った場合はランダムなフリガナを選ぶ。`name_ja`列は定義してあるのに`katakana_name`より後ろにある場合は、都道府県⇔市区町村のときと同様に警告が表示される。`romaji_name`(氏名のローマ字)も`katakana_name`と全く同じ参照ロジックを持つ(`name_ja`より後ろに置くと対応するローマ字になる)。
+
+### 相関のある数値(correlated_number)
+
+`integer`/`float`は完全にランダムな数値だが、`correlated_number`は他の列の値から計算する数値。**参照する列は、この列より前に定義しておく必要がある**(都道府県⇔市区町村・氏名の整合性と同じ考え方だが、こちらは警告ではなく必須の制約で、違反すると生成前にエラーになる)。
+
+```yaml
+columns:
+  - name: quantity
+    type: integer
+    min: 1
+    max: 5
+  - name: unit_price
+    type: integer
+    min: 100
+    max: 1000
+  - name: category
+    type: enum
+    choices: [食品, 家電]
+  - name: purchase_date
+    type: date
+    start: "2024-01-01"
+    end: "2024-12-31"
+  - name: sales_amount
+    type: correlated_number
+    base_columns: [quantity, unit_price] # quantity × unit_priceを基準値にする
+    category_column: category            # カテゴリによって価格帯を変える
+    category_multipliers:
+      食品: 0.8
+      家電: 3.0
+    date_column: purchase_date           # 月によって売上の傾向を変える(季節変動)
+    monthly_multipliers: [1,1,1,1,1,1,1,1,1,1,1,2] # 12月だけ2倍
+    noise: 0.1                           # ±10%のランダムなブレを加える
+    decimals: 0
+```
+
+`base_columns`/`category_column`/`category_multipliers`/`date_column`/`monthly_multipliers`/`noise`はすべて省略可(必須は`base_columns`のみ)なので、必要な仕組みだけを組み合わせて使える(例: 計算式だけ使う、季節変動だけ使う、など)。SQL/JSON/Excel出力では常に数値として扱われる(クォートされない)。unique制約は非対応(計算結果に対して事前に全パターンを用意するのが現実的でないため、`pattern`/`foreign_key`と同じ扱い)。
 
 ### 進捗表示
 
