@@ -86,16 +86,16 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `katakana_name` | フリガナ(全角)。**直前に`name_ja`列があれば、その氏名と対応する読みを選ぶ**。無ければランダム | `with_space`(省略時false。trueで姓の読みと名の読みの間にスペース、例:「ヤマダ タロウ」) |
 | `katakana_name_hankaku` | フリガナ(半角)。参照ロジックは`katakana_name`と同じ | `with_space`(省略時false。意味は`katakana_name`と同じ) |
 | `gender` | "男性"/"女性"を50%ずつのランダムで返す。他の列との連動は無い独立ランダム | なし |
-| `blood_type` | "A型"/"O型"/"B型"/"AB型"を、日本人の血液型分布の目安(4:3:2:1)で重み付けして返す | なし |
+| `blood_type` | "A型"/"O型"/"B型"/"AB型"を、日本人の血液型分布の目安(4:3:2:1)で重み付けして返す | `with_suffix`(省略時true。falseで「型」を付けずに「A」「O」「B」「AB」を返す) |
 | `email` | `user{連番}@{domain}` | `domain`(省略時`example.com`) |
 | `integer` | `min`〜`max`のランダムな整数 | `min`, `max` |
 | `float` | `min`〜`max`のランダムな小数 | `min`, `max`, `decimals`(省略時2) |
 | `boolean` | `true` / `false` | なし |
 | `date` | `start`〜`end`のランダムな日付 | `start`, `end`, `format`(省略時`ymd`。`ymd`/`iso8601`/`slash`/`wareki`) |
 | `birth_date` | `min_age`〜`max_age`歳になる生年月日を、今日の日付から逆算 | `min_age`, `max_age`, `format`(dateと共通) |
-| `postal_code` | 日本の郵便番号風(`NNN-NNNN`) | なし |
-| `phone_ja` | 携帯電話番号風(`090/080/070-XXXX-XXXX`) | なし |
-| `phone_ja_landline` | 固定電話番号風(市外局番+`XXXX-XXXX`) | なし |
+| `postal_code` | 日本の郵便番号風(`NNN-NNNN`) | `with_hyphen`(省略時true。falseで「-」を入れず`NNNNNNN`にする) |
+| `phone_ja` | 携帯電話番号風(`090/080/070-XXXX-XXXX`) | `with_hyphen`(省略時true。falseで「-」を入れない) |
+| `phone_ja_landline` | 固定電話番号風(市外局番+`XXXX-XXXX`) | `with_hyphen`(省略時true。falseで「-」を入れない) |
 | `address_ja` | 都道府県+市区町村の簡易住所 | `allowed_prefectures`(省略可。指定した都道府県名のリストからだけ選ぶ。例: `["東京都", "大阪府"]`。省略時は47都道府県すべて) |
 | `company_name_ja` | 「株式会社〇〇商事」のような会社名 | なし |
 | `uuid` | UUID v4形式のランダムなID(例: `550e8400-...`) | なし |
@@ -110,7 +110,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `password` | 英大文字・英小文字・数字・一部記号を含むダミーのパスワード風文字列(12文字) | なし |
 | `profile_image_url` | プレースホルダー画像サービス(`placehold.jp`)のURL文字列。実際に画像を取得したり通信したりはしない | なし |
 | `credit_card_number` | 16桁、Luhnアルゴリズムで検査数字を計算したクレジットカード番号風 | なし |
-| `credit_card_expiry` | クレジットカードの有効期限(`MM/YY`形式、今日から1〜5年後) | なし |
+| `credit_card_expiry` | クレジットカードの有効期限(`MM/YY`形式、今日から1〜5年後) | `with_slash`(省略時true。falseで「/」を入れず`MMYY`にする) |
 | `bank_account_number` | 日本の普通預金口座番号を想定した7桁のゼロ埋め数字 | なし |
 | `product_sku` | `SKU-`+英大文字/数字8文字の商品SKU風文字列 | なし |
 | `my_number` | 12桁、個人番号法の検査数字計算方法に従ったマイナンバー風 | なし |
@@ -120,6 +120,8 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `foreign_key` | 親テーブルに実在する値からランダムに1つ選ぶ(複数テーブル形式`tables:`専用) | `references`(`"テーブル名.列名"`形式) |
 
 どの列タイプにも `null_rate`(0.0〜1.0)を追加でき、その確率でNULL(CSVでは空文字、SQLではクォートなしの`NULL`、JSONでは`null`)を出力する。
+
+どの列タイプにも `data_type`(文字列、省略可)を追加できる。これは、SQL/JSON/Excel出力でその列の値を文字列としてクォートするか、整数/小数/真偽値として出すかを、列タイプからの自動判定から上書きするための指定。案件によって「この列は本当はこの型として扱ってほしい」という決まりがある場合に使う(例: `postal_code`を`with_hyphen: false`にしたうえで`data_type: "INTEGER"`にすると、SQLでクォート無し・JSONで数値として出力される。逆に`integer`列に`data_type: "VARCHAR(10)"`を指定すると、0埋めのコードのような数値に見える値を文字列として保持できる)。`INT`/`INTEGER`/`BIGINT`/`SMALLINT`/`TINYINT`は整数、`FLOAT`/`DOUBLE`/`DECIMAL`/`NUMERIC`/`REAL`は小数、`BOOL`/`BOOLEAN`/`BIT`は真偽値と判定し、それ以外(`VARCHAR`/`CHAR`/`TEXT`/`DATE`など、知らない型名も含む)は文字列として扱う(先頭の単語だけを大文字化して判定するため、`VARCHAR(100)`のように括弧付きで書いてもよい)。省略時は今まで通り列タイプから自動判定する。CSV出力には影響しない(CSVには元々型の区別が無いため)。実際の値の見た目と違う型を指定すると、SQL/JSONの出力が壊れた形になることがあるので注意。
 
 生成される氏名・住所・電話番号・郵便番号・会社名・カード番号・口座番号等はすべて固定リストや簡易な計算式からのランダムな組み合わせで、実在する個人・企業・住所・番号とは一切関係がない。
 

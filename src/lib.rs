@@ -211,6 +211,12 @@ pub struct ColumnDef {
     // trueにすると、この列の値が行間で重複しないようにする。省略時はfalse
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique: Option<bool>,
+    // SQL/JSON/Excel出力時、この列の値を文字列/整数/小数/真偽値のどれとして出力するかを
+    // 列タイプの自動判定から上書きする(例: "VARCHAR(100)"、"INTEGER"のような自由入力の型名)。
+    // 案件によって「この列は本当はこの型で扱ってほしい」という指定が決まっている場合に使う。
+    // 省略時(None)は今まで通り列タイプから自動判定する(default_value_category)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
     // #[serde(flatten)]を付けると、column_type(ColumnType型、下で定義)が持つ
     // フィールド(typeやmin/max等)を、入れ子にせずnameと同じ階層に展開して読み書きできる。
     // これにより、YAML上は "name: id" と "type: integer" を同じ階層に並べて書ける
@@ -265,7 +271,11 @@ pub enum ColumnType {
     // "男性"または"女性"を50%ずつのランダムで返す
     Gender,
     // "A型"/"O型"/"B型"/"AB型"を日本人の血液型分布に近い比率(4:3:2:1目安)で重み付けして返す
-    BloodType,
+    BloodType {
+        // trueのとき(省略時も含む)「A型」のように「型」を付ける。falseだと「A」のように付けない
+        #[serde(default = "default_true")]
+        with_suffix: bool,
+    },
     // 正規表現に似た簡易パターンから値を生成する(例: "[A-Z]{3}-[0-9]{4}" → "ABC-1234")。
     // 文法の詳細はcompile_patternのコメントを参照
     Pattern {
@@ -284,10 +294,21 @@ pub enum ColumnType {
         #[serde(default = "default_date_format")]
         format: DateFormat,
     },
-    PostalCode,
-    PhoneJa,
+    PostalCode {
+        // trueのとき(省略時も含む)「123-4567」のように「-」を入れる。falseだと「1234567」
+        #[serde(default = "default_true")]
+        with_hyphen: bool,
+    },
+    PhoneJa {
+        // trueのとき(省略時も含む)「090-1234-5678」のように「-」を入れる。falseだと数字のみ
+        #[serde(default = "default_true")]
+        with_hyphen: bool,
+    },
     // 携帯電話番号(phone_ja)とは別に、市外局番付きの固定電話番号を生成する
-    PhoneJaLandline,
+    PhoneJaLandline {
+        #[serde(default = "default_true")]
+        with_hyphen: bool,
+    },
     AddressJa {
         // 指定した都道府県名だけからランダムに選ぶ(例: ["東京都", "大阪府"])。
         // 省略時(None)は今まで通り47都道府県すべてが対象(既存のschema.yamlとの後方互換のため)
@@ -329,7 +350,11 @@ pub enum ColumnType {
     // 16桁、Luhnアルゴリズムで検査数字(末尾1桁)を計算する
     CreditCardNumber,
     // "MM/YY"形式(今日から1〜5年後のランダムな年月)
-    CreditCardExpiry,
+    CreditCardExpiry {
+        // trueのとき(省略時も含む)「12/28」のように「/」を入れる。falseだと「1228」
+        #[serde(default = "default_true")]
+        with_slash: bool,
+    },
     // 日本の普通預金口座番号を想定した7桁のゼロ埋め数字
     BankAccountNumber,
     // "SKU-"+英大文字/数字8文字
@@ -360,6 +385,12 @@ fn default_decimals() -> u32 {
 
 fn default_email_domain() -> String {
     "example.com".to_string()
+}
+
+// with_suffix/with_hyphen/with_slashのような「省略時はtrue(今までと同じ書式)」に使う
+// serdeのdefault用ヘルパー。with_space(既定false)とは逆に、こちらは省略時にtrueにしたいため別途用意する
+fn default_true() -> bool {
+    true
 }
 
 // date/birth_date列の日付表示形式。Iso8601とYmdは日付のみの表記では見た目が同じ(YYYY-MM-DD)
@@ -447,6 +478,9 @@ pub struct PreparedColumn {
     // (resolve_unique_pools が base_seed が決まった後に埋める)。
     // Some(pool)のとき、generate_cellはこの中から順番に値を取り出すだけになる
     unique_pool: Option<Vec<String>>,
+    // ColumnDef.data_typeをそのまま転記したもの。SQL/JSON/Excel出力の型判定
+    // (resolve_value_category)がkindの代わりにこちらを優先して使う
+    data_type: Option<String>,
 }
 
 pub enum PreparedColumnType {
@@ -462,13 +496,13 @@ pub enum PreparedColumnType {
     Float { min: f64, max: f64, decimals: u32 },
     Boolean,
     Gender,
-    BloodType,
+    BloodType { with_suffix: bool },
     Pattern { pieces: Vec<PatternPiece> },
     Date { start_days: i32, span_days: i64, format: DateFormat },
     BirthDate { start_days: i32, span_days: i64, format: DateFormat },
-    PostalCode,
-    PhoneJa,
-    PhoneJaLandline,
+    PostalCode { with_hyphen: bool },
+    PhoneJa { with_hyphen: bool },
+    PhoneJaLandline { with_hyphen: bool },
     AddressJa { allowed_prefectures: Option<Arc<Vec<&'static str>>> },
     CompanyNameJa,
     Uuid,
@@ -485,7 +519,7 @@ pub enum PreparedColumnType {
     Password,
     ProfileImageUrl,
     CreditCardNumber,
-    CreditCardExpiry,
+    CreditCardExpiry { with_slash: bool },
     BankAccountNumber,
     ProductSku,
     MyNumber,
@@ -890,7 +924,7 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 }
                 ColumnType::Boolean => PreparedColumnType::Boolean,
                 ColumnType::Gender => PreparedColumnType::Gender,
-                ColumnType::BloodType => PreparedColumnType::BloodType,
+                ColumnType::BloodType { with_suffix } => PreparedColumnType::BloodType { with_suffix: *with_suffix },
                 ColumnType::Pattern { pattern } => {
                     let pieces = compile_pattern(pattern).map_err(|e| format!("列 \"{}\": {}", c.name, e))?;
                     PreparedColumnType::Pattern { pieces }
@@ -943,9 +977,11 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                         format: *format,
                     }
                 }
-                ColumnType::PostalCode => PreparedColumnType::PostalCode,
-                ColumnType::PhoneJa => PreparedColumnType::PhoneJa,
-                ColumnType::PhoneJaLandline => PreparedColumnType::PhoneJaLandline,
+                ColumnType::PostalCode { with_hyphen } => PreparedColumnType::PostalCode { with_hyphen: *with_hyphen },
+                ColumnType::PhoneJa { with_hyphen } => PreparedColumnType::PhoneJa { with_hyphen: *with_hyphen },
+                ColumnType::PhoneJaLandline { with_hyphen } => {
+                    PreparedColumnType::PhoneJaLandline { with_hyphen: *with_hyphen }
+                }
                 ColumnType::AddressJa { allowed_prefectures } => PreparedColumnType::AddressJa {
                     allowed_prefectures: validate_allowed_prefectures(allowed_prefectures, &c.name)?,
                 },
@@ -970,7 +1006,9 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                 ColumnType::Password => PreparedColumnType::Password,
                 ColumnType::ProfileImageUrl => PreparedColumnType::ProfileImageUrl,
                 ColumnType::CreditCardNumber => PreparedColumnType::CreditCardNumber,
-                ColumnType::CreditCardExpiry => PreparedColumnType::CreditCardExpiry,
+                ColumnType::CreditCardExpiry { with_slash } => {
+                    PreparedColumnType::CreditCardExpiry { with_slash: *with_slash }
+                }
                 ColumnType::BankAccountNumber => PreparedColumnType::BankAccountNumber,
                 ColumnType::ProductSku => PreparedColumnType::ProductSku,
                 ColumnType::MyNumber => PreparedColumnType::MyNumber,
@@ -1086,7 +1124,14 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
 
             // 実際の値(unique_pool)はこの後base_seedが決まってから resolve_unique_pools で埋める。
             // Ok(...)で「この1列分の変換に成功した」ことを表す
-            Ok(PreparedColumn { name: c.name.clone(), kind, null_rate, unique, unique_pool: None })
+            Ok(PreparedColumn {
+                name: c.name.clone(),
+                kind,
+                null_rate,
+                unique,
+                unique_pool: None,
+                data_type: c.data_type.clone(),
+            })
         })
         // ここまでの.map(...)は「Result<PreparedColumn, エラー>」を1列ごとに作るところまでだった。
         // collect::<Result<Vec<_>, _>>()は、そのResultの一覧をまとめて1つのResultにする特別な
@@ -1203,7 +1248,7 @@ fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
         // "男性"/"女性"の2通りしかない
         PreparedColumnType::Gender => UniqueCapacity::Enumerable(2),
         // "A型"/"O型"/"B型"/"AB型"の4通りしかない
-        PreparedColumnType::BloodType => UniqueCapacity::Enumerable(4),
+        PreparedColumnType::BloodType { .. } => UniqueCapacity::Enumerable(4),
         // 常に同じ文字列しか返さないため、組み合わせは1通り(row_count=1のときだけunique指定に意味がある。
         // 2行以上を指定すると、他のEnumerable型と同じ「組み合わせが足りない」エラーで自然に弾かれる)
         PreparedColumnType::Fixed { .. } => UniqueCapacity::Enumerable(1),
@@ -1273,16 +1318,17 @@ fn unique_capacity(kind: &PreparedColumnType) -> UniqueCapacity {
         PreparedColumnType::DepartmentJa => UniqueCapacity::Enumerable(DEPARTMENTS.len() as u128),
         PreparedColumnType::JobTitleJa => UniqueCapacity::Enumerable(JOB_TITLES.len() as u128),
         // 「今日」から1〜5年後(5通り)×1〜12月(12通り)の60通り
-        PreparedColumnType::CreditCardExpiry => UniqueCapacity::Enumerable(60),
+        // with_slashの有無は組み合わせ数(60通り)自体には影響しない(区切り記号を付けるかどうかだけの違いのため)
+        PreparedColumnType::CreditCardExpiry { .. } => UniqueCapacity::Enumerable(60),
         // 携帯電話・固定電話は組み合わせ数(市外局番の数 × 10^8)が膨大でEnumerable方式では
         // 列挙しきれないが、実務で指定されるrow_count(最大100万)に対しては十分すぎるほど
-        // 大きいため、Retry方式(値を作って重複チェック)で対応する
-        PreparedColumnType::PhoneJa => UniqueCapacity::Retry(PHONE_PREFIXES.len() as u128 * 100_000_000),
-        PreparedColumnType::PhoneJaLandline => {
+        // 大きいため、Retry方式(値を作って重複チェック)で対応する。with_hyphenの有無もここでは影響しない
+        PreparedColumnType::PhoneJa { .. } => UniqueCapacity::Retry(PHONE_PREFIXES.len() as u128 * 100_000_000),
+        PreparedColumnType::PhoneJaLandline { .. } => {
             UniqueCapacity::Retry(PHONE_PREFIXES_LANDLINE.len() as u128 * 100_000_000)
         }
-        // 郵便番号(NNN-NNNN): 1000 × 10000 = 1000万通り
-        PreparedColumnType::PostalCode => UniqueCapacity::Retry(1000 * 10_000),
+        // 郵便番号(NNN-NNNN): 1000 × 10000 = 1000万通り。with_hyphenの有無は組み合わせ数に影響しない
+        PreparedColumnType::PostalCode { .. } => UniqueCapacity::Retry(1000 * 10_000),
         // 住所(1列): (都道府県ごとの市区町村数の合計) × 番地1(1〜19) × 番地2(1〜19)。
         // allowed_prefecturesで絞り込まれていれば、対象の都道府県分だけを合計する
         PreparedColumnType::AddressJa { allowed_prefectures } => {
@@ -1348,8 +1394,9 @@ fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
     match kind {
         PreparedColumnType::Boolean => vec!["true".to_string(), "false".to_string()],
         PreparedColumnType::Gender => vec!["男性".to_string(), "女性".to_string()],
-        PreparedColumnType::BloodType => {
-            vec!["A型".to_string(), "O型".to_string(), "B型".to_string(), "AB型".to_string()]
+        PreparedColumnType::BloodType { with_suffix } => {
+            let suffix = if *with_suffix { "型" } else { "" };
+            vec!["A", "O", "B", "AB"].into_iter().map(|t| format!("{t}{suffix}")).collect()
         }
         PreparedColumnType::Fixed { value } => vec![value.clone()],
         PreparedColumnType::Float { min, max, decimals } => {
@@ -1433,12 +1480,14 @@ fn enumerate_values(kind: &PreparedColumnType) -> Vec<String> {
         PreparedColumnType::JobTitleJa => JOB_TITLES.iter().map(|s| s.to_string()).collect(),
         // random_credit_card_expiryと同じ「今日」基準で、1〜5年後×1〜12月の60通りを列挙する。
         // ここでもflat_mapを使い、「1〜5年後それぞれについて、1〜12月の12パターンを作る」処理を行う
-        PreparedColumnType::CreditCardExpiry => {
+        PreparedColumnType::CreditCardExpiry { with_slash } => {
             use chrono::Datelike;
             let today = chrono::Local::now().date_naive();
+            let sep = if *with_slash { "/" } else { "" };
             (1..=5)
                 .flat_map(|years_ahead| {
-                    (1..=12).map(move |month| format!("{:02}/{:02}", month, (today.year() + years_ahead) % 100))
+                    (1..=12)
+                        .map(move |month| format!("{:02}{sep}{:02}", month, (today.year() + years_ahead) % 100))
                 })
                 .collect()
         }
@@ -2149,18 +2198,22 @@ fn random_email(id: u32, domain: &str) -> String {
     format!("user{}@{}", id, domain)
 }
 
-fn random_postal_code(rng: &mut impl Rng) -> String {
-    format!("{:03}-{:04}", rng.gen_range(0..1000), rng.gen_range(0..10000))
+// with_hyphenがtrue(省略時も含む)なら"123-4567"、falseなら"1234567"
+fn random_postal_code(rng: &mut impl Rng, with_hyphen: bool) -> String {
+    let sep = if with_hyphen { "-" } else { "" };
+    format!("{:03}{sep}{:04}", rng.gen_range(0..1000), rng.gen_range(0..10000))
 }
 
-fn random_phone(rng: &mut impl Rng) -> String {
+fn random_phone(rng: &mut impl Rng, with_hyphen: bool) -> String {
     let prefix = PHONE_PREFIXES[rng.gen_range(0..PHONE_PREFIXES.len())];
-    format!("{}-{:04}-{:04}", prefix, rng.gen_range(0..10000), rng.gen_range(0..10000))
+    let sep = if with_hyphen { "-" } else { "" };
+    format!("{prefix}{sep}{:04}{sep}{:04}", rng.gen_range(0..10000), rng.gen_range(0..10000))
 }
 
-fn random_phone_landline(rng: &mut impl Rng) -> String {
+fn random_phone_landline(rng: &mut impl Rng, with_hyphen: bool) -> String {
     let prefix = PHONE_PREFIXES_LANDLINE[rng.gen_range(0..PHONE_PREFIXES_LANDLINE.len())];
-    format!("{}-{:04}-{:04}", prefix, rng.gen_range(0..10000), rng.gen_range(0..10000))
+    let sep = if with_hyphen { "-" } else { "" };
+    format!("{prefix}{sep}{:04}{sep}{:04}", rng.gen_range(0..10000), rng.gen_range(0..10000))
 }
 
 // allowedがSome(絞り込み済みの都道府県名一覧)なら、その中からだけ都道府県を選ぶ。
@@ -2315,12 +2368,13 @@ fn random_credit_card_number(rng: &mut impl Rng) -> String {
 
 // クレジットカードの有効期限を"MM/YY"形式で返す。「今日」を基準に1〜5年後の
 // ランダムな年+ランダムな月(1〜12)にする(birth_dateと同じく「今日」基準の考え方)
-fn random_credit_card_expiry(rng: &mut impl Rng) -> String {
+fn random_credit_card_expiry(rng: &mut impl Rng, with_slash: bool) -> String {
     use chrono::Datelike;
     let today = chrono::Local::now().date_naive();
     let year = today.year() + rng.gen_range(1..=5);
     let month = rng.gen_range(1..=12);
-    format!("{:02}/{:02}", month, year % 100)
+    let sep = if with_slash { "/" } else { "" };
+    format!("{:02}{sep}{:02}", month, year % 100)
 }
 
 // 日本の普通預金口座番号を想定した7桁のゼロ埋め数字
@@ -2467,9 +2521,10 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::Boolean => rng.gen_bool(0.5).to_string(),
         PreparedColumnType::Gender => if rng.gen_bool(0.5) { "男性".to_string() } else { "女性".to_string() },
         // 日本人の血液型分布の目安(A:O:B:AB ≒ 4:3:2:1)で重み付け
-        PreparedColumnType::BloodType => {
-            let pairs = [("A型", 4.0_f64), ("O型", 3.0), ("B型", 2.0), ("AB型", 1.0)];
-            pairs.choose_weighted(rng, |(_, weight)| *weight).unwrap().0.to_string()
+        PreparedColumnType::BloodType { with_suffix } => {
+            let pairs = [("A", 4.0_f64), ("O", 3.0), ("B", 2.0), ("AB", 1.0)];
+            let letter = pairs.choose_weighted(rng, |(_, weight)| *weight).unwrap().0;
+            if *with_suffix { format!("{letter}型") } else { letter.to_string() }
         }
         PreparedColumnType::Pattern { pieces } => {
             let mut value = String::new();
@@ -2494,9 +2549,9 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
                 .expect("年齢範囲から計算した日付は必ず有効な日付になる");
             format_date(date, *format)
         }
-        PreparedColumnType::PostalCode => random_postal_code(rng),
-        PreparedColumnType::PhoneJa => random_phone(rng),
-        PreparedColumnType::PhoneJaLandline => random_phone_landline(rng),
+        PreparedColumnType::PostalCode { with_hyphen } => random_postal_code(rng, *with_hyphen),
+        PreparedColumnType::PhoneJa { with_hyphen } => random_phone(rng, *with_hyphen),
+        PreparedColumnType::PhoneJaLandline { with_hyphen } => random_phone_landline(rng, *with_hyphen),
         PreparedColumnType::AddressJa { allowed_prefectures } => {
             random_address(rng, allowed_prefectures.as_ref().map(|a| a.as_slice()))
         }
@@ -2525,7 +2580,7 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         PreparedColumnType::Password => random_password(rng),
         PreparedColumnType::ProfileImageUrl => random_profile_image_url(rng),
         PreparedColumnType::CreditCardNumber => random_credit_card_number(rng),
-        PreparedColumnType::CreditCardExpiry => random_credit_card_expiry(rng),
+        PreparedColumnType::CreditCardExpiry { with_slash } => random_credit_card_expiry(rng, *with_slash),
         PreparedColumnType::BankAccountNumber => random_bank_account_number(rng),
         PreparedColumnType::ProductSku => random_product_sku(rng),
         PreparedColumnType::MyNumber => random_my_number(rng),
@@ -2547,53 +2602,62 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
     }
 }
 
-// SQLのVALUES句に書くとき、文字列として ' ' で囲む必要がある列タイプかどうか
-fn is_text_column(kind: &PreparedColumnType) -> bool {
-    // foreign_key列は参照先の型(repr)次第でクォート要否が変わるので個別に判定し、
-    // それ以外は列タイプで固定的に判定する
-    if let PreparedColumnType::ForeignKey { repr, .. } = kind {
-        return *repr == FkRepr::Text;
+// SQL/JSON/Excel出力で、列の値を実際どう出力するかの分類。
+// 「文字列としてクォートする/整数として出す/小数として出す/真偽値として出す」の4通り。
+// 通常は列タイプ(kind)から自動で決まるが、ColumnDef.data_type(列ごとの上書き指定)が
+// あればそちらを優先する(resolve_value_category参照)
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ValueCategory {
+    Text,
+    Integer,
+    Float,
+    Boolean,
+}
+
+// ColumnDef.data_type に書かれた自由入力の型名(例: "VARCHAR(100)")から、
+// ValueCategoryを判定する。先頭の単語("("または空白より前)だけを大文字化して見る
+// (例: "VARCHAR(100)" → "VARCHAR"、"decimal(10,2)" → "DECIMAL")。
+// 知らない型名(VARCHAR/CHAR/TEXT/DATEなど)は安全側のTextに倒す
+fn classify_data_type_name(name: &str) -> ValueCategory {
+    let head = name
+        .trim()
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .to_uppercase();
+    match head.as_str() {
+        "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" => ValueCategory::Integer,
+        "FLOAT" | "DOUBLE" | "DECIMAL" | "NUMERIC" | "REAL" => ValueCategory::Float,
+        "BOOL" | "BOOLEAN" | "BIT" => ValueCategory::Boolean,
+        _ => ValueCategory::Text,
     }
-    matches!(
-        kind,
-        PreparedColumnType::NameJa { .. }
-            | PreparedColumnType::LastNameJa
-            | PreparedColumnType::FirstNameJa
-            | PreparedColumnType::RomajiName
-            | PreparedColumnType::KatakanaLastName
-            | PreparedColumnType::KatakanaFirstName
-            | PreparedColumnType::Email { .. }
-            | PreparedColumnType::Date { .. }
-            | PreparedColumnType::BirthDate { .. }
-            | PreparedColumnType::PostalCode
-            | PreparedColumnType::PhoneJa
-            | PreparedColumnType::PhoneJaLandline
-            | PreparedColumnType::AddressJa { .. }
-            | PreparedColumnType::CompanyNameJa
-            | PreparedColumnType::Uuid
-            | PreparedColumnType::PrefectureJa { .. }
-            | PreparedColumnType::CityJa
-            | PreparedColumnType::KatakanaName { .. }
-            | PreparedColumnType::KatakanaNameHankaku { .. }
-            | PreparedColumnType::DepartmentJa
-            | PreparedColumnType::JobTitleJa
-            | PreparedColumnType::IpAddress
-            | PreparedColumnType::Jwt
-            | PreparedColumnType::ApiKey
-            | PreparedColumnType::CreditCardNumber
-            | PreparedColumnType::CreditCardExpiry
-            | PreparedColumnType::BankAccountNumber
-            | PreparedColumnType::ProductSku
-            | PreparedColumnType::MyNumber
-            | PreparedColumnType::Enum { .. }
-            | PreparedColumnType::Fixed { .. }
-            | PreparedColumnType::Gender
-            | PreparedColumnType::BloodType
-            | PreparedColumnType::Pattern { .. }
-            | PreparedColumnType::Username
-            | PreparedColumnType::Password
-            | PreparedColumnType::ProfileImageUrl
-    )
+}
+
+// data_typeの指定が無い列に使う、今まで通りの列タイプ(kind)からの自動判定。
+// foreign_key列は参照先の型(repr)次第で決まり、それ以外は列タイプで固定的に決まる。
+// ここに列挙されていない型(氏名・住所・文字列系すべて)は、まとめてTextとして扱う
+fn default_value_category(kind: &PreparedColumnType) -> ValueCategory {
+    match kind {
+        PreparedColumnType::Sequence | PreparedColumnType::Integer { .. } => ValueCategory::Integer,
+        PreparedColumnType::Float { .. } => ValueCategory::Float,
+        PreparedColumnType::Boolean => ValueCategory::Boolean,
+        PreparedColumnType::ForeignKey { repr, .. } => match repr {
+            FkRepr::Integer => ValueCategory::Integer,
+            FkRepr::Float => ValueCategory::Float,
+            FkRepr::Boolean => ValueCategory::Boolean,
+            FkRepr::Text => ValueCategory::Text,
+        },
+        _ => ValueCategory::Text,
+    }
+}
+
+// SQL(sql_literal)/JSON(cell_to_json)/Excel(write_xlsx_cell)が共通で使う判定の入口。
+// data_typeが指定されていればそれを優先し、無ければ列タイプからの自動判定を使う
+fn resolve_value_category(kind: &PreparedColumnType, data_type: Option<&str>) -> ValueCategory {
+    match data_type {
+        Some(t) => classify_data_type_name(t),
+        None => default_value_category(kind),
+    }
 }
 
 // 進捗バーを表示する行数のしきい値。これより少ない行数だと一瞬で終わってしまい、
@@ -2661,9 +2725,10 @@ pub fn generate_all_rows(row_count: u32, columns: &[PreparedColumn], base_seed: 
     rows
 }
 
-// SQL文字列リテラルの中に ' が含まれていると構文が壊れるので '' に二重化してエスケープする
-fn sql_literal(kind: &PreparedColumnType, value: &str) -> String {
-    if is_text_column(kind) {
+// SQL文字列リテラルの中に ' が含まれていると構文が壊れるので '' に二重化してエスケープする。
+// data_type: ColumnDef.data_type(列ごとのデータ型の上書き指定)。Noneなら列タイプから自動判定する
+fn sql_literal(kind: &PreparedColumnType, data_type: Option<&str>, value: &str) -> String {
+    if resolve_value_category(kind, data_type) == ValueCategory::Text {
         format!("'{}'", value.replace('\'', "''"))
     } else {
         value.to_string()
@@ -2743,7 +2808,7 @@ pub fn build_sql_from_rows(
                 .iter()
                 .zip(columns)
                 .map(|(cell, c)| match cell {
-                    Some(v) => sql_literal(&c.kind, v),
+                    Some(v) => sql_literal(&c.kind, c.data_type.as_deref(), v),
                     None => "NULL".to_string(), // SQLのNULLはクォートしてはいけない
                 })
                 .collect();
@@ -3009,36 +3074,23 @@ pub fn write_text(text: &str, path: &str, encoding: Encoding) -> Result<(), Box<
 }
 
 // 列タイプに応じて、文字列の値を適切なJSONの型(数値・真偽値・文字列・null)に変換する
-fn cell_to_json(kind: &PreparedColumnType, cell: Option<&str>) -> serde_json::Value {
+// data_type: ColumnDef.data_type(列ごとのデータ型の上書き指定)。Noneなら列タイプから自動判定する
+fn cell_to_json(kind: &PreparedColumnType, data_type: Option<&str>, cell: Option<&str>) -> serde_json::Value {
     let value = match cell {
         Some(v) => v,
         None => return serde_json::Value::Null,
     };
 
-    match kind {
-        PreparedColumnType::Sequence => value.parse::<u64>().map(Into::into).unwrap_or(serde_json::Value::Null),
-        PreparedColumnType::Integer { .. } => {
-            value.parse::<i64>().map(Into::into).unwrap_or(serde_json::Value::Null)
-        }
-        PreparedColumnType::Float { .. } => value
+    match resolve_value_category(kind, data_type) {
+        ValueCategory::Integer => value.parse::<i64>().map(Into::into).unwrap_or(serde_json::Value::Null),
+        ValueCategory::Float => value
             .parse::<f64>()
             .ok()
             .and_then(serde_json::Number::from_f64)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
-        PreparedColumnType::Boolean => serde_json::Value::Bool(value == "true"),
-        PreparedColumnType::ForeignKey { repr, .. } => match repr {
-            FkRepr::Integer => value.parse::<i64>().map(Into::into).unwrap_or(serde_json::Value::Null),
-            FkRepr::Float => value
-                .parse::<f64>()
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-            FkRepr::Boolean => serde_json::Value::Bool(value == "true"),
-            FkRepr::Text => serde_json::Value::String(value.to_string()),
-        },
-        _ => serde_json::Value::String(value.to_string()),
+        ValueCategory::Boolean => serde_json::Value::Bool(value == "true"),
+        ValueCategory::Text => serde_json::Value::String(value.to_string()),
     }
 }
 
@@ -3057,7 +3109,10 @@ pub fn build_json_from_rows(
             // 内部の領域を先に確保しておく最適化(無くても動作は変わらない)
             let mut object = serde_json::Map::with_capacity(columns.len());
             for (column, cell) in columns.iter().zip(row) {
-                object.insert(column.name.clone(), cell_to_json(&column.kind, cell.as_deref()));
+                object.insert(
+                    column.name.clone(),
+                    cell_to_json(&column.kind, column.data_type.as_deref(), cell.as_deref()),
+                );
             }
             // serde_json::to_string(...)はMapをJSON形式の文字列に変換するメソッド。
             // expect(...)は「ここで失敗するとしたらプログラムのバグなので、その場で
@@ -3084,11 +3139,13 @@ fn build_json(
 
 // 列タイプに応じて、Excelのセルに数値/真偽値/文字列として書き込む。NULL(None)は何も
 // 書かない(Excel上は空白セルになる。これが最も自然なNULLの表現)
+// data_type: ColumnDef.data_type(列ごとのデータ型の上書き指定)。Noneなら列タイプから自動判定する
 fn write_xlsx_cell(
     worksheet: &mut rust_xlsxwriter::Worksheet,
     row: u32,
     col: u16,
     kind: &PreparedColumnType,
+    data_type: Option<&str>,
     cell: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // セルの値がNone(NULL)なら、何も書き込まずにここで終わる(Excel上は空白セルになる)
@@ -3096,8 +3153,8 @@ fn write_xlsx_cell(
         return Ok(());
     };
 
-    match kind {
-        PreparedColumnType::Sequence | PreparedColumnType::Integer { .. } | PreparedColumnType::Float { .. } => {
+    match resolve_value_category(kind, data_type) {
+        ValueCategory::Integer | ValueCategory::Float => {
             // value.parse::<f64>()は「文字列を小数として読み取れるか試す」処理で、
             // 成功すればOk(数値)、失敗すればErrになる。"if let Ok(number) = ... "は
             // 「読み取れたときだけ」中に入る構文で、読み取れれば数値セルとして、
@@ -3108,25 +3165,10 @@ fn write_xlsx_cell(
                 worksheet.write_string(row, col, value)?;
             }
         }
-        PreparedColumnType::Boolean => {
+        ValueCategory::Boolean => {
             worksheet.write_boolean(row, col, value == "true")?;
         }
-        PreparedColumnType::ForeignKey { repr, .. } => match repr {
-            FkRepr::Integer | FkRepr::Float => {
-                if let Ok(number) = value.parse::<f64>() {
-                    worksheet.write_number(row, col, number)?;
-                } else {
-                    worksheet.write_string(row, col, value)?;
-                }
-            }
-            FkRepr::Boolean => {
-                worksheet.write_boolean(row, col, value == "true")?;
-            }
-            FkRepr::Text => {
-                worksheet.write_string(row, col, value)?;
-            }
-        },
-        _ => {
+        ValueCategory::Text => {
             worksheet.write_string(row, col, value)?;
         }
     }
@@ -3311,7 +3353,14 @@ fn write_xlsx_tables(
         for (row_idx, row) in table.rows.iter().enumerate() {
             let excel_row = (row_idx + 1) as u32;
             for (col_idx, (column, cell)) in table.columns.iter().zip(row).enumerate() {
-                write_xlsx_cell(worksheet, excel_row, col_idx as u16, &column.kind, cell.as_deref())?;
+                write_xlsx_cell(
+                    worksheet,
+                    excel_row,
+                    col_idx as u16,
+                    &column.kind,
+                    column.data_type.as_deref(),
+                    cell.as_deref(),
+                )?;
             }
         }
     }
@@ -3625,7 +3674,7 @@ mod tests {
 
     #[test]
     fn sql_literal_quotes_text_columns_and_escapes_quote() {
-        let quoted = sql_literal(&PreparedColumnType::NameJa { with_space: false }, "O'Brien");
+        let quoted = sql_literal(&PreparedColumnType::NameJa { with_space: false }, None, "O'Brien");
         assert_eq!(quoted, "'O''Brien'");
     }
 
@@ -3720,8 +3769,8 @@ mod tests {
 
     #[test]
     fn sql_literal_does_not_quote_numeric_or_boolean_columns() {
-        assert_eq!(sql_literal(&PreparedColumnType::Integer { min: 0, max: 10 }, "5"), "5");
-        assert_eq!(sql_literal(&PreparedColumnType::Boolean, "true"), "true");
+        assert_eq!(sql_literal(&PreparedColumnType::Integer { min: 0, max: 10 }, None, "5"), "5");
+        assert_eq!(sql_literal(&PreparedColumnType::Boolean, None, "true"), "true");
     }
 
     #[test]
@@ -3946,16 +3995,41 @@ mod tests {
     #[test]
     fn generate_value_blood_type_is_one_of_four_types() {
         let mut rng = row_rng(42, 1);
-        let value = generate_value(&PreparedColumnType::BloodType, 1, &mut rng);
+        let value = generate_value(&PreparedColumnType::BloodType { with_suffix: true }, 1, &mut rng);
         assert!(["A型", "O型", "B型", "AB型"].contains(&value.as_str()));
     }
 
     #[test]
+    fn blood_type_with_suffix_false_omits_suffix() {
+        let mut rng = row_rng(42, 1);
+        let value = generate_value(&PreparedColumnType::BloodType { with_suffix: false }, 1, &mut rng);
+        assert!(["A", "O", "B", "AB"].contains(&value.as_str()));
+    }
+
+    #[test]
     fn gender_and_blood_type_are_quoted_as_text_in_sql() {
-        assert!(is_text_column(&PreparedColumnType::Gender));
-        assert!(is_text_column(&PreparedColumnType::BloodType));
-        assert_eq!(sql_literal(&PreparedColumnType::Gender, "男性"), "'男性'");
-        assert_eq!(sql_literal(&PreparedColumnType::BloodType, "A型"), "'A型'");
+        assert!(default_value_category(&PreparedColumnType::Gender) == ValueCategory::Text);
+        assert!(default_value_category(&PreparedColumnType::BloodType { with_suffix: true }) == ValueCategory::Text);
+        assert_eq!(sql_literal(&PreparedColumnType::Gender, None, "男性"), "'男性'");
+        assert_eq!(sql_literal(&PreparedColumnType::BloodType { with_suffix: true }, None, "A型"), "'A型'");
+    }
+
+    #[test]
+    fn data_type_override_forces_integer_column_to_be_quoted_as_text() {
+        // 0埋めのコードなど、数値に見えても文字列として保持したいケース。
+        // data_typeで"VARCHAR(10)"を指定すると、SQL/JSON/Excelいずれも文字列として扱われる
+        let kind = PreparedColumnType::Integer { min: 0, max: 100 };
+        assert_eq!(sql_literal(&kind, Some("VARCHAR(10)"), "007"), "'007'");
+        assert_eq!(cell_to_json(&kind, Some("VARCHAR(10)"), Some("007")), serde_json::Value::String("007".to_string()));
+    }
+
+    #[test]
+    fn data_type_override_forces_text_column_to_be_unquoted_as_integer() {
+        // 郵便番号を「-」無しにしたうえで、data_typeで"INTEGER"を指定すると、
+        // SQLではクォート無し、JSONでは数値として出力される
+        let kind = PreparedColumnType::PostalCode { with_hyphen: false };
+        assert_eq!(sql_literal(&kind, Some("INTEGER"), "1234567"), "1234567");
+        assert_eq!(cell_to_json(&kind, Some("INTEGER"), Some("1234567")), serde_json::Value::Number(1234567.into()));
     }
 
     #[test]
@@ -4117,12 +4191,20 @@ mod tests {
     #[test]
     fn random_postal_code_has_nnn_dash_nnnn_format() {
         let mut rng = row_rng(1, 1);
-        let code = random_postal_code(&mut rng);
+        let code = random_postal_code(&mut rng, true);
         let parts: Vec<&str> = code.split('-').collect();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].len(), 3);
         assert_eq!(parts[1].len(), 4);
         assert!(code.chars().all(|c| c.is_ascii_digit() || c == '-'));
+    }
+
+    #[test]
+    fn random_postal_code_without_hyphen_is_digits_only() {
+        let mut rng = row_rng(1, 1);
+        let code = random_postal_code(&mut rng, false);
+        assert_eq!(code.len(), 7);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
     }
 
     #[test]
@@ -4726,6 +4808,19 @@ mod tests {
     }
 
     #[test]
+    fn credit_card_expiry_with_slash_false_omits_slash() {
+        let schema = schema_from_yaml(
+            "row_count: 50\ncolumns:\n  - name: exp\n    type: credit_card_expiry\n    with_slash: false\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 9).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert_eq!(line.len(), 4, "{line}");
+            assert!(line.chars().all(|c| c.is_ascii_digit()), "{line}");
+        }
+    }
+
+    #[test]
     fn bank_account_number_has_seven_digit_format() {
         let schema = schema_from_yaml("row_count: 30\ncolumns:\n  - name: acc\n    type: bank_account_number\n");
         let columns = prepare_columns(&schema).unwrap();
@@ -5080,6 +5175,32 @@ mod tests {
             let parts: Vec<&str> = line.split('-').collect();
             assert_eq!(parts.len(), 3, "{line}");
             assert!(PHONE_PREFIXES_LANDLINE.contains(&parts[0]), "{line}");
+        }
+    }
+
+    #[test]
+    fn phone_ja_landline_with_hyphen_false_omits_hyphen() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: p\n    type: phone_ja_landline\n    with_hyphen: false\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 3).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(!line.contains('-'), "{line}");
+            assert!(line.chars().all(|c| c.is_ascii_digit()), "{line}");
+            assert!(PHONE_PREFIXES_LANDLINE.iter().any(|prefix| line.starts_with(prefix)), "{line}");
+        }
+    }
+
+    #[test]
+    fn phone_ja_with_hyphen_false_omits_hyphen() {
+        let schema =
+            schema_from_yaml("row_count: 30\ncolumns:\n  - name: p\n    type: phone_ja\n    with_hyphen: false\n");
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 3).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(!line.contains('-'), "{line}");
+            assert!(line.chars().all(|c| c.is_ascii_digit()), "{line}");
         }
     }
 
