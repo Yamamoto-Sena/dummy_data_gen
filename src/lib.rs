@@ -380,7 +380,11 @@ pub enum ColumnType {
     // 他の列の値から計算する数値列(例: 売上金額 = 数量 × 単価)。
     // 参照する列(base_columns/category_column/date_column)は、この列より前に定義されている必要がある
     CorrelatedNumber {
-        // 掛け合わせる元になる数値列名のリスト(integer/float/sequence/correlated_numberのみ指定可)。1つ以上必須
+        // 掛け合わせる元になる数値列名のリスト(integer/float/sequence/correlated_numberのみ指定可)。1つ以上必須。
+        // #[serde(default)]を付けているのは「省略された(キー自体が無い)」場合でも空Vecとして受け取り、
+        // 下のprepare_columnsにある「1つ以上指定してください」という親切なエラーメッセージまで
+        // 到達させるため(付けないと、serdeの「missing field」という生のエラーで止まってしまう)
+        #[serde(default)]
         base_columns: Vec<String>,
         // 指定した列の実際の値(文字列)ごとに倍率を変える。category_multipliersとセットで指定する
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2597,7 +2601,10 @@ fn extract_month_from_date_string(value: &str, format: DateFormat) -> Option<u32
 
 // correlated_number列(他の列から計算する数値)の値を作る。preceding_columns/preceding_valuesは
 // 同じ添字で対応しており(例: preceding_columns[2]の名前が"quantity"ならpreceding_values[2]が
-// その値)、prepare_columnsで存在・型を検証済みのため、通常は全て見つかる想定
+// その値)、prepare_columnsで存在・型を検証済みのため、通常は全て見つかる想定。
+// 戻り値がOption<String>なのは、base_columnsのどれか1つでもNULL(null_rateで欠けた場合)や
+// 数値として読めない値だったときに、その分を無かったことにして残りだけ掛けるのではなく、
+// 列全体をNULLとして扱う(=Noneを返す)ようにしたいため
 fn generate_correlated_number(
     rng: &mut impl Rng,
     base_columns: &[String],
@@ -2611,16 +2618,18 @@ fn generate_correlated_number(
     max: Option<f64>,
     preceding_columns: &[PreparedColumn],
     preceding_values: &[Option<String>],
-) -> String {
+) -> Option<String> {
     // 列名からpreceding_columns/preceding_valuesを探す小さなヘルパー。見つからない・NULLの場合はNone
     let find_value = |name: &str| -> Option<&str> {
         preceding_columns.iter().position(|c| c.name == name).and_then(|i| preceding_values[i].as_deref())
     };
 
-    // base_columnsの値を全部掛け算する(数値として読めなければ掛け算に参加させない=無視する。
-    // NULLになった場合の保険で、prepare_columnsが数値の列であることを検証済みのため通常は起きない)
-    let mut value: f64 =
-        base_columns.iter().filter_map(|name| find_value(name)?.parse::<f64>().ok()).product();
+    // base_columnsの値を全部掛け算する。どれか1つでも見つからない・NULL・数値として読めなければ、
+    // その時点で関数全体をNone(=この列もNULL)で終える(?演算子で早期リターン)
+    let mut value: f64 = 1.0;
+    for name in base_columns {
+        value *= find_value(name)?.parse::<f64>().ok()?;
+    }
 
     // カテゴリ別倍率: 指定した列の実際の値が倍率テーブルに載っていれば掛ける。載っていなければ1.0(変化なし)
     if let (Some(col), Some(multipliers)) = (category_column, category_multipliers) {
@@ -2656,7 +2665,16 @@ fn generate_correlated_number(
         value = value.min(max);
     }
 
-    format!("{:.*}", decimals as usize, value)
+    // base_columnsの値が極端に大きいと掛け算でf64の範囲を超え、無限大(inf)やNaNになることがある
+    // (min/maxが両方指定されていれば通常はここで有限に収まるが、片方だけ・または両方未指定だと
+    // 素通りしてしまう)。Float.min/maxのis_finite()チェックと同じ考え方で、無限大・NaNのまま
+    // format!に渡すと"inf"/"NaN"という、SQLとしては構文エラーになる文字列が出力されてしまうため、
+    // 有限でなければ安全な既定値(0)に丸める
+    if !value.is_finite() {
+        value = 0.0;
+    }
+
+    Some(format!("{:.*}", decimals as usize, value))
 }
 
 // 同じ行の中で、前の列の生成結果を後ろの列に伝えるための文脈。
@@ -2735,7 +2753,7 @@ fn generate_cell(
             min,
             max,
         } => (
-            Some(generate_correlated_number(
+            generate_correlated_number(
                 rng,
                 base_columns,
                 category_column.as_deref(),
@@ -2748,7 +2766,7 @@ fn generate_cell(
                 max,
                 preceding_columns,
                 preceding_values,
-            )),
+            ),
             None,
         ),
         _ => (Some(generate_value(&column.kind, row_num, rng)), None),
@@ -5874,6 +5892,47 @@ mod tests {
         for line in csv_text.lines().skip(1) {
             let amount: f64 = line.split(',').nth(1).unwrap().parse().unwrap();
             assert!((90.0..=110.0).contains(&amount), "{line}");
+        }
+    }
+
+    #[test]
+    fn correlated_number_missing_base_columns_key_gives_friendly_error_not_raw_deserialize_error() {
+        // GUIが列を追加しただけ(base_columnsを一度も設定しない)場合、送られるJSONに
+        // base_columnsキー自体が無い。#[serde(default)]が無いとここでserdeの生の
+        // "missing field"エラーになってしまうため、空Vecとして受け取れることを確認する
+        // (その後prepare_columns側の「1つ以上指定してください」という親切なエラーに繋がる)
+        let schema = schema_from_yaml("row_count: 1\ncolumns:\n  - name: amount\n    type: correlated_number\n");
+        let err = prepare_columns(&schema).err().unwrap();
+        assert!(err.to_string().contains("base_columns"), "エラーメッセージ: {}", err);
+    }
+
+    #[test]
+    fn correlated_number_null_base_column_makes_result_null() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: base\n    type: integer\n    min: 100\n    max: 100\n    null_rate: 1.0\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 4).unwrap();
+        for line in csv_text.lines().skip(1) {
+            // CSVでは NULL は空文字になる。base自体もnull_rate:1.0で必ず空になるので、
+            // amountも「baseが無かったことにして1として掛ける」のではなく空(NULL)になるはず
+            assert_eq!(line, ",", "{line}");
+        }
+    }
+
+    #[test]
+    fn correlated_number_overflow_falls_back_to_zero_instead_of_inf() {
+        // 2つのfloat列(それぞれ1e200)を掛け合わせるとf64の範囲(最大約1.8e308)を超えて
+        // 無限大になる。min/maxを指定していないので、そのまま"inf"という文字列が
+        // 出力されてしまわないか(SQLとして構文エラーになる)を確認する
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: a\n    type: float\n    min: 1e200\n    max: 1e200\n  - name: b\n    type: float\n    min: 1e200\n    max: 1e200\n  - name: amount\n    type: correlated_number\n    base_columns: [a, b]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 6).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let amount = line.split(',').nth(2).unwrap();
+            assert_eq!(amount, "0", "{line}");
         }
     }
 
