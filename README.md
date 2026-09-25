@@ -7,7 +7,7 @@
 - **高速**: 値の生成をRustのマルチスレッド処理(rayon)で並列化。10列×100万行でも数秒で生成できる。
 - **完全オフライン**: ネットワーク通信を一切行わない。テストデータ(氏名・メールアドレス等)を外部サービスに送信できない、社内のセキュリティ規定にも対応しやすい。
 - **YAMLで自由にスキーマ定義**: 列名・型・行数を`schema.yaml`に書くだけ。Gitで管理・レビューできる。
-- **CSV/SQL/JSON/Excelに対応**: `--format csv`(デフォルト)/ `--format sql`(`INSERT INTO`文をバッチ生成)/ `--format json`(NDJSON、1行1件)/ `--format xlsx`(Excelファイル)。
+- **CSV/SQL/JSON/Excelに対応**: `--format csv`(デフォルト)/ `--format sql`(`INSERT INTO`文をバッチ生成)/ `--format json`(NDJSON、1行1件。`--json-array`で配列形式)/ `--format xlsx`(Excelファイル)。
 - **Shift-JIS出力に対応**: `--encoding sjis`。Dr.Sum/MotionBoard/Datalizerなど、日本の業務システムはUTF-8だけでなくShift-JISを前提にしていることが多いため。
 - **再現性**: `--seed`で乱数シードを固定すると、同じ設定から毎回同じデータを再現できる。
 - **NULL値の混入**: 列ごとに`null_rate`(0.0〜1.0)を指定すると、指定した確率でNULL(空)を混ぜられる。
@@ -71,6 +71,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `--seed <数値>` | 乱数シード。指定すると毎回同じデータを再現する | 未指定(毎回ランダム) |
 | `--output <path>` | 出力先ファイルパス | 形式に応じた既定値 |
 | `--quote-all` | CSV出力で全ての値をダブルクォートで囲む(名称にスペースを含む値の区切りを明確にしたい場合向け)。sql/json/xlsxには影響しない。単一テーブル(`tables:`を使わない形式)では`--format csv`単体のときのみ有効。複数テーブル(`tables:`形式)ではcsvを含む出力であれば常に有効(他の形式と同時指定してもcsvの部分にだけ効く) | 指定なし(必要な値だけクォート) |
+| `--json-array` | JSON出力を、ファイル全体で1つのJSON配列(`[{...},{...}]`)にする。csv/sql/xlsxには影響しない。複数テーブルではテーブルごとのファイルがそれぞれ1つの配列になる | 指定なし(NDJSON、1行1件) |
 
 ### 対応する列タイプ
 
@@ -91,7 +92,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `integer` | `min`〜`max`のランダムな整数 | `min`, `max` |
 | `float` | `min`〜`max`のランダムな小数 | `min`, `max`, `decimals`(省略時2) |
 | `boolean` | `true` / `false` | なし |
-| `date` | `start`〜`end`のランダムな日付 | `start`, `end`, `format`(省略時`ymd`。`ymd`/`iso8601`/`slash`/`wareki`) |
+| `date` | `start`〜`end`のランダムな日付 | `start`, `end`, `format`(省略時`ymd`。`ymd`/`iso8601`/`slash`/`compact`(区切りなし`YYYYMMDD`)/`wareki`) |
 | `birth_date` | `min_age`〜`max_age`歳になる生年月日を、今日の日付から逆算 | `min_age`, `max_age`, `format`(dateと共通) |
 | `postal_code` | 日本の郵便番号風(`NNN-NNNN`) | `with_hyphen`(省略時true。falseで「-」を入れず`NNNNNNN`にする) |
 | `phone_ja` | 携帯電話番号風(`090/080/070-XXXX-XXXX`) | `with_hyphen`(省略時true。falseで「-」を入れない) |
@@ -119,6 +120,8 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `pattern` | 正規表現に似た簡易記法から値を生成する(例: `"[A-Z]{3}-[0-9]{4}"` → `"ABC-1234"`)。対応するのはリテラル文字・`[...]`文字クラス(範囲`a-z`・`^`否定)・量指定子`?`/`*`/`+`/`{n}`/`{n,}`/`{n,m}`のみで、グループ化`(...)`や選択`\|`を使うとエラーになる(その文字自体を値に含めたい場合は`\(`のように`\`でエスケープする) | `pattern` |
 | `foreign_key` | 親テーブルに実在する値からランダムに1つ選ぶ(複数テーブル形式`tables:`専用) | `references`(`"テーブル名.列名"`形式) |
 | `correlated_number` | 他の列の値から計算する数値(例: 売上金額 = 数量 × 単価)。この列より**前**に定義された列だけを参照できる | `base_columns`(掛け合わせる数値列名のリスト。`integer`/`float`/`sequence`/`correlated_number`のみ指定可、1つ以上必須)。`category_column`+`category_multipliers`(省略可。指定した列の実際の値ごとに倍率を変える。例: `category_column: category`、`category_multipliers: {食品: 0.8, 家電: 3.0}`。一致しない値は倍率1.0のまま)。`date_column`+`monthly_multipliers`(省略可。指定した`date`/`birth_date`列の月によって倍率を変える。12個の数値、1月始まり)。`noise`(省略可・既定0.0。`±noise`のランダムな乱数を最後に掛ける。例: 0.1で±10%)。`decimals`(省略可・既定0)。`min`/`max`(省略可。結果をこの範囲でクランプする) |
+| `tax_amount` | 消費税額(税抜金額 × 税率を端数処理した整数)。詳細は下の「消費税額・税込金額」参照 | `base_column`(税抜金額の列名、必須)、`tax_rate`(省略時0.10)、`category_column`+`category_rates`(省略可。区分ごとの税率)、`rounding`(`floor`/`round`/`ceil`、省略時`floor`) |
+| `tax_inclusive_amount` | 税込金額(税抜金額 + 消費税額) | `tax_amount`と同じ |
 
 どの列タイプにも `null_rate`(0.0〜1.0)を追加でき、その確率でNULL(CSVでは空文字、SQLではクォートなしの`NULL`、JSONでは`null`)を出力する。
 
@@ -182,6 +185,19 @@ cargo run -- --config schema_multi_table.yaml --format csv,sql
 ```
 
 数値・真偽値の列はJSON上でも数値・真偽値として出力され(クォートされない)、NULLは`null`になる。
+
+ファイル全体を1つのJSONとして読み込むツール向けに、`--json-array` を付けると配列形式で出力する(値の中身はNDJSONと同じ)。
+
+```bash
+cargo run -- --config schema.yaml --format json --json-array --output result.json
+```
+
+```json
+[
+  {"id":1,"name":"佐藤翔太","age":32,"status":"利用中"},
+  {"id":2,"name":"田中健太","age":29,"status":"休止中"}
+]
+```
 
 ### Excel(xlsx)出力
 
@@ -286,13 +302,49 @@ columns:
 
 `base_columns`/`category_column`/`category_multipliers`/`date_column`/`monthly_multipliers`/`noise`はすべて省略可(必須は`base_columns`のみ)なので、必要な仕組みだけを組み合わせて使える(例: 計算式だけ使う、季節変動だけ使う、など)。SQL/JSON/Excel出力では常に数値として扱われる(クォートされない)。unique制約は非対応(計算結果に対して事前に全パターンを用意するのが現実的でないため、`pattern`/`foreign_key`と同じ扱い)。
 
+### 消費税額・税込金額(tax_amount / tax_inclusive_amount)
+
+純売上(税抜金額)の列から消費税額・税込金額を計算する列。税抜金額の列(`base_column`)は**この列より前**に定義する(`integer`/`float`/`sequence`/`correlated_number`のみ指定可。違反すると生成前にエラー)。純売上そのものは上の`correlated_number`(数量×単価など)で作る。
+
+```yaml
+columns:
+  - name: category
+    type: enum
+    choices: [食品, その他]
+  - name: net_sales                 # 純売上(税抜)
+    type: correlated_number
+    base_columns: [quantity, unit_price]
+  - name: tax
+    type: tax_amount                # 消費税額
+    base_column: net_sales
+    tax_rate: 0.10                  # 標準税率。10%なら0.10(省略時0.10)
+    category_column: category       # 区分ごとに税率を変える(軽減税率など。省略可)
+    category_rates:
+      食品: 0.08                    # 一覧に無い区分は標準税率
+    rounding: floor                 # 端数処理: floor(切り捨て・既定)/round(四捨五入)/ceil(切り上げ)
+  - name: gross
+    type: tax_inclusive_amount      # 税込金額 = 税抜金額 + 消費税額
+    base_column: net_sales
+    tax_rate: 0.10
+    category_column: category
+    category_rates:
+      食品: 0.08
+    rounding: floor
+```
+
+- `tax_amount`と`tax_inclusive_amount`は設定項目が共通。**税率の設定は列ごとに持つ**ため、税込金額を出すときは消費税額の列と同じ設定を書く(食い違うと税込金額が消費税額列と合わなくなる)。
+- 税率は割合で指定する(10%なら`0.10`。`10`と書くとエラー)。範囲は0.0〜1.0。
+- 消費税額は円未満を`rounding`で処理した整数。税込金額は税抜金額の小数桁数を引き継ぐ(整数なら整数)。1000×10%のような計算で出る浮動小数点の誤差(100.00000000000001)は端数処理の前に除去しているため、切り上げても101にならない。
+- 税抜金額の列がNULL(`null_rate`)のときは、この列もNULLになる。
+- SQL/JSON/Excel出力では`tax_amount`は整数、`tax_inclusive_amount`は小数として扱われる(`data_type`で上書き可)。unique制約は非対応。
+
 ### 進捗表示
 
 `row_count`が1000以上のとき、生成中にターミナルへ進捗バー(件数・割合)を表示する。ファイルへのリダイレクトなど、ターミナル以外への出力時は自動的に表示されない。
 
 ## GUI版(DummyGen JP)について
 
-`C:\dev_2\dummygen_jp_gui` に、このツールをライブラリ(`src/lib.rs`)として組み込んだTauri v2 + React 19のデスクトップGUIアプリ「DummyGen JP」がある。コマンド操作に不慣れな担当者向けに、カラム設定・生成件数・出力形式(CSV/SQL/Excel)・文字コード(UTF-8/Shift-JIS。Excel選択時は文字コードの概念が無いため設定不要)・値をダブルクォートで囲むかどうかを画面から設定できるほか、サンプルCSVの読み込みによる列・選択肢の自動設定、列のドラッグ並べ替え・複製、設定の保存・読み込み(プルダウン)、ワンクリックテンプレート、生成前のリアルタイムプレビュー(表示件数を変更可能)、複数テーブル(外部キー)対応、列設定のYAML書き出し/読み込み(このツールの`schema.yaml`と互換)といった画面独自の機能を持つ。GUIはCSV/SQL/Excel出力に対応(JSON出力は今のところCLI専用)。Excel(xlsx)出力は単一テーブル・複数テーブルのどちらも、CLIと同じく全行を一度メモリに載せてから書き出す方式(ストリーミング書き込みは無い)。複数テーブルのCSV/SQL生成も、CLI(`tables:`形式)と同じく全テーブル分の行を一度メモリに載せてから書き出す方式(単一テーブルのCSV/SQLは今まで通りメモリを圧迫しない方式のまま)。`quote_all`(値を""で囲むオプション)は単一テーブル・複数テーブルのどちらのCSV出力でも使える。GUIから生成したUTF-8のCSVには、Excelで開いたときに文字化けしないようファイル先頭にBOMを付けている(CLIの`--encoding utf8`出力にはBOMは付かず、これまで通り)。
+`C:\dev_2\dummygen_jp_gui` に、このツールをライブラリ(`src/lib.rs`)として組み込んだTauri v2 + React 19のデスクトップGUIアプリ「DummyGen JP」がある。コマンド操作に不慣れな担当者向けに、カラム設定・生成件数・出力形式(CSV/SQL/JSON/Excel)・文字コード(UTF-8/Shift-JIS。Excel選択時は文字コードの概念が無いため設定不要)・値をダブルクォートで囲むかどうかを画面から設定できるほか、サンプルCSVの読み込みによる列・選択肢の自動設定、列のドラッグ並べ替え・複製、設定の保存・読み込み(プルダウン)、ワンクリックテンプレート、生成前のリアルタイムプレビュー(表示件数を変更可能)、複数テーブル(外部キー)対応、列設定のYAML書き出し/読み込み(このツールの`schema.yaml`と互換)といった画面独自の機能を持つ。GUIはCSV/SQL/JSON/Excel出力に対応(JSONはNDJSON/配列形式を選べ、文字コードは常にUTF-8。CLIと同じく全行を一度メモリに載せてから書き出す)。Excel(xlsx)出力は単一テーブル・複数テーブルのどちらも、CLIと同じく全行を一度メモリに載せてから書き出す方式(ストリーミング書き込みは無い)。複数テーブルのCSV/SQL生成も、CLI(`tables:`形式)と同じく全テーブル分の行を一度メモリに載せてから書き出す方式(単一テーブルのCSV/SQLは今まで通りメモリを圧迫しない方式のまま)。`quote_all`(値を""で囲むオプション)は単一テーブル・複数テーブルのどちらのCSV出力でも使える。GUIから生成したUTF-8のCSVには、Excelで開いたときに文字化けしないようファイル先頭にBOMを付けている(CLIの`--encoding utf8`出力にはBOMは付かず、これまで通り)。
 
 ## Dr.Sum / MotionBoard / Datalizer 等での利用について
 

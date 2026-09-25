@@ -408,6 +408,46 @@ pub enum ColumnType {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max: Option<f64>,
     },
+    // 消費税額(純売上などの税抜金額 × 税率)。設定はtax_amountとtax_inclusive_amountで共通のためTaxSettingsにまとめてある
+    TaxAmount(TaxSettings),
+    // 税込金額(税抜金額 + 消費税額)
+    TaxInclusiveAmount(TaxSettings),
+}
+
+// 消費税の端数処理。日本の請求書では切り捨てが多いが案件で異なるため選べるようにしてある
+#[derive(Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum TaxRounding {
+    #[default]
+    Floor,
+    Round,
+    Ceil,
+}
+
+fn default_tax_rate() -> f64 {
+    0.10
+}
+
+// tax_amount/tax_inclusive_amount列の設定(2つの型で同じ項目を使うため共通化している)。
+// 参照する列(base_column/category_column)は、この列より前に定義されている必要がある
+#[derive(Deserialize, Serialize)]
+pub struct TaxSettings {
+    // 税抜金額(純売上など)の列名。integer/float/sequence/correlated_numberのみ指定可。
+    // #[serde(default)]は「省略された場合」でも、prepare_columnsの親切なエラーメッセージまで到達させるため
+    #[serde(default)]
+    base_column: String,
+    // 標準の税率。0.10なら10%。省略時0.10
+    #[serde(default = "default_tax_rate")]
+    tax_rate: f64,
+    // 指定した列の実際の値(文字列)ごとに税率を変える(軽減税率など)。category_ratesとセットで指定する。
+    // 一致しない値は上のtax_rateを使う
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    category_column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    category_rates: Option<HashMap<String, f64>>,
+    // 消費税額の端数処理。省略時は切り捨て
+    #[serde(default)]
+    rounding: TaxRounding,
 }
 
 fn default_decimals() -> u32 {
@@ -432,6 +472,8 @@ pub enum DateFormat {
     Ymd,
     Iso8601,
     Slash,
+    // 区切り文字なしの「YYYYMMDD」(例: 20240315)。「-」を入れたくない案件向け
+    Compact,
     Wareki,
 }
 
@@ -443,6 +485,7 @@ fn format_date(date: chrono::NaiveDate, format: DateFormat) -> String {
     match format {
         DateFormat::Ymd | DateFormat::Iso8601 => date.format("%Y-%m-%d").to_string(),
         DateFormat::Slash => date.format("%Y/%m/%d").to_string(),
+        DateFormat::Compact => date.format("%Y%m%d").to_string(),
         DateFormat::Wareki => format_wareki(date),
     }
 }
@@ -577,6 +620,15 @@ pub enum PreparedColumnType {
         decimals: u32,
         min: Option<f64>,
         max: Option<f64>,
+    },
+    // tax_amount(include_base=false)/tax_inclusive_amount(include_base=true)の実行時表現
+    ConsumptionTax {
+        base_column: String,
+        tax_rate: f64,
+        category_column: Option<String>,
+        category_rates: Option<HashMap<String, f64>>,
+        rounding: TaxRounding,
+        include_base: bool,
     },
 }
 
@@ -1219,6 +1271,10 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
                         min: *min,
                         max: *max,
                     }
+                }
+                ColumnType::TaxAmount(settings) => prepare_tax_column(&c.name, settings, &schema.columns[..i], false)?,
+                ColumnType::TaxInclusiveAmount(settings) => {
+                    prepare_tax_column(&c.name, settings, &schema.columns[..i], true)?
                 }
             };
 
@@ -2593,6 +2649,10 @@ fn extract_month_from_date_string(value: &str, format: DateFormat) -> Option<u32
     match format {
         DateFormat::Ymd | DateFormat::Iso8601 => value.split('-').nth(1)?.parse().ok(),
         DateFormat::Slash => value.split('/').nth(1)?.parse().ok(),
+        // 「YYYYMMDD」は区切りが無いので、先頭から5〜6文字目(0始まりで4..6)が月。
+        // 年は4桁(0001〜9999)で固定のため位置がずれることは無い。文字列がASCII数字のみ
+        // であることは format_date が保証しているが、念のためget()で範囲外・文字境界外をNoneにする
+        DateFormat::Compact => value.get(4..6)?.parse().ok(),
         // format_warekiが作る文字列は必ず「元号+年+月+日」の順(例: "令和6年3月15日"、
         // 元年なら"令和元年3月15日")なので、"年"の後ろ〜"月"の前の部分が月の数字になる
         DateFormat::Wareki => value.split('年').nth(1)?.split('月').next()?.parse().ok(),
@@ -2675,6 +2735,132 @@ fn generate_correlated_number(
     }
 
     Some(format!("{:.*}", decimals as usize, value))
+}
+
+// tax_amount/tax_inclusive_amount列の設定を検証して実行時表現にする。
+// preceding=この列より前の列(base_column/category_columnはここから探す)
+fn prepare_tax_column(
+    name: &str,
+    settings: &TaxSettings,
+    preceding: &[ColumnDef],
+    include_base: bool,
+) -> Result<PreparedColumnType, Box<dyn std::error::Error>> {
+    if settings.base_column.is_empty() {
+        return Err(format!("列 \"{}\": base_column に税抜金額の列名を指定してください", name).into());
+    }
+    match preceding.iter().find(|other| other.name == settings.base_column) {
+        Some(other) if matches!(
+            other.column_type,
+            ColumnType::Integer { .. } | ColumnType::Float { .. } | ColumnType::Sequence | ColumnType::CorrelatedNumber { .. }
+        ) => {}
+        Some(_) => {
+            return Err(format!(
+                "列 \"{}\": base_columnの \"{}\" は数値の列(integer/float/sequence/correlated_number)ではありません",
+                name, settings.base_column
+            )
+            .into());
+        }
+        None => {
+            return Err(format!(
+                "列 \"{}\": base_columnの \"{}\" が見つかりません(この列より前に定義された数値の列を指定してください)",
+                name, settings.base_column
+            )
+            .into());
+        }
+    }
+
+    // 税率は0〜1(0%〜100%)。NaNやinfもここで弾かれる(範囲比較がfalseになるため)
+    let rate_ok = |r: f64| (0.0..=1.0).contains(&r);
+    if !rate_ok(settings.tax_rate) {
+        return Err(format!(
+            "列 \"{}\": tax_rate({})は0.0〜1.0の範囲で指定してください(10%なら0.10)",
+            name, settings.tax_rate
+        )
+        .into());
+    }
+    if settings.category_column.is_some() != settings.category_rates.is_some() {
+        return Err(format!("列 \"{}\": category_column と category_rates は両方一緒に指定してください", name).into());
+    }
+    if let Some(col) = &settings.category_column {
+        if !preceding.iter().any(|other| &other.name == col) {
+            return Err(format!(
+                "列 \"{}\": category_columnの \"{}\" が見つかりません(この列より前に定義された列を指定してください)",
+                name, col
+            )
+            .into());
+        }
+    }
+    if let Some(rates) = &settings.category_rates {
+        for (key, rate) in rates {
+            if !rate_ok(*rate) {
+                return Err(format!(
+                    "列 \"{}\": category_ratesの \"{}\" の税率({})は0.0〜1.0の範囲で指定してください",
+                    name, key, rate
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(PreparedColumnType::ConsumptionTax {
+        base_column: settings.base_column.clone(),
+        tax_rate: settings.tax_rate,
+        category_column: settings.category_column.clone(),
+        category_rates: settings.category_rates.clone(),
+        rounding: settings.rounding,
+        include_base,
+    })
+}
+
+// 消費税額(=税抜金額×税率を端数処理したもの)を求める。
+// 1000×0.1のような計算は浮動小数点の誤差で100.00000000000001になり、切り上げると101に
+// なってしまうため、端数処理の前に小数第6位で丸めて誤差を消している
+fn calc_tax(base: f64, rate: f64, rounding: TaxRounding) -> f64 {
+    let raw = base * rate;
+    let raw = (raw * 1e6).round() / 1e6;
+    match rounding {
+        TaxRounding::Floor => raw.floor(),
+        TaxRounding::Round => raw.round(),
+        TaxRounding::Ceil => raw.ceil(),
+    }
+}
+
+// tax_amount/tax_inclusive_amount列の値を作る。税抜金額の列がNULL・数値として読めない場合は
+// generate_correlated_numberと同様、この列もNULL(None)にする
+fn generate_consumption_tax(
+    base_column: &str,
+    tax_rate: f64,
+    category_column: Option<&str>,
+    category_rates: Option<&HashMap<String, f64>>,
+    rounding: TaxRounding,
+    include_base: bool,
+    preceding_columns: &[PreparedColumn],
+    preceding_values: &[Option<String>],
+) -> Option<String> {
+    let find_value = |name: &str| -> Option<&str> {
+        preceding_columns.iter().position(|c| c.name == name).and_then(|i| preceding_values[i].as_deref())
+    };
+    let base_text = find_value(base_column)?;
+    let base: f64 = base_text.parse().ok()?;
+
+    // 区分(軽減税率など)ごとの税率。区分の値が税率表に無ければ標準税率
+    let rate = match (category_column, category_rates) {
+        (Some(col), Some(rates)) => find_value(col).and_then(|v| rates.get(v)).copied().unwrap_or(tax_rate),
+        _ => tax_rate,
+    };
+
+    let tax = calc_tax(base, rate, rounding);
+    if !tax.is_finite() {
+        return Some("0".to_string());
+    }
+    if include_base {
+        // 税抜金額の小数桁数をそのまま引き継ぐ(整数なら整数のまま)
+        let decimals = base_text.split_once('.').map_or(0, |(_, frac)| frac.len());
+        let total = base + tax;
+        Some(format!("{:.*}", decimals, if total.is_finite() { total } else { 0.0 }))
+    } else {
+        Some(format!("{:.0}", tax))
+    }
 }
 
 // 同じ行の中で、前の列の生成結果を後ろの列に伝えるための文脈。
@@ -2769,6 +2955,26 @@ fn generate_cell(
             ),
             None,
         ),
+        PreparedColumnType::ConsumptionTax {
+            ref base_column,
+            tax_rate,
+            ref category_column,
+            ref category_rates,
+            rounding,
+            include_base,
+        } => (
+            generate_consumption_tax(
+                base_column,
+                tax_rate,
+                category_column.as_deref(),
+                category_rates.as_ref(),
+                rounding,
+                include_base,
+                preceding_columns,
+                preceding_values,
+            ),
+            None,
+        ),
         _ => (Some(generate_value(&column.kind, row_num, rng)), None),
     }
 }
@@ -2809,6 +3015,9 @@ fn generate_value(kind: &PreparedColumnType, row_num: u32, rng: &mut impl Rng) -
         // CityJa/KatakanaNameのような「参照無しでもランダムに代替できる」フォールバックが作れないため)
         PreparedColumnType::CorrelatedNumber { .. } => {
             unreachable!("correlated_number列はgenerate_cellが必ず先に処理する")
+        }
+        PreparedColumnType::ConsumptionTax { .. } => {
+            unreachable!("tax_amount/tax_inclusive_amount列はgenerate_cellが必ず先に処理する")
         }
         PreparedColumnType::Sequence => row_num.to_string(),
         PreparedColumnType::NameJa { with_space } => random_name(rng, *with_space),
@@ -2942,6 +3151,9 @@ fn default_value_category(kind: &PreparedColumnType) -> ValueCategory {
     match kind {
         PreparedColumnType::Sequence | PreparedColumnType::Integer { .. } => ValueCategory::Integer,
         PreparedColumnType::Float { .. } | PreparedColumnType::CorrelatedNumber { .. } => ValueCategory::Float,
+        // 消費税額は常に整数(円未満は端数処理で消える)。税込金額は税抜金額の小数桁数を引き継ぐため小数扱い
+        PreparedColumnType::ConsumptionTax { include_base: false, .. } => ValueCategory::Integer,
+        PreparedColumnType::ConsumptionTax { include_base: true, .. } => ValueCategory::Float,
         PreparedColumnType::Boolean => ValueCategory::Boolean,
         PreparedColumnType::ForeignKey { repr, .. } => match repr {
             FkRepr::Integer => ValueCategory::Integer,
@@ -3403,30 +3615,55 @@ pub fn build_json_from_rows(
     rows: &[Vec<Option<String>>],
 ) -> Result<String, Box<dyn std::error::Error>> {
     // 1行につき1つのJSONオブジェクト(文字列)を作り、linesという一覧にまとめる
-    let lines: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            // serde_json::Mapは「キーと値の組」を順序を保ったまま持てる入れ物(JSONの{}に対応する)。
-            // with_capacity(columns.len())は、最終的に列の数だけ入ることが分かっているので、
-            // 内部の領域を先に確保しておく最適化(無くても動作は変わらない)
-            let mut object = serde_json::Map::with_capacity(columns.len());
-            for (column, cell) in columns.iter().zip(row) {
-                object.insert(
-                    column.name.clone(),
-                    cell_to_json(&column.kind, column.data_type.as_deref(), cell.as_deref()),
-                );
-            }
-            // serde_json::to_string(...)はMapをJSON形式の文字列に変換するメソッド。
-            // expect(...)は「ここで失敗するとしたらプログラムのバグなので、その場で
-            // 止めて知らせる」という意図(通常のString/数値/真偽値だけを詰めているMapが
-            // JSON化に失敗することは無い)
-            serde_json::to_string(&object).expect("serde_jsonのオブジェクト直列化は失敗しない")
-        })
-        .collect();
+    let lines: Vec<String> = rows.iter().map(|row| row_to_json_line(columns, row)).collect();
 
     let mut text = lines.join("\n");
     text.push('\n'); // CSV/SQL出力と同様、ファイル末尾に改行を入れておく
     Ok(text)
+}
+
+// JSON配列形式([{...},{...}])の中身をUTF-8の文字列として組み立てる。
+// NDJSON(build_json_from_rows)はファイル全体としては1つのJSONにならないため、
+// ファイル全体を1つのJSONとして読み込むツール向けにこちらを用意している。
+// 人が開いて読みやすいよう、1件ごとに改行して2スペース字下げする(値の中身はNDJSONと同じ)
+pub fn build_json_array_from_rows(
+    columns: &[PreparedColumn],
+    rows: &[Vec<Option<String>>],
+) -> Result<String, Box<dyn std::error::Error>> {
+    if rows.is_empty() {
+        return Ok("[]\n".to_string());
+    }
+    let lines: Vec<String> = rows.iter().map(|row| format!("  {}", row_to_json_line(columns, row))).collect();
+    Ok(format!("[\n{}\n]\n", lines.join(",\n")))
+}
+
+// json_arrayの値に応じて、NDJSON(false)か配列形式(true)のどちらかでJSONの中身を組み立てる
+pub fn build_json_text(
+    columns: &[PreparedColumn],
+    rows: &[Vec<Option<String>>],
+    json_array: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if json_array {
+        build_json_array_from_rows(columns, rows)
+    } else {
+        build_json_from_rows(columns, rows)
+    }
+}
+
+// 1行分の値を、列名をキーにしたJSONオブジェクトの文字列(改行なし)にする
+fn row_to_json_line(columns: &[PreparedColumn], row: &[Option<String>]) -> String {
+    // serde_json::Mapは「キーと値の組」を順序を保ったまま持てる入れ物(JSONの{}に対応する)。
+    // with_capacity(columns.len())は、最終的に列の数だけ入ることが分かっているので、
+    // 内部の領域を先に確保しておく最適化(無くても動作は変わらない)
+    let mut object = serde_json::Map::with_capacity(columns.len());
+    for (column, cell) in columns.iter().zip(row) {
+        object.insert(column.name.clone(), cell_to_json(&column.kind, column.data_type.as_deref(), cell.as_deref()));
+    }
+    // serde_json::to_string(...)はMapをJSON形式の文字列に変換するメソッド。
+    // expect(...)は「ここで失敗するとしたらプログラムのバグなので、その場で
+    // 止めて知らせる」という意図(通常のString/数値/真偽値だけを詰めているMapが
+    // JSON化に失敗することは無い)
+    serde_json::to_string(&object).expect("serde_jsonのオブジェクト直列化は失敗しない")
 }
 
 // build_json_from_rowsの「行数とシードを渡すだけで一発で作れる」版(テストからのみ使用)
@@ -3541,6 +3778,7 @@ pub fn output_base_path(output: Option<&str>, format: Format, multiple_formats: 
 // 指定された1つの形式について、既に生成済みの行データ(rows)を清書してファイルに保存する。
 // rowsを引数で受け取ることで、複数形式を同時出力しても値の生成(generate_all_rows)は
 // 1回で済む(形式ごとに毎回同じ乱数列から生成し直すのは無駄なため)。単一テーブル専用。
+// json_array: Json形式のときだけ使う(trueなら配列形式、falseならNDJSON)
 pub fn write_output(
     format: Format,
     columns: &[PreparedColumn],
@@ -3548,6 +3786,7 @@ pub fn write_output(
     table_name: Option<&str>,
     path: &str,
     encoding: Encoding,
+    json_array: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match format {
         // 複数形式同時出力の経路であり、CLIの--quote-allは(ドキュメント通り)ここには適用しない
@@ -3563,7 +3802,7 @@ pub fn write_output(
             };
             write_text(&build_sql_from_rows(columns, rows, table_name)?, path, encoding)
         }
-        Format::Json => write_text(&build_json_from_rows(columns, rows)?, path, encoding),
+        Format::Json => write_text(&build_json_text(columns, rows, json_array)?, path, encoding),
         Format::Xlsx => write_xlsx_from_rows(columns, rows, path),
     }
 }
@@ -3675,12 +3914,14 @@ fn write_xlsx_tables(
 // 戻り値は書き込んだ(パス, 行数)の一覧(mainが成功メッセージを1行ずつ表示するために使う)。
 // quote_all: Csv形式のときだけ使う(単一テーブルのwrite_csv_streamingと同じ意味。
 // sql/json/xlsxには影響しない)
+// json_array: Json形式のときだけ使う(trueなら配列形式、falseならNDJSON。write_outputと同じ意味)
 pub fn write_output_multi_table(
     format: Format,
     tables: &[GeneratedTable],
     base_path: &str,
     encoding: Encoding,
     quote_all: bool,
+    json_array: bool,
 ) -> Result<Vec<(String, u32)>, Box<dyn std::error::Error>> {
     match format {
         // csv/jsonはテーブルごとに別ファイルに保存する形式なので、同じ処理でまとめて扱う
@@ -3708,7 +3949,7 @@ pub fn write_output_multi_table(
             for (table, path) in tables.iter().zip(paths) {
                 let text = match format {
                     Format::Csv => build_csv_from_rows(table.columns, table.rows, quote_all)?,
-                    Format::Json => build_json_from_rows(table.columns, table.rows)?,
+                    Format::Json => build_json_text(table.columns, table.rows, json_array)?,
                     _ => unreachable!("csv/json以外はこの分岐に来ない"),
                 };
                 write_text(&text, &path, encoding)?;
@@ -3860,7 +4101,7 @@ mod tests {
         let base_path = dir.join("dummy_data_gen_test_multi_quote_all.csv");
         let base_path_str = base_path.to_str().unwrap();
 
-        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, true).unwrap();
+        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, true, false).unwrap();
 
         let written_path = table_file_path(base_path_str, "users");
         let actual = std::fs::read_to_string(&written_path).unwrap();
@@ -3884,7 +4125,7 @@ mod tests {
         let base_path = dir.join("dummy_data_gen_test_multi_quote_none.csv");
         let base_path_str = base_path.to_str().unwrap();
 
-        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, false).unwrap();
+        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, false, false).unwrap();
 
         let written_path = table_file_path(base_path_str, "users");
         let actual = std::fs::read_to_string(&written_path).unwrap();
@@ -4825,6 +5066,35 @@ mod tests {
     }
 
     #[test]
+    fn build_json_array_is_single_json_array_with_same_values_as_ndjson() {
+        let schema = schema_from_yaml(
+            "row_count: 3\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n  - name: active\n    type: boolean\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let rows = generate_all_rows(schema.row_count, &columns, 42);
+
+        let array_text = build_json_array_from_rows(&columns, &rows).unwrap();
+        let array: serde_json::Value = serde_json::from_str(&array_text).expect("ファイル全体で1つのJSONとして読めるはず");
+        let items = array.as_array().expect("トップレベルが配列になっているはず");
+        assert_eq!(items.len(), 3);
+
+        let ndjson_items: Vec<serde_json::Value> = build_json_from_rows(&columns, &rows)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(items, &ndjson_items);
+    }
+
+    #[test]
+    fn build_json_array_with_no_rows_is_empty_array() {
+        // row_count: 0はprepare_columnsの検証で弾かれるため、スキーマは1件にして行データだけ空を渡す
+        let schema = schema_from_yaml("row_count: 1\ncolumns:\n  - name: id\n    type: sequence\n");
+        let columns = prepare_columns(&schema).unwrap();
+        assert_eq!(build_json_array_from_rows(&columns, &[]).unwrap(), "[]\n");
+    }
+
+    #[test]
     fn build_json_null_cell_becomes_json_null() {
         let schema = schema_from_yaml(
             "row_count: 10\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n    null_rate: 1.0\n",
@@ -5672,6 +5942,48 @@ mod tests {
     }
 
     #[test]
+    fn date_format_compact_uses_yyyymmdd_without_separators() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: d\n    type: date\n    start: \"2020-01-01\"\n    end: \"2020-01-31\"\n    format: compact\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert!(line.starts_with("202001"), "{line}");
+            assert_eq!(line.len(), 8, "{line}");
+            assert!(line.chars().all(|c| c.is_ascii_digit()), "{line}");
+        }
+    }
+
+    #[test]
+    fn birth_date_format_compact_uses_yyyymmdd() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: b\n    type: birth_date\n    min_age: 20\n    max_age: 30\n    format: compact\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert_eq!(line.len(), 8, "{line}");
+            assert!(line.chars().all(|c| c.is_ascii_digit()), "{line}");
+        }
+    }
+
+    #[test]
+    fn correlated_number_monthly_multiplier_works_with_compact_date() {
+        let schema = schema_from_yaml(
+            "row_count: 30\ncolumns:\n  - name: base\n    type: integer\n    min: 100\n    max: 100\n  - name: d\n    type: date\n    start: \"2024-01-01\"\n    end: \"2024-12-31\"\n    format: compact\n  - name: amount\n    type: correlated_number\n    base_columns: [base]\n    date_column: d\n    monthly_multipliers: [1,1,1,1,1,1,1,1,1,1,1,2]\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 5).unwrap();
+        for line in csv_text.lines().skip(1) {
+            let parts: Vec<&str> = line.split(',').collect();
+            let month: u32 = parts[1][4..6].parse().unwrap(); // "YYYYMMDD"の5〜6文字目(0始まり)がMM
+            let expected = if month == 12 { 200.0 } else { 100.0 };
+            assert_eq!(parts[2].parse::<f64>().unwrap(), expected, "{line}");
+        }
+    }
+
+    #[test]
     fn date_without_format_field_defaults_to_ymd() {
         // 既存のschema.yaml(format未指定)との後方互換を確認する
         let schema = schema_from_yaml(
@@ -5796,6 +6108,10 @@ mod tests {
         assert_eq!(extract_month_from_date_string("2024-03-15", DateFormat::Ymd), Some(3));
         assert_eq!(extract_month_from_date_string("2024-03-15", DateFormat::Iso8601), Some(3));
         assert_eq!(extract_month_from_date_string("2024/03/15", DateFormat::Slash), Some(3));
+        assert_eq!(extract_month_from_date_string("20240315", DateFormat::Compact), Some(3));
+        assert_eq!(extract_month_from_date_string("20241231", DateFormat::Compact), Some(12));
+        // 想定外の短い文字列でもパニックせずNoneになる
+        assert_eq!(extract_month_from_date_string("2024", DateFormat::Compact), None);
         assert_eq!(extract_month_from_date_string("令和6年3月15日", DateFormat::Wareki), Some(3));
         // 元年(その元号の最初の年)は「6年」のような数字が付かず「元年」表記になる
         // (format_warekiのyear_label参照)。月の取り出しには影響しないことを確認する
@@ -5858,6 +6174,167 @@ mod tests {
             let month: u32 = parts[1][5..7].parse().unwrap(); // "YYYY-MM-DD"の5〜6文字目(0始まり)がMM
             let expected = if month == 12 { 200.0 } else { 100.0 };
             assert_eq!(parts[2].parse::<f64>().unwrap(), expected, "{line}");
+        }
+    }
+
+    // 消費税列のテスト用: 1列目(base)が常にbase_valueの整数、2列目以降にextra(YAMLの列定義の続き)を足したCSVを作る
+    fn tax_csv(base_value: i64, extra_columns: &str) -> Vec<Vec<String>> {
+        let yaml = format!(
+            "row_count: 3\ncolumns:\n  - name: base\n    type: integer\n    min: {base_value}\n    max: {base_value}\n{extra_columns}"
+        );
+        let schema = schema_from_yaml(&yaml);
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        csv_text.lines().skip(1).map(|l| l.split(',').map(String::from).collect()).collect()
+    }
+
+    #[test]
+    fn tax_amount_defaults_to_10_percent_floor_and_inclusive_adds_it() {
+        // 1005円×10%=100.5円 → 既定の切り捨てで100円、税込は1105円
+        let rows = tax_csv(
+            1005,
+            "  - name: tax\n    type: tax_amount\n    base_column: base\n  - name: total\n    type: tax_inclusive_amount\n    base_column: base\n",
+        );
+        for row in rows {
+            assert_eq!(row[1], "100");
+            assert_eq!(row[2], "1105");
+        }
+    }
+
+    #[test]
+    fn tax_amount_rounding_modes() {
+        let cases = [("floor", "100"), ("round", "101"), ("ceil", "101")];
+        for (mode, expected) in cases {
+            let rows = tax_csv(
+                1005,
+                &format!("  - name: tax\n    type: tax_amount\n    base_column: base\n    rounding: {mode}\n"),
+            );
+            assert_eq!(rows[0][1], expected, "rounding={mode}");
+        }
+    }
+
+    #[test]
+    fn tax_amount_is_not_thrown_off_by_float_error() {
+        // 1000×0.1は浮動小数点だと100.00000000000001。切り上げても101にならず100のままであること
+        let rows = tax_csv(
+            1000,
+            "  - name: tax\n    type: tax_amount\n    base_column: base\n    tax_rate: 0.10\n    rounding: ceil\n",
+        );
+        assert_eq!(rows[0][1], "100");
+        // 0.07×100=7.000000000000001 も同様
+        let rows = tax_csv(
+            100,
+            "  - name: tax\n    type: tax_amount\n    base_column: base\n    tax_rate: 0.07\n    rounding: ceil\n",
+        );
+        assert_eq!(rows[0][1], "7");
+    }
+
+    #[test]
+    fn tax_amount_uses_category_rates_and_falls_back_to_standard_rate() {
+        let yaml = "row_count: 30\ncolumns:\n  - name: kind\n    type: enum\n    choices: [food, other, misc]\n  - name: base\n    type: integer\n    min: 1000\n    max: 1000\n  - name: tax\n    type: tax_amount\n    base_column: base\n    tax_rate: 0.10\n    category_column: kind\n    category_rates:\n      food: 0.08\n";
+        let schema = schema_from_yaml(yaml);
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 3).unwrap();
+        let mut seen_food = false;
+        let mut seen_other = false;
+        for line in csv_text.lines().skip(1) {
+            let parts: Vec<&str> = line.split(',').collect();
+            match parts[0] {
+                "food" => {
+                    assert_eq!(parts[2], "80", "{line}");
+                    seen_food = true;
+                }
+                // 税率表に無い区分は標準税率(10%)
+                _ => {
+                    assert_eq!(parts[2], "100", "{line}");
+                    seen_other = true;
+                }
+            }
+        }
+        assert!(seen_food && seen_other, "両方の区分が出るseedのはず");
+    }
+
+    #[test]
+    fn tax_inclusive_amount_keeps_decimals_of_base() {
+        let yaml = "row_count: 2\ncolumns:\n  - name: base\n    type: float\n    min: 100.5\n    max: 100.5\n    decimals: 2\n  - name: total\n    type: tax_inclusive_amount\n    base_column: base\n    tax_rate: 0.10\n    rounding: floor\n";
+        let schema = schema_from_yaml(yaml);
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        // 100.50×10%=10.05 → 切り捨てて10、税込は110.50(桁数は税抜金額と同じ2桁)
+        assert_eq!(csv_text.lines().nth(1).unwrap(), "100.50,110.50");
+    }
+
+    #[test]
+    fn tax_amount_is_null_when_base_is_null() {
+        let yaml = "row_count: 5\ncolumns:\n  - name: base\n    type: integer\n    min: 100\n    max: 100\n    null_rate: 1.0\n  - name: tax\n    type: tax_amount\n    base_column: base\n";
+        let schema = schema_from_yaml(yaml);
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        for line in csv_text.lines().skip(1) {
+            assert_eq!(line, ",", "税抜金額がNULLなら消費税額もNULL");
+        }
+    }
+
+    #[test]
+    fn tax_amount_works_on_top_of_correlated_number() {
+        // 純売上(数量×単価) → 消費税額 → 税込金額 の一連の流れ
+        let yaml = "row_count: 3\ncolumns:\n  - name: qty\n    type: integer\n    min: 3\n    max: 3\n  - name: price\n    type: integer\n    min: 1000\n    max: 1000\n  - name: net\n    type: correlated_number\n    base_columns: [qty, price]\n  - name: tax\n    type: tax_amount\n    base_column: net\n  - name: gross\n    type: tax_inclusive_amount\n    base_column: net\n";
+        let schema = schema_from_yaml(yaml);
+        let columns = prepare_columns(&schema).unwrap();
+        let csv_text = build_csv(schema.row_count, &columns, 1).unwrap();
+        assert_eq!(csv_text.lines().nth(1).unwrap(), "3,1000,3000,300,3300");
+    }
+
+    #[test]
+    fn tax_columns_reject_invalid_settings() {
+        let cases = [
+            // base_column未指定
+            ("  - name: t\n    type: tax_amount\n", "base_column"),
+            // 存在しない列
+            ("  - name: t\n    type: tax_amount\n    base_column: nothing\n", "見つかりません"),
+            // 自分より後ろの列
+            ("  - name: t\n    type: tax_amount\n    base_column: later\n  - name: later\n    type: integer\n    min: 1\n    max: 2\n", "見つかりません"),
+            // 税率が範囲外(10を10%のつもりで書いた典型的な間違い)
+            ("  - name: t\n    type: tax_amount\n    base_column: base\n    tax_rate: 10\n", "0.0〜1.0"),
+            ("  - name: t\n    type: tax_amount\n    base_column: base\n    tax_rate: -0.1\n", "0.0〜1.0"),
+            // 区分だけ・税率表だけの指定
+            ("  - name: t\n    type: tax_amount\n    base_column: base\n    category_column: base\n", "両方一緒"),
+            ("  - name: t\n    type: tax_amount\n    base_column: base\n    category_rates:\n      a: 0.08\n", "両方一緒"),
+            // 区分の税率が範囲外
+            ("  - name: t\n    type: tax_amount\n    base_column: base\n    category_column: base\n    category_rates:\n      a: 8\n", "0.0〜1.0"),
+            // 数値でない列を税抜金額にした
+            ("  - name: n\n    type: gender\n  - name: t\n    type: tax_amount\n    base_column: n\n", "数値の列"),
+            // uniqueは非対応
+            ("  - name: t\n    type: tax_amount\n    base_column: base\n    unique: true\n", "unique"),
+        ];
+        for (extra, expected) in cases {
+            let yaml = format!(
+                "row_count: 3\ncolumns:\n  - name: base\n    type: integer\n    min: 1\n    max: 100\n{extra}"
+            );
+            let schema = schema_from_yaml(&yaml);
+            let err = prepare_columns(&schema).err().unwrap_or_else(|| panic!("エラーになるはず: {extra}"));
+            assert!(err.to_string().contains(expected), "期待={expected} 実際={err}\n{extra}");
+        }
+    }
+
+    #[test]
+    fn tax_columns_round_trip_through_yaml_and_report_value_category() {
+        let yaml = "row_count: 2\ntable_name: t\ncolumns:\n  - name: base\n    type: integer\n    min: 1\n    max: 5\n  - name: tax\n    type: tax_amount\n    base_column: base\n    tax_rate: 0.08\n    rounding: ceil\n    category_column: base\n    category_rates:\n      \"1\": 0.1\n  - name: gross\n    type: tax_inclusive_amount\n    base_column: base\n";
+        let schema = schema_from_yaml(yaml);
+        let file = SchemaFile { tables: vec![schema], multi_table: false };
+        let out = schema_file_to_yaml(&file).unwrap();
+        let reloaded: RawSchemaFile = serde_yaml::from_str(&out).unwrap();
+        let reloaded = normalize_schema_file(reloaded).unwrap();
+        let columns = prepare_columns(&reloaded.tables[0]).unwrap();
+        assert!(default_value_category(&columns[1].kind) == ValueCategory::Integer);
+        assert!(default_value_category(&columns[2].kind) == ValueCategory::Float);
+        match &columns[1].kind {
+            PreparedColumnType::ConsumptionTax { tax_rate, rounding, include_base, .. } => {
+                assert_eq!(*tax_rate, 0.08);
+                assert_eq!(*rounding, TaxRounding::Ceil);
+                assert!(!include_base);
+            }
+            _ => panic!("ConsumptionTaxのはず"),
         }
     }
 

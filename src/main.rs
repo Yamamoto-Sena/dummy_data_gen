@@ -44,6 +44,12 @@ struct Args {
     /// 出力であれば常に有効(他の形式と同時指定してもcsvの部分にだけ効く)
     #[arg(long)]
     quote_all: bool,
+
+    /// JSON出力を、ファイル全体で1つのJSON配列([{...},{...}])にする。
+    /// 指定しない場合(既定)は今まで通り、1行に1件ずつJSONオブジェクトを書くNDJSON形式になる。
+    /// csv/sql/xlsxには影響しない
+    #[arg(long)]
+    json_array: bool,
 }
 
 // mainの中では、この後何度も同じ形が出てくる:
@@ -153,7 +159,15 @@ fn main() {
         for format in formats {
             let path = output_base_path(args.output.as_deref(), format, multiple_formats);
             let result =
-                write_output(format, &columns, &rows, schema.table_name.as_deref(), &path, args.encoding);
+                write_output(
+                format,
+                &columns,
+                &rows,
+                schema.table_name.as_deref(),
+                &path,
+                args.encoding,
+                args.json_array,
+            );
 
             match result {
                 Ok(()) => println!(
@@ -219,7 +233,7 @@ fn main() {
 
     for format in formats {
         let base_path = output_base_path(args.output.as_deref(), format, multiple_formats);
-        match write_output_multi_table(format, &generated, &base_path, args.encoding, args.quote_all) {
+        match write_output_multi_table(format, &generated, &base_path, args.encoding, args.quote_all, args.json_array) {
             Ok(written) => {
                 for (path, row_count) in written {
                     println!("{}行のデータを {} ({}) に書き出しました", row_count, path, args.encoding);
