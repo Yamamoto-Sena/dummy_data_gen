@@ -123,6 +123,7 @@ fn main() {
                     DEFAULT_CHUNK_SIZE,
                     false,
                     args.quote_all,
+                    false,
                     on_progress,
                 ),
                 Format::Sql => match schema.table_name.as_deref() {
@@ -233,7 +234,7 @@ fn main() {
 
     for format in formats {
         let base_path = output_base_path(args.output.as_deref(), format, multiple_formats);
-        match write_output_multi_table(format, &generated, &base_path, args.encoding, args.quote_all, args.json_array) {
+        match write_output_multi_table(format, &generated, &base_path, args.encoding, args.quote_all, false, args.json_array) {
             Ok(written) => {
                 for (path, row_count) in written {
                     println!("{}行のデータを {} ({}) に書き出しました", row_count, path, args.encoding);

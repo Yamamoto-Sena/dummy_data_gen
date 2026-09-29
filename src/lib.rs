@@ -1364,13 +1364,22 @@ pub fn prepare_columns(schema: &Schema) -> Result<Vec<PreparedColumn>, Box<dyn s
         // inspectは「中身がOkのときだけ、値を変えずに追加の処理(ここでは警告メッセージの表示)を
         // 行い、そのまま同じ値を返す」メソッド。Errのときは何もせずそのまま素通りする
         .inspect(|columns| {
-            for warning in misplaced_city_ja_warnings(columns) {
-                eprintln!("{warning}");
-            }
-            for warning in misplaced_katakana_name_warnings(columns) {
+            for warning in prepare_warnings(columns) {
                 eprintln!("{warning}");
             }
         })
+}
+
+// prepare_columns成功後の列一覧から、気づいた方がよい問題点(エラーにはしないもの)を
+// まとめて集める。prepare_columns自身はCLIの出力(eprintln!で表示するだけ)を変えないよう
+// 戻り値には含めていないため、GUI(dummygen_jp_gui)やHTTPサーバー(src-server)のように
+// 画面に警告を表示したい呼び出し元は、prepare_columns/prepare_tablesの後にこの関数を
+// 別途呼んで結果を表示する
+pub fn prepare_warnings(columns: &[PreparedColumn]) -> Vec<String> {
+    let mut warnings = misplaced_city_ja_warnings(columns);
+    warnings.extend(misplaced_katakana_name_warnings(columns));
+    warnings.extend(incompatible_data_type_warnings(columns));
+    warnings
 }
 
 // city_ja列は「自分より前にあるprefecture_ja列」しか見ない設計になっている。
@@ -1439,6 +1448,68 @@ fn misplaced_katakana_name_warnings(columns: &[PreparedColumn]) -> Vec<String> {
                 "警告: 列 \"{}\"({label})より後ろに name_ja 列があります。{label}は自分より前のname_ja列しか参照しないため、氏名とフリガナ/ローマ字が対応しません。name_ja列を{label}列より前に移動してください。",
                 kana_col.name
             )
+        })
+        .collect()
+}
+
+// data_type(列ごとのデータ型上書き指定)がINTEGER/FLOAT/BOOLEANのとき、その列タイプが
+// 生成する値には数字・true/false以外の文字が必ず混ざることが型の定義から自明な列タイプ一覧。
+// この組み合わせだと出力時に確実に問題が起きる(JSONは値がnullになって消える、SQLは
+// クォートされない不正な構文になる、Excelだけは自動でテキストにフォールバックする。
+// 詳しくはresolve_value_category/cell_to_json/sql_literal/write_xlsx_cellのコメントを参照)。
+// postal_code/phone_ja/phone_ja_landline/credit_card_number/bank_account_number/my_number
+// のような「数字だけの文字列」を返す型は、書式(with_hyphenなど)次第では実際に数値として
+// 解釈できてしまう場合があり「明らかに数値化できない」とは言い切れないため、ここには含めない
+// (数値化できても桁落ち等が起きうる点は別問題として扱う)
+fn is_obviously_non_numeric_type(kind: &PreparedColumnType) -> bool {
+    matches!(
+        kind,
+        PreparedColumnType::NameJa { .. }
+            | PreparedColumnType::LastNameJa
+            | PreparedColumnType::FirstNameJa
+            | PreparedColumnType::RomajiName
+            | PreparedColumnType::KatakanaLastName
+            | PreparedColumnType::KatakanaFirstName
+            | PreparedColumnType::KatakanaName { .. }
+            | PreparedColumnType::KatakanaNameHankaku { .. }
+            | PreparedColumnType::Email { .. }
+            | PreparedColumnType::Gender
+            | PreparedColumnType::BloodType { .. }
+            | PreparedColumnType::AddressJa { .. }
+            | PreparedColumnType::CompanyNameJa
+            | PreparedColumnType::Uuid
+            | PreparedColumnType::PrefectureJa { .. }
+            | PreparedColumnType::CityJa
+            | PreparedColumnType::DepartmentJa
+            | PreparedColumnType::JobTitleJa
+            | PreparedColumnType::IpAddress
+            | PreparedColumnType::Jwt
+            | PreparedColumnType::ApiKey
+            | PreparedColumnType::Username
+            | PreparedColumnType::Password
+            | PreparedColumnType::ProfileImageUrl
+            | PreparedColumnType::ProductSku
+    )
+}
+
+// 列タイプから見て明らかに数値・真偽値になり得ないのに、data_typeでINTEGER/FLOAT/BOOLEANを
+// 指定してしまっている列を検知する。エラーにはしない(prepare_columnsの他のチェックと違い、
+// 「値は生成できるが出力時に壊れる」という性質の問題で、CSV出力だけを使うなら実害が無いため)。
+// misplaced_city_ja_warnings/misplaced_katakana_name_warningsと同じ「気づけるように警告するだけ」の設計
+fn incompatible_data_type_warnings(columns: &[PreparedColumn]) -> Vec<String> {
+    columns
+        .iter()
+        .filter(|c| is_obviously_non_numeric_type(&c.kind))
+        .filter_map(|c| {
+            let data_type = c.data_type.as_deref()?;
+            let category = classify_data_type_name(data_type);
+            if category == ValueCategory::Text {
+                return None;
+            }
+            Some(format!(
+                "警告: 列 \"{}\"はテキストの値しか生成しない列タイプですが、データの型に\"{data_type}\"が指定されています。SQLでは不正な構文に、JSONでは値がnullになる可能性があります(Excelは自動的にテキストとして書き込まれます)。",
+                c.name
+            ))
         })
         .collect()
 }
@@ -3397,14 +3468,51 @@ pub fn write_sql_streaming(
     Ok(())
 }
 
+// date/birth_date列かどうか(escape_dates_for_excelがどの列に効くかの判定に使う)
+fn is_date_like_type(kind: &PreparedColumnType) -> bool {
+    matches!(kind, PreparedColumnType::Date { .. } | PreparedColumnType::BirthDate { .. })
+}
+
+// CSVの1行分のセルを組み立てる(build_csv_from_rows/write_csv_streaming共通)。
+// escape_dates_for_excelがtrueのとき、date_like[列の添字]がtrueの列だけ値の先頭に
+// 半角の'を付ける(詳しい理由はbuild_csv_from_rowsのコメント参照)。
+// Cow<str>(「借用のままか、必要になったときだけ新しい文字列を作るか」を切り替えられる型)に
+// しているのは、'を付ける必要が無い大多数のセルでは今まで通り文字列をコピーせずに済ませるため
+fn build_csv_record<'a>(
+    row: &'a [Option<String>],
+    date_like: &[bool],
+    escape_dates_for_excel: bool,
+) -> Vec<std::borrow::Cow<'a, str>> {
+    row.iter()
+        .enumerate()
+        .map(|(i, cell)| {
+            let value = cell.as_deref().unwrap_or("");
+            if escape_dates_for_excel && date_like[i] && !value.is_empty() {
+                std::borrow::Cow::Owned(format!("'{}", value))
+            } else {
+                std::borrow::Cow::Borrowed(value)
+            }
+        })
+        .collect()
+}
+
 // CSVの中身(行データは生成済みのものを受け取る)をUTF-8の文字列として組み立てる。
 // NULL(None)はCSVでは空文字として書き出す。
 // quote_all: trueのとき全ての値をダブルクォートで囲む(write_csv_streamingのquote_allと同じ挙動)。
 // falseのとき(既定)はカンマ・改行・"を含む値だけを囲む
+// escape_dates_for_excel: trueのとき、date/birth_date列の値の先頭に半角の'を付けて書き出す。
+// CSVには本来「型」の概念が無いが、Excelでダブルクリックして開くと"2024-01-05"のような
+// 文字列を日付として自動認識し、数値の日付シリアル値に変換したうえで列幅に収まらない
+// 行だけ"####"と表示してしまうことがある(月・日の桁数によって表示に必要な幅が変わるため、
+// 同じ列でも行によって表示できたりできなかったりする)。先頭に'を付けると、Excelはその値を
+// 「数値変換しない文字列」として扱うため、この誤変換自体が起きなくなる(Excel上は'は
+// 表示されず、日付の文字列がそのまま見える)。ただしExcel以外のツール(DB取り込み等)で
+// このCSVを読む場合は'が値の一部として残ってしまうため、既定はfalseにしてある
 pub fn build_csv_from_rows(
     columns: &[PreparedColumn],
     rows: &[Vec<Option<String>>],
     quote_all: bool,
+    escape_dates_for_excel: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // csvクレート(CSVの読み書きをしてくれる外部ライブラリ)のQuoteStyleは「値をいつ""で
     // 囲むか」の設定。Alwaysは常に囲む、Necessaryは「カンマ・改行・"を含む値のときだけ」
@@ -3418,13 +3526,19 @@ pub fn build_csv_from_rows(
     let headers: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     writer.write_record(&headers)?; // ヘッダー行を書き込む(?は「エラーなら即座に呼び出し元へ返す」構文)
 
+    // どの列がdate/birth_date列かを列ごとに1回だけ調べておく(行数分繰り返さないため)
+    let date_like: Vec<bool> = columns.iter().map(|c| is_date_like_type(&c.kind)).collect();
+
     // rowsに入っている行を1行ずつ順番に処理する
     for row in rows {
         // 1行分のセルを見て、値があればその文字列、無ければ(None=NULL)空文字にする。
         // as_deref()は「Option<String>からOption<&str>を取り出す」変換、
-        // unwrap_or("")は「値が無ければ代わりに空文字を使う」という意味
-        let record: Vec<&str> = row.iter().map(|cell| cell.as_deref().unwrap_or("")).collect();
-        writer.write_record(&record)?;
+        // unwrap_or("")は「値が無ければ代わりに空文字を使う」という意味。
+        // Cow<str>(「借用のままか、必要になったときだけ新しい文字列を作るか」を切り替えられる型)
+        // にしているのは、escape_dates_for_excelがfalseまたは対象外の列では今まで通り
+        // 文字列をコピーせずに済ませ、date列に'を付ける必要があるときだけ新しい文字列を作るため
+        let record = build_csv_record(row, &date_like, escape_dates_for_excel);
+        writer.write_record(record.iter().map(|c| c.as_ref()))?;
     }
 
     let bytes = writer.into_inner()?; // 内部バッファ(UTF-8のバイト列)を取り出す
@@ -3438,7 +3552,7 @@ fn build_csv(
     columns: &[PreparedColumn],
     base_seed: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    build_csv_from_rows(columns, &generate_all_rows(row_count, columns, base_seed), false)
+    build_csv_from_rows(columns, &generate_all_rows(row_count, columns, base_seed), false, false)
 }
 
 // build_csv_from_rowsとの違いは、全行をメモリに載せてから一括で書き出すのではなく、
@@ -3473,6 +3587,9 @@ pub fn write_csv_streaming(
     // falseのとき(既定)は今まで通り、カンマ・改行・"を含む値だけを囲む
     // (csvクレートのQuoteStyle::Necessaryのデフォルト挙動)。
     quote_all: bool,
+    // trueのとき、date/birth_date列の値の先頭に半角の'を付けて書き出す
+    // (build_csv_from_rowsのescape_dates_for_excelと同じ意味。詳しくはそちらのコメント参照)
+    escape_dates_for_excel: bool,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), Box<dyn std::error::Error>> {
     // File::create(path)は指定したパスに新しいファイルを作る(既にあれば中身を空にする)。
@@ -3489,6 +3606,8 @@ pub fn write_csv_streaming(
     let total = row_count as u64;
     let mut done: u64 = 0;
     let quote_style = if quote_all { csv::QuoteStyle::Always } else { csv::QuoteStyle::Necessary };
+    // どの列がdate/birth_date列かを列ごとに1回だけ調べておく(チャンクごとに繰り返さないため)
+    let date_like: Vec<bool> = columns.iter().map(|c| is_date_like_type(&c.kind)).collect();
 
     if row_count == 0 {
         // row_countが0でも、build_csv_from_rowsと同様にヘッダー行だけは書き出す
@@ -3518,8 +3637,8 @@ pub fn write_csv_streaming(
             writer.write_record(&headers)?;
         }
         for row in &rows {
-            let record: Vec<&str> = row.iter().map(|cell| cell.as_deref().unwrap_or("")).collect();
-            writer.write_record(&record)?;
+            let record = build_csv_record(row, &date_like, escape_dates_for_excel);
+            writer.write_record(record.iter().map(|c| c.as_ref()))?;
         }
         let text = String::from_utf8(writer.into_inner()?)?;
         // 組み立てたテキストを、指定の文字コードに変換してファイルに書き足す
@@ -3790,7 +3909,7 @@ pub fn write_output(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match format {
         // 複数形式同時出力の経路であり、CLIの--quote-allは(ドキュメント通り)ここには適用しない
-        Format::Csv => write_text(&build_csv_from_rows(columns, rows, false)?, path, encoding),
+        Format::Csv => write_text(&build_csv_from_rows(columns, rows, false, false)?, path, encoding),
         Format::Sql => {
             let table_name = match table_name {
                 Some(t) => t,
@@ -3914,6 +4033,7 @@ fn write_xlsx_tables(
 // 戻り値は書き込んだ(パス, 行数)の一覧(mainが成功メッセージを1行ずつ表示するために使う)。
 // quote_all: Csv形式のときだけ使う(単一テーブルのwrite_csv_streamingと同じ意味。
 // sql/json/xlsxには影響しない)
+// escape_dates_for_excel: Csv形式のときだけ使う(単一テーブルのwrite_csv_streamingと同じ意味)
 // json_array: Json形式のときだけ使う(trueなら配列形式、falseならNDJSON。write_outputと同じ意味)
 pub fn write_output_multi_table(
     format: Format,
@@ -3921,6 +4041,7 @@ pub fn write_output_multi_table(
     base_path: &str,
     encoding: Encoding,
     quote_all: bool,
+    escape_dates_for_excel: bool,
     json_array: bool,
 ) -> Result<Vec<(String, u32)>, Box<dyn std::error::Error>> {
     match format {
@@ -3948,7 +4069,7 @@ pub fn write_output_multi_table(
             // ここではtables(テーブルの中身)とpaths(保存先パス)を組にして、1テーブルずつ処理する
             for (table, path) in tables.iter().zip(paths) {
                 let text = match format {
-                    Format::Csv => build_csv_from_rows(table.columns, table.rows, quote_all)?,
+                    Format::Csv => build_csv_from_rows(table.columns, table.rows, quote_all, escape_dates_for_excel)?,
                     Format::Json => build_json_text(table.columns, table.rows, json_array)?,
                     _ => unreachable!("csv/json以外はこの分岐に来ない"),
                 };
@@ -4101,7 +4222,7 @@ mod tests {
         let base_path = dir.join("dummy_data_gen_test_multi_quote_all.csv");
         let base_path_str = base_path.to_str().unwrap();
 
-        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, true, false).unwrap();
+        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, true, false, false).unwrap();
 
         let written_path = table_file_path(base_path_str, "users");
         let actual = std::fs::read_to_string(&written_path).unwrap();
@@ -4125,7 +4246,7 @@ mod tests {
         let base_path = dir.join("dummy_data_gen_test_multi_quote_none.csv");
         let base_path_str = base_path.to_str().unwrap();
 
-        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, false, false).unwrap();
+        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, false, false, false).unwrap();
 
         let written_path = table_file_path(base_path_str, "users");
         let actual = std::fs::read_to_string(&written_path).unwrap();
@@ -5414,6 +5535,65 @@ mod tests {
         }
     }
 
+    // --- ここからdata_type上書き指定の互換性チェック(incompatible_data_type_warnings)のテスト ---
+
+    #[test]
+    fn warns_when_department_ja_data_type_is_forced_to_integer() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: dept\n    type: department_ja\n    data_type: INTEGER\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert_eq!(incompatible_data_type_warnings(&columns).len(), 1);
+    }
+
+    #[test]
+    fn warns_when_name_ja_data_type_is_forced_to_boolean() {
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: name\n    type: name_ja\n    data_type: BOOLEAN\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert_eq!(incompatible_data_type_warnings(&columns).len(), 1);
+    }
+
+    #[test]
+    fn no_warning_when_data_type_is_not_specified() {
+        let schema = schema_from_yaml("row_count: 5\ncolumns:\n  - name: dept\n    type: department_ja\n");
+        let columns = prepare_columns(&schema).unwrap();
+        assert!(incompatible_data_type_warnings(&columns).is_empty());
+    }
+
+    #[test]
+    fn no_warning_when_data_type_resolves_to_text() {
+        // VARCHARのような未知の型名はclassify_data_type_nameがTextに倒すため、
+        // 「明らかに数値化できない」型との組み合わせでも警告の対象外になる
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: dept\n    type: department_ja\n    data_type: VARCHAR(50)\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert!(incompatible_data_type_warnings(&columns).is_empty());
+    }
+
+    #[test]
+    fn no_warning_when_numeric_type_data_type_is_forced_to_integer() {
+        // integer列自体をINTEGERにするのは自然な組み合わせなので警告しない
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: n\n    type: integer\n    min: 0\n    max: 10\n    data_type: INTEGER\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert!(incompatible_data_type_warnings(&columns).is_empty());
+    }
+
+    #[test]
+    fn no_warning_when_digit_like_type_data_type_is_forced_to_integer() {
+        // postal_code等の「数字だけの文字列」を返す型は、書式次第で実際に数値として
+        // 解釈できてしまう場合があるため、明らかに数値化できないとは言い切れず対象外にしている
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: zip\n    type: postal_code\n    with_hyphen: false\n    data_type: INTEGER\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert!(incompatible_data_type_warnings(&columns).is_empty());
+    }
+
     // --- ここから F3-3(複数形式同時出力) のテスト ---
 
     #[test]
@@ -5439,7 +5619,7 @@ mod tests {
         let columns = prepare_columns(&schema).unwrap();
         let rows = generate_all_rows(schema.row_count, &columns, 42);
         assert_eq!(
-            build_csv_from_rows(&columns, &rows, false).unwrap(),
+            build_csv_from_rows(&columns, &rows, false, false).unwrap(),
             build_csv(schema.row_count, &columns, 42).unwrap()
         );
     }
@@ -5463,7 +5643,7 @@ mod tests {
         );
         let columns = prepare_columns(&schema).unwrap();
         let rows = generate_all_rows(schema.row_count, &columns, 99);
-        let csv_text = build_csv_from_rows(&columns, &rows, false).unwrap();
+        let csv_text = build_csv_from_rows(&columns, &rows, false, false).unwrap();
         let json_text = build_json_from_rows(&columns, &rows).unwrap();
 
         let csv_names: Vec<&str> = csv_text.lines().skip(1).map(|l| l.split(',').nth(1).unwrap()).collect();
@@ -5517,7 +5697,7 @@ mod tests {
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming.csv");
         let path_str = path.to_str().unwrap();
         let mut progress_calls = Vec::new();
-        write_csv_streaming(schema.row_count, &columns, 42, path_str, Encoding::Utf8, 7, false, false, |done, total| {
+        write_csv_streaming(schema.row_count, &columns, 42, path_str, Encoding::Utf8, 7, false, false, false, |done, total| {
             progress_calls.push((done, total));
         })
         .unwrap();
@@ -5542,7 +5722,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_zero.csv");
         let path_str = path.to_str().unwrap();
-        write_csv_streaming(0, &columns, 42, path_str, Encoding::Utf8, 10, false, false, |_, _| {}).unwrap();
+        write_csv_streaming(0, &columns, 42, path_str, Encoding::Utf8, 10, false, false, false, |_, _| {}).unwrap();
 
         let actual = std::fs::read_to_string(&path).unwrap();
         assert_eq!(actual.lines().count(), 1); // ヘッダー行のみ
@@ -5560,7 +5740,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_bom.csv");
         let path_str = path.to_str().unwrap();
-        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, true, false, |_, _| {}).unwrap();
+        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, true, false, false, |_, _| {}).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
@@ -5577,7 +5757,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_no_bom.csv");
         let path_str = path.to_str().unwrap();
-        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, false, |_, _| {}).unwrap();
+        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, false, false, |_, _| {}).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         assert_ne!(&bytes[..3.min(bytes.len())], &[0xEF, 0xBB, 0xBF][..3.min(bytes.len())]);
@@ -5596,7 +5776,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_quote_all.csv");
         let path_str = path.to_str().unwrap();
-        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, true, |_, _| {}).unwrap();
+        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, true, false, |_, _| {}).unwrap();
 
         let actual = std::fs::read_to_string(&path).unwrap();
         assert_eq!(actual, "\"id\",\"name\",\"note\"\n\"1\",\"山田 太郎\",\"he said \"\"hi\"\", ok\"\n");
@@ -5615,10 +5795,48 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_quote_none.csv");
         let path_str = path.to_str().unwrap();
-        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, false, |_, _| {}).unwrap();
+        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, false, false, |_, _| {}).unwrap();
 
         let actual = std::fs::read_to_string(&path).unwrap();
         assert_eq!(actual, "id,name\n1,山田 太郎\n");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // escape_dates_for_excel: trueのとき、date/birth_date列だけ値の先頭に半角の'が付くことを確認する
+    // (id列のような他の列タイプは対象外のまま。'はExcelが文字列をExcel自身の日付シリアル値に
+    // 誤変換するのを防ぐためのもので、Excel上には表示されない)
+    #[test]
+    fn write_csv_streaming_with_escape_dates_for_excel_true_prefixes_date_columns_only() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: id\n    type: sequence\n  - name: paid_at\n    type: date\n    start: \"2024-01-05\"\n    end: \"2024-01-05\"\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+
+        let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_escape_dates.csv");
+        let path_str = path.to_str().unwrap();
+        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, false, true, |_, _| {}).unwrap();
+
+        let actual = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(actual, "id,paid_at\n1,'2024-01-05\n");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // escape_dates_for_excel: false(既定)のときは、これまで通り'が付かないことを確認する
+    #[test]
+    fn write_csv_streaming_with_escape_dates_for_excel_false_has_no_prefix() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ncolumns:\n  - name: id\n    type: sequence\n  - name: paid_at\n    type: date\n    start: \"2024-01-05\"\n    end: \"2024-01-05\"\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+
+        let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_no_escape_dates.csv");
+        let path_str = path.to_str().unwrap();
+        write_csv_streaming(schema.row_count, &columns, 1, path_str, Encoding::Utf8, 10, false, false, false, |_, _| {}).unwrap();
+
+        let actual = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(actual, "id,paid_at\n1,2024-01-05\n");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -5635,7 +5853,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_unique.csv");
         let path_str = path.to_str().unwrap();
-        write_csv_streaming(schema.row_count, &columns, 99, path_str, Encoding::Utf8, 5, false, false, |_, _| {}).unwrap();
+        write_csv_streaming(schema.row_count, &columns, 99, path_str, Encoding::Utf8, 5, false, false, false, |_, _| {}).unwrap();
         let actual = std::fs::read_to_string(&path).unwrap();
 
         let mut values: Vec<i64> = Vec::new();
