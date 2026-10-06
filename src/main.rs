@@ -50,6 +50,13 @@ struct Args {
     /// csv/sql/xlsxには影響しない
     #[arg(long)]
     json_array: bool,
+
+    /// SQL出力(--format sql)で、テーブル名・カラム名を囲む識別子クォートの方式。
+    /// standard(既定、ダブルクォート。PostgreSQL/SQLiteもこれと同じ) / mysql(バッククォート) /
+    /// postgresql(ダブルクォート) / sqlserver(角カッコ) / sqlite(ダブルクォート)。
+    /// csv/json/xlsxには影響しない
+    #[arg(long, value_enum, default_value_t = SqlDialect::Standard)]
+    sql_dialect: SqlDialect,
 }
 
 // mainの中では、この後何度も同じ形が出てくる:
@@ -132,6 +139,7 @@ fn main() {
                         &columns,
                         base_seed,
                         table_name,
+                        args.sql_dialect,
                         &path,
                         args.encoding,
                         DEFAULT_CHUNK_SIZE,
@@ -165,6 +173,7 @@ fn main() {
                 &columns,
                 &rows,
                 schema.table_name.as_deref(),
+                args.sql_dialect,
                 &path,
                 args.encoding,
                 args.json_array,
@@ -234,7 +243,16 @@ fn main() {
 
     for format in formats {
         let base_path = output_base_path(args.output.as_deref(), format, multiple_formats);
-        match write_output_multi_table(format, &generated, &base_path, args.encoding, args.quote_all, false, args.json_array) {
+        match write_output_multi_table(
+            format,
+            &generated,
+            &base_path,
+            args.sql_dialect,
+            args.encoding,
+            args.quote_all,
+            false,
+            args.json_array,
+        ) {
             Ok(written) => {
                 for (path, row_count) in written {
                     println!("{}行のデータを {} ({}) に書き出しました", row_count, path, args.encoding);

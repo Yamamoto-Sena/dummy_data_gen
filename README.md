@@ -72,6 +72,7 @@ cargo run -- --config schema.yaml --format csv --encoding utf8
 | `--output <path>` | 出力先ファイルパス | 形式に応じた既定値 |
 | `--quote-all` | CSV出力で全ての値をダブルクォートで囲む(名称にスペースを含む値の区切りを明確にしたい場合向け)。sql/json/xlsxには影響しない。単一テーブル(`tables:`を使わない形式)では`--format csv`単体のときのみ有効。複数テーブル(`tables:`形式)ではcsvを含む出力であれば常に有効(他の形式と同時指定してもcsvの部分にだけ効く) | 指定なし(必要な値だけクォート) |
 | `--json-array` | JSON出力を、ファイル全体で1つのJSON配列(`[{...},{...}]`)にする。csv/sql/xlsxには影響しない。複数テーブルではテーブルごとのファイルがそれぞれ1つの配列になる | 指定なし(NDJSON、1行1件) |
+| `--sql-dialect <standard\|mysql\|postgresql\|sqlserver\|sqlite>` | SQL出力(`--format sql`)でテーブル名・カラム名を囲むクォート方式。`standard`/`postgresql`/`sqlite`はダブルクォート(`"name"`)、`mysql`はバッククォート(`` `name` ``)、`sqlserver`は角カッコ(`[name]`)。MySQLはデフォルト設定(`ANSI_QUOTES`無効)だとダブルクォートを識別子として受け付けないため、MySQLに流し込む場合は`mysql`を指定する。csv/json/xlsxには影響しない | `standard` |
 
 ### 対応する列タイプ
 

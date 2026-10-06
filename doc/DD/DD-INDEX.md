@@ -16,6 +16,8 @@
 
 | DD | 件名 | 主な成果 |
 |----|------|---------|
+| DD-033 | SQL識別子のクォート方式をDB方言ごとに切替可能にする | SqlDialect(standard/mysql/postgresql/sqlserver/sqlite)をエンジン・CLI・GUI全面対応 |
+| DD-032 | 日付列(date・birth_date)のデータ型上書き非互換チェックの漏れを修正 | 不具合修正 |
 | DD-031 | DD-Know-How(設計書駆動開発キット)をLevel 2で導入 | 導入完了 |
 | DD-030 | CSV出力にExcel向け日付エスケープオプション(escape_dates_for_excel)を追加 | 不具合修正 |
 | DD-029 | 日付のYYYYMMDD形式と消費税額・税込金額列を追加、JSON配列出力に対応 | 機能追加 |

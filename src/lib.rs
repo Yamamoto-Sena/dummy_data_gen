@@ -76,6 +76,38 @@ impl std::fmt::Display for Format {
     }
 }
 
+// SQL出力(--format sql)の識別子(テーブル名・カラム名)をどの記号で囲むか。
+// DBによって識別子クォートの構文が違う(MySQLはダブルクォートがデフォルトでは
+// 文字列リテラルと解釈されてしまい、そのままでは使えない等)ため、出力先のDBに
+// 合わせて選べるようにしている。PostgreSql/Sqliteは標準SQLと同じダブルクォートだが、
+// GUIの選択肢ラベルと1:1対応させ、将来方言ごとに別の挙動が必要になったときの
+// 拡張を楽にするため、クォート文字が同じでもバリアントは分けてある
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
+pub enum SqlDialect {
+    #[value(name = "standard")]
+    Standard,
+    #[value(name = "mysql")]
+    Mysql,
+    #[value(name = "postgresql")]
+    PostgreSql,
+    #[value(name = "sqlserver")]
+    SqlServer,
+    #[value(name = "sqlite")]
+    Sqlite,
+}
+
+impl std::fmt::Display for SqlDialect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SqlDialect::Standard => write!(f, "standard"),
+            SqlDialect::Mysql => write!(f, "mysql"),
+            SqlDialect::PostgreSql => write!(f, "postgresql"),
+            SqlDialect::SqlServer => write!(f, "sqlserver"),
+            SqlDialect::Sqlite => write!(f, "sqlite"),
+        }
+    }
+}
+
 // schema.yaml の中身をそのまま受け止める箱(struct)。serdeというライブラリが自動で
 // YAML→struct(この形)に変換してくれる。「1テーブル分の定義」を表す型で、単一テーブル
 // 形式(schema.yamlのトップレベルにrow_count/columnsを直接書く形式)でも、複数テーブル
@@ -1452,6 +1484,15 @@ fn misplaced_katakana_name_warnings(columns: &[PreparedColumn]) -> Vec<String> {
         .collect()
 }
 
+// date/birth_date列がINTEGER/FLOATへのdata_type上書きと「明らかに」非互換かどうかを判定する。
+// date/birth_dateはpostal_code等と違い、書式(format)によって話が変わる: compact(YYYYMMDD、
+// 例"20240315")は区切り文字の無い数字だけの文字列なので数値として解釈できてしまい「明らか」とは
+// 言い切れないが、それ以外(ymd/iso8601/slash/wareki)は必ず「-」「/」「年」等の数字以外の文字を
+// 含むため、INTEGER/FLOATを指定すると確実に壊れる
+fn date_format_incompatible_with_numeric(format: DateFormat) -> bool {
+    !matches!(format, DateFormat::Compact)
+}
+
 // data_type(列ごとのデータ型上書き指定)がINTEGER/FLOAT/BOOLEANのとき、その列タイプが
 // 生成する値には数字・true/false以外の文字が必ず混ざることが型の定義から自明な列タイプ一覧。
 // この組み合わせだと出力時に確実に問題が起きる(JSONは値がnullになって消える、SQLは
@@ -1460,7 +1501,9 @@ fn misplaced_katakana_name_warnings(columns: &[PreparedColumn]) -> Vec<String> {
 // postal_code/phone_ja/phone_ja_landline/credit_card_number/bank_account_number/my_number
 // のような「数字だけの文字列」を返す型は、書式(with_hyphenなど)次第では実際に数値として
 // 解釈できてしまう場合があり「明らかに数値化できない」とは言い切れないため、ここには含めない
-// (数値化できても桁落ち等が起きうる点は別問題として扱う)
+// (数値化できても桁落ち等が起きうる点は別問題として扱う)。
+// date/birth_dateは書式次第で結論が変わるためこの一覧には含めず、
+// incompatible_data_type_warnings側でdate_format_incompatible_with_numericを使って別途判定する
 fn is_obviously_non_numeric_type(kind: &PreparedColumnType) -> bool {
     matches!(
         kind,
@@ -1499,15 +1542,34 @@ fn is_obviously_non_numeric_type(kind: &PreparedColumnType) -> bool {
 fn incompatible_data_type_warnings(columns: &[PreparedColumn]) -> Vec<String> {
     columns
         .iter()
-        .filter(|c| is_obviously_non_numeric_type(&c.kind))
         .filter_map(|c| {
             let data_type = c.data_type.as_deref()?;
             let category = classify_data_type_name(data_type);
             if category == ValueCategory::Text {
                 return None;
             }
+            // 警告理由の説明文言。列タイプによって「なぜ壊れるか」が違うため出し分ける。
+            // is_obviously_non_numeric_type一覧の型はどのdata_type上書き(INTEGER/FLOAT/BOOLEANの
+            // いずれ)でも壊れるが、date/birth_dateは書式(format)と指定先の型の組み合わせ次第
+            // (date_format_incompatible_with_numericのコメント参照)
+            let reason = if is_obviously_non_numeric_type(&c.kind) {
+                Some("テキストの値しか生成しない列タイプ")
+            } else {
+                match &c.kind {
+                    PreparedColumnType::Date { format, .. } | PreparedColumnType::BirthDate { format, .. } => {
+                        if category == ValueCategory::Boolean {
+                            Some("true/falseにはならない日付の値を生成する列タイプ")
+                        } else if date_format_incompatible_with_numeric(*format) {
+                            Some("「-」や「/」等の区切り文字を含む日付の値を生成する列タイプ")
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }?;
             Some(format!(
-                "警告: 列 \"{}\"はテキストの値しか生成しない列タイプですが、データの型に\"{data_type}\"が指定されています。SQLでは不正な構文に、JSONでは値がnullになる可能性があります(Excelは自動的にテキストとして書き込まれます)。",
+                "警告: 列 \"{}\"は{reason}ですが、データの型に\"{data_type}\"が指定されています。SQLでは不正な構文に、JSONでは値がnullになる可能性があります(Excelは自動的にテキストとして書き込まれます)。",
                 c.name
             ))
         })
@@ -3320,11 +3382,19 @@ fn sql_literal(kind: &PreparedColumnType, data_type: Option<&str>, value: &str) 
     }
 }
 
-// テーブル名・列名(識別子)を "..." で囲む。囲まないと、名前に , や " などSQLとして
-// 意味を持つ文字が含まれていた場合に文の構造そのものが壊れてしまう
-// (例: 列名 "id, name" をそのまま埋め込むと、列の数とVALUESの値の数が食い違ってしまう)
-fn sql_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+// テーブル名・列名(識別子)を、dialectに応じた記号で囲む。囲まないと、名前に , や "
+// などSQLとして意味を持つ文字が含まれていた場合に文の構造そのものが壊れてしまう
+// (例: 列名 "id, name" をそのまま埋め込むと、列の数とVALUESの値の数が食い違ってしまう)。
+// 識別子自身がその方言のクォート文字を含む場合は、文字を二重化してエスケープする
+// (SQL Serverの角カッコは開き[と閉じ]が別の文字のため、閉じ側だけを二重化する)
+fn sql_ident(name: &str, dialect: SqlDialect) -> String {
+    match dialect {
+        SqlDialect::Mysql => format!("`{}`", name.replace('`', "``")),
+        SqlDialect::SqlServer => format!("[{}]", name.replace(']', "]]")),
+        SqlDialect::Standard | SqlDialect::PostgreSql | SqlDialect::Sqlite => {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        }
+    }
 }
 
 // 一度に書き出す行数(あまり大きいINSERT文1本にまとめると読みにくく、SQLエンジン側の
@@ -3365,6 +3435,7 @@ pub fn build_sql_from_rows(
     columns: &[PreparedColumn],
     rows: &[Vec<Option<String>>],
     table_name: &str,
+    dialect: SqlDialect,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // table_nameが空文字・空白だけ(例: "   ")だと、そのままではINSERT INTO "   "のような
     // 実用上意味のない(データベースによっては構文エラーになる)SQLになってしまうため、
@@ -3378,10 +3449,10 @@ pub fn build_sql_from_rows(
     // (例: ["id", "name"] → "`id`, `name`"のような形)
     let column_names = columns
         .iter()
-        .map(|c| sql_ident(&c.name))
+        .map(|c| sql_ident(&c.name, dialect))
         .collect::<Vec<_>>()
         .join(", ");
-    let table_ident = sql_ident(table_name);
+    let table_ident = sql_ident(table_name, dialect);
 
     // 1行ずつ、VALUES句の"(値1, 値2, ...)"の形に組み立てる
     let value_rows: Vec<String> = rows
@@ -3424,8 +3495,9 @@ fn build_sql(
     columns: &[PreparedColumn],
     table_name: &str,
     base_seed: u64,
+    dialect: SqlDialect,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    build_sql_from_rows(columns, &generate_all_rows(row_count, columns, base_seed), table_name)
+    build_sql_from_rows(columns, &generate_all_rows(row_count, columns, base_seed), table_name, dialect)
 }
 
 // write_csv_streamingのSQL版。chunk_sizeがSQL_BATCH_SIZE(1000)の倍数である限り、
@@ -3436,6 +3508,7 @@ pub fn write_sql_streaming(
     columns: &[PreparedColumn],
     base_seed: u64,
     table_name: &str,
+    dialect: SqlDialect,
     path: &str,
     encoding: Encoding,
     chunk_size: u32,
@@ -3454,7 +3527,7 @@ pub fn write_sql_streaming(
     for chunk_start in (1..=row_count).step_by(chunk_size as usize) {
         let chunk_end = (chunk_start + chunk_size - 1).min(row_count);
         let rows = generate_rows_range(columns, base_seed, chunk_start, chunk_end);
-        let sql_text = build_sql_from_rows(columns, &rows, table_name)?;
+        let sql_text = build_sql_from_rows(columns, &rows, table_name, dialect)?;
         write_chunk_text(&mut out, &sql_text, encoding, &mut had_sjis_errors)?;
 
         done += (chunk_end - chunk_start + 1) as u64;
@@ -3903,6 +3976,7 @@ pub fn write_output(
     columns: &[PreparedColumn],
     rows: &[Vec<Option<String>>],
     table_name: Option<&str>,
+    sql_dialect: SqlDialect,
     path: &str,
     encoding: Encoding,
     json_array: bool,
@@ -3919,7 +3993,7 @@ pub fn write_output(
                     );
                 }
             };
-            write_text(&build_sql_from_rows(columns, rows, table_name)?, path, encoding)
+            write_text(&build_sql_from_rows(columns, rows, table_name, sql_dialect)?, path, encoding)
         }
         Format::Json => write_text(&build_json_text(columns, rows, json_array)?, path, encoding),
         Format::Xlsx => write_xlsx_from_rows(columns, rows, path),
@@ -3977,12 +4051,12 @@ fn sanitize_sheet_name(name: &str, used: &mut std::collections::HashSet<String>)
 
 // 複数テーブルを依存順(親が先)に受け取り、1本のSQLにまとめる。
 // 外部キー制約のあるDBにそのまま流し込めるよう、親のテーブルのINSERT文を先に出力する
-fn build_sql_multi(tables: &[GeneratedTable]) -> Result<String, Box<dyn std::error::Error>> {
+fn build_sql_multi(tables: &[GeneratedTable], dialect: SqlDialect) -> Result<String, Box<dyn std::error::Error>> {
     let mut sql = String::new();
     for table in tables {
         let table_name = table.name.expect("複数テーブル形式ではtable_nameが必須(normalize_schema_fileで保証済み)");
         sql.push_str(&format!("-- テーブル: {}\n", table_name));
-        sql.push_str(&build_sql_from_rows(table.columns, table.rows, table_name)?);
+        sql.push_str(&build_sql_from_rows(table.columns, table.rows, table_name, dialect)?);
         sql.push('\n');
     }
     Ok(sql)
@@ -4039,6 +4113,7 @@ pub fn write_output_multi_table(
     format: Format,
     tables: &[GeneratedTable],
     base_path: &str,
+    sql_dialect: SqlDialect,
     encoding: Encoding,
     quote_all: bool,
     escape_dates_for_excel: bool,
@@ -4079,7 +4154,7 @@ pub fn write_output_multi_table(
             Ok(written)
         }
         Format::Sql => {
-            write_text(&build_sql_multi(tables)?, base_path, encoding)?;
+            write_text(&build_sql_multi(tables, sql_dialect)?, base_path, encoding)?;
             let total_rows: u32 = tables.iter().map(|t| t.rows.len() as u32).sum();
             Ok(vec![(base_path.to_string(), total_rows)])
         }
@@ -4222,7 +4297,10 @@ mod tests {
         let base_path = dir.join("dummy_data_gen_test_multi_quote_all.csv");
         let base_path_str = base_path.to_str().unwrap();
 
-        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, true, false, false).unwrap();
+        write_output_multi_table(
+            Format::Csv, &[users_table], base_path_str, SqlDialect::Standard, Encoding::Utf8, true, false, false,
+        )
+        .unwrap();
 
         let written_path = table_file_path(base_path_str, "users");
         let actual = std::fs::read_to_string(&written_path).unwrap();
@@ -4246,13 +4324,39 @@ mod tests {
         let base_path = dir.join("dummy_data_gen_test_multi_quote_none.csv");
         let base_path_str = base_path.to_str().unwrap();
 
-        write_output_multi_table(Format::Csv, &[users_table], base_path_str, Encoding::Utf8, false, false, false).unwrap();
+        write_output_multi_table(
+            Format::Csv, &[users_table], base_path_str, SqlDialect::Standard, Encoding::Utf8, false, false, false,
+        )
+        .unwrap();
 
         let written_path = table_file_path(base_path_str, "users");
         let actual = std::fs::read_to_string(&written_path).unwrap();
         assert_eq!(actual, "id,name\n1,山田 太郎\n");
 
         let _ = std::fs::remove_file(&written_path);
+    }
+
+    // 複数テーブルのSQL一括出力(build_sql_multi)でも、dialectで指定した記号が
+    // 全テーブルのテーブル名・列名に一貫して使われることを確認する
+    #[test]
+    fn build_sql_multi_respects_dialect() {
+        let parent_schema =
+            schema_from_yaml("row_count: 1\ntable_name: parent\ncolumns:\n  - name: id\n    type: sequence\n");
+        let parent_columns = prepare_columns(&parent_schema).unwrap();
+        let parent_rows = generate_all_rows(parent_schema.row_count, &parent_columns, 1);
+        let parent_table = GeneratedTable { name: Some("parent"), columns: &parent_columns, rows: &parent_rows };
+
+        let child_schema =
+            schema_from_yaml("row_count: 1\ntable_name: child\ncolumns:\n  - name: id\n    type: sequence\n");
+        let child_columns = prepare_columns(&child_schema).unwrap();
+        let child_rows = generate_all_rows(child_schema.row_count, &child_columns, 1);
+        let child_table = GeneratedTable { name: Some("child"), columns: &child_columns, rows: &child_rows };
+
+        let sql = build_sql_multi(&[parent_table, child_table], SqlDialect::SqlServer).unwrap();
+        assert!(sql.contains("INSERT INTO [parent] ([id]) VALUES"));
+        assert!(sql.contains("INSERT INTO [child] ([id]) VALUES"));
+        // 渡した順(親→子)のままSQLに出力されることも確認する
+        assert!(sql.find("[parent]").unwrap() < sql.find("[child]").unwrap());
     }
 
     #[test]
@@ -4350,7 +4454,7 @@ mod tests {
             "row_count: 1\ntable_name: t\ncolumns:\n  - name: \"id, name\"\n    type: sequence\n  - name: email\n    type: email\n",
         );
         let columns = prepare_columns(&schema).unwrap();
-        let sql = build_sql(schema.row_count, &columns, "t", 42).unwrap();
+        let sql = build_sql(schema.row_count, &columns, "t", 42, SqlDialect::Standard).unwrap();
         assert!(sql.contains("\"id, name\""));
         assert!(sql.starts_with("INSERT INTO \"t\" (\"id, name\", \"email\") VALUES"));
         // 値は2個(列も2個)であるべき
@@ -4417,8 +4521,50 @@ mod tests {
         let schema = schema_from_yaml("row_count: 1\ncolumns:\n  - name: id\n    type: sequence\n");
         let columns = prepare_columns(&schema).unwrap();
         let rows = generate_all_rows(1, &columns, 1);
-        assert!(build_sql_from_rows(&columns, &rows, "").is_err());
-        assert!(build_sql_from_rows(&columns, &rows, "   ").is_err());
+        assert!(build_sql_from_rows(&columns, &rows, "", SqlDialect::Standard).is_err());
+        assert!(build_sql_from_rows(&columns, &rows, "   ", SqlDialect::Standard).is_err());
+    }
+
+    // SqlDialectごとにsql_identが使うクォート記号が切り替わることを確認する
+    // (standard/postgresql/sqliteはダブルクォートのまま、mysqlはバッククォート、
+    // sqlserverは角カッコ)
+    #[test]
+    fn sql_ident_uses_quote_style_matching_dialect() {
+        assert_eq!(sql_ident("users", SqlDialect::Standard), "\"users\"");
+        assert_eq!(sql_ident("users", SqlDialect::PostgreSql), "\"users\"");
+        assert_eq!(sql_ident("users", SqlDialect::Sqlite), "\"users\"");
+        assert_eq!(sql_ident("users", SqlDialect::Mysql), "`users`");
+        assert_eq!(sql_ident("users", SqlDialect::SqlServer), "[users]");
+    }
+
+    // 識別子自身がその方言のクォート文字を含む場合、二重化されてエスケープされる
+    // ことを確認する(mysqlのバッククォート、sqlserverの閉じ角カッコ)
+    #[test]
+    fn sql_ident_escapes_dialect_specific_quote_char() {
+        assert_eq!(sql_ident("a`b", SqlDialect::Mysql), "`a``b`");
+        assert_eq!(sql_ident("a]b", SqlDialect::SqlServer), "[a]]b]");
+    }
+
+    // mysql/sqlserver方言を指定したとき、build_sql_from_rowsが組み立てるINSERT文の
+    // テーブル名・列名もsql_identと同じ記号で囲まれることを確認する
+    #[test]
+    fn build_sql_from_rows_respects_mysql_dialect() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ntable_name: t\ncolumns:\n  - name: id\n    type: sequence\n  - name: email\n    type: email\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let sql = build_sql(schema.row_count, &columns, "t", 42, SqlDialect::Mysql).unwrap();
+        assert!(sql.starts_with("INSERT INTO `t` (`id`, `email`) VALUES"));
+    }
+
+    #[test]
+    fn build_sql_from_rows_respects_sqlserver_dialect() {
+        let schema = schema_from_yaml(
+            "row_count: 1\ntable_name: t\ncolumns:\n  - name: id\n    type: sequence\n  - name: email\n    type: email\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let sql = build_sql(schema.row_count, &columns, "t", 42, SqlDialect::SqlServer).unwrap();
+        assert!(sql.starts_with("INSERT INTO [t] ([id], [email]) VALUES"));
     }
 
     // 回帰テスト: 以前はShift-JISで表現できない文字をHTML文字参照("&#12345;")に
@@ -5594,6 +5740,49 @@ mod tests {
         assert!(incompatible_data_type_warnings(&columns).is_empty());
     }
 
+    #[test]
+    fn warns_when_date_with_hyphen_format_data_type_is_forced_to_integer() {
+        // 既定のymd書式("2024-01-05"のように"-"を含む)にINTEGERを指定すると、
+        // SQLで不正な構文・JSONで値が消えるため警告対象になる(以前は見落とされていた欠落)
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: d\n    type: date\n    start: \"2020-01-01\"\n    end: \"2020-01-31\"\n    data_type: INTEGER\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert_eq!(incompatible_data_type_warnings(&columns).len(), 1);
+    }
+
+    #[test]
+    fn no_warning_when_compact_date_data_type_is_forced_to_integer() {
+        // compact書式("20240105"のように数字だけ)は実際にINTEGERとして解釈できてしまうため、
+        // 明らかに数値化できないとは言い切れず対象外にしている(postal_code等と同じ考え方)
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: d\n    type: date\n    start: \"2020-01-01\"\n    end: \"2020-01-31\"\n    format: compact\n    data_type: INTEGER\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert!(incompatible_data_type_warnings(&columns).is_empty());
+    }
+
+    #[test]
+    fn warns_when_compact_date_data_type_is_forced_to_boolean() {
+        // compact書式は数字だけの文字列になるがtrue/falseにはならないため、
+        // INTEGER/FLOATと違いBOOLEANはどの書式でも必ず警告対象になる
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: d\n    type: date\n    start: \"2020-01-01\"\n    end: \"2020-01-31\"\n    format: compact\n    data_type: BOOLEAN\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert_eq!(incompatible_data_type_warnings(&columns).len(), 1);
+    }
+
+    #[test]
+    fn warns_when_birth_date_data_type_is_forced_to_float() {
+        // birth_dateもdateと同じformatフィールドを持つため、同じ判定がそのまま当てはまる
+        let schema = schema_from_yaml(
+            "row_count: 5\ncolumns:\n  - name: b\n    type: birth_date\n    min_age: 20\n    max_age: 60\n    data_type: FLOAT\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        assert_eq!(incompatible_data_type_warnings(&columns).len(), 1);
+    }
+
     // --- ここから F3-3(複数形式同時出力) のテスト ---
 
     #[test]
@@ -5885,15 +6074,42 @@ mod tests {
             "row_count: 2500\ntable_name: t\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n",
         );
         let columns = prepare_columns(&schema).unwrap();
-        let expected = build_sql(schema.row_count, &columns, "t", 42).unwrap();
+        let expected = build_sql(schema.row_count, &columns, "t", 42, SqlDialect::Standard).unwrap();
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming.sql");
         let path_str = path.to_str().unwrap();
-        write_sql_streaming(schema.row_count, &columns, 42, "t", path_str, Encoding::Utf8, 1000, |_, _| {}).unwrap();
+        write_sql_streaming(
+            schema.row_count, &columns, 42, "t", SqlDialect::Standard, path_str, Encoding::Utf8, 1000, |_, _| {},
+        )
+        .unwrap();
 
         let actual = std::fs::read_to_string(&path).unwrap();
         assert_eq!(actual, expected);
         assert_eq!(actual.matches("INSERT INTO").count(), 3); // 1000, 1000, 500行の3本
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ストリーミング出力でもdialectがチャンクをまたいで一貫して適用され、
+    // 一括生成(build_sql)のmysql方言出力と完全に一致することを確認する
+    #[test]
+    fn write_sql_streaming_respects_dialect_across_chunk_boundaries() {
+        let schema = schema_from_yaml(
+            "row_count: 2500\ntable_name: t\ncolumns:\n  - name: id\n    type: sequence\n  - name: name\n    type: name_ja\n",
+        );
+        let columns = prepare_columns(&schema).unwrap();
+        let expected = build_sql(schema.row_count, &columns, "t", 42, SqlDialect::Mysql).unwrap();
+
+        let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_mysql.sql");
+        let path_str = path.to_str().unwrap();
+        write_sql_streaming(
+            schema.row_count, &columns, 42, "t", SqlDialect::Mysql, path_str, Encoding::Utf8, 1000, |_, _| {},
+        )
+        .unwrap();
+
+        let actual = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(actual, expected);
+        assert!(actual.starts_with("INSERT INTO `t`"));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -5910,7 +6126,10 @@ mod tests {
 
         let path = std::env::temp_dir().join("dummy_data_gen_test_streaming_small_batch.sql");
         let path_str = path.to_str().unwrap();
-        write_sql_streaming(schema.row_count, &columns, 1, "t", path_str, Encoding::Utf8, 4, |_, _| {}).unwrap();
+        write_sql_streaming(
+            schema.row_count, &columns, 1, "t", SqlDialect::Standard, path_str, Encoding::Utf8, 4, |_, _| {},
+        )
+        .unwrap();
 
         let actual = std::fs::read_to_string(&path).unwrap();
         assert_eq!(actual.matches("INSERT INTO").count(), 4); // 15行 ÷ chunk_size(4) = 4,4,4,3の4チャンク
